@@ -4,11 +4,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 from dotenv import load_dotenv
 
-from app.routers import  emailassistant, recipegenerator, users, webscraping,meal_planner
+from app.routers import (
+    emailassistant,
+    recipegenerator,
+    users,
+    webscraping,
+    meal_planner,
+)
 from app.database import connect_db, close_db
 from app.routers import rag
-from app.routers import ragChat
+from app.routers import chat
 import redis.asyncio as redis
+
 redis_client = None
 load_dotenv()
 
@@ -32,7 +39,7 @@ app.add_middleware(
 
 app.include_router(prefix="/api/user", router=users.router)
 app.include_router(prefix="/api", router=rag.router)
-app.include_router(prefix="/api", router=ragChat.router)
+app.include_router(prefix="/api", router=chat.router)
 app.include_router(prefix="/api", router=meal_planner.mealRouter)
 app.include_router(prefix="/api", router=webscraping.router)
 app.include_router(prefix="/api", router=emailassistant.router)

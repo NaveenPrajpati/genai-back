@@ -138,6 +138,7 @@ class _FilteredHybridRetriever(PineconeHybridSearchRetriever):
             kwargs["filter"] = self.metadata_filter
         return super()._get_relevant_documents(query, run_manager=run_manager, **kwargs)
 
+
 # ── Step 3: embedders (built once) ───────────────────────────────────────────
 embeddings = OpenAIEmbeddings()
 
@@ -146,8 +147,16 @@ embeddings = OpenAIEmbeddings()
 bm25_encoder = BM25Encoder().default()
 
 # ── Step 5: reranker + reorderer (built once; models are expensive to load) ──
-_cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
-reranker = CrossEncoderReranker(model=_cross_encoder, top_n=RERANK_TOP_N)
+_cross_encoder = None
+
+
+def _get_reranker():
+    global _cross_encoder
+    if _cross_encoder is None:
+        _cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
+    return CrossEncoderReranker(model=_cross_encoder, top_n=RERANK_TOP_N)
+
+
 reorder = LongContextReorder()
 
 
@@ -181,7 +190,9 @@ def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
     _default_hybrid.add_texts(texts, metadatas=metadatas)
 
 
-def build_retriever(doc_ids: Optional[List[str]] = None) -> ContextualCompressionRetriever:
+def build_retriever(
+    doc_ids: Optional[List[str]] = None,
+) -> ContextualCompressionRetriever:
     """
     Assemble the full retrieval chain:  hybrid retrieve → cross-encoder rerank.
 
@@ -193,4 +204,6 @@ def build_retriever(doc_ids: Optional[List[str]] = None) -> ContextualCompressio
         doc_ids: restrict search to these ingestion ids. None = search everything.
     """
     base = _default_hybrid if not doc_ids else _base_hybrid_retriever(doc_ids)
-    return ContextualCompressionRetriever(base_compressor=reranker, base_retriever=base)
+    return ContextualCompressionRetriever(
+        base_compressor=_get_reranker(), base_retriever=base
+    )
