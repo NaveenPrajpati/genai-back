@@ -6,8 +6,6 @@ from bson import ObjectId
 from app.models.user import UserCreate, UserLogin
 from app.database import get_db
 import jwt
-from app.core.config import supabase
-from typing import Literal, TypedDict
 
 JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
 JWT_ALGORITHM = "HS256"
@@ -63,25 +61,6 @@ async def get_user_by_id(user_id: str) -> dict | None:
     )
 
 
-class ProfileState(TypedDict):
-    display_name: str
-    user: uuid
-    # diet: Literal["vegetarian", "non-vegetarian"]
-    # protein_target: int
-
-
-def createProfile(data: ProfileState):
-    try:
-        supabase.table("profiles").insert(
-            {
-                "display_name": data["display_name"],
-                "user": data["user"],
-            }
-        ).execute()
-    except Exception as e:
-        print(e)
-
-
 async def signup_user(user: UserCreate) -> tuple[dict, str]:
     col = _collection()
     if await col.find_one({"email": user.email}):
@@ -96,11 +75,12 @@ async def signup_user(user: UserCreate) -> tuple[dict, str]:
         "description": user.description,
         "password_hash": _hash_password(user.password),
         "is_guest": False,
+        "diet": "vegetarien",
+        "protien_target": 100,
     }
     result = await col.insert_one(record)
     created = await col.find_one({"_id": result.inserted_id}, {"password_hash": 0})
 
-    createProfile({"display_name": "profile 1", "user": created["uid"]})
     token = create_access_token(str(result.inserted_id), is_guest=False)
     return created, token
 
@@ -136,7 +116,6 @@ async def create_guest_user() -> tuple[dict, str]:
     }
     result = await col.insert_one(record)
     created = await col.find_one({"_id": result.inserted_id}, {"password_hash": 0})
-    createProfile({"display_name": "profile 1", "user": created["uid"]})
     token = create_access_token(str(result.inserted_id), is_guest=True)
     return created, token
 
