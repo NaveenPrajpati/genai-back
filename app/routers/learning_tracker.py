@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 from langgraph.graph import START, StateGraph, END
 from app.core.config import supabase
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from langgraph.types import interrupt, Command
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
@@ -16,6 +16,7 @@ import logging
 import uuid
 import os
 import httpx
+from app.database import get_db
 
 load_dotenv()
 
@@ -23,19 +24,19 @@ logger = logging.getLogger(__name__)
 
 
 mealRouter = APIRouter(
-    prefix="/learning-tracker",
-    tags=["learning-tracker"],
+    prefix="/learning",
+    tags=["learning"],
     responses={404: {"description": "Not found"}},
 )
 
 
 class QueryRequest(BaseModel):
     text: str
-    plan_id: Optional[str] = None
+    roadmap_id: Optional[str] = None
     thread_id: Optional[str] = None
 
 
-class PlannerState(TypedDict, total=False):
+class LearningState(TypedDict, total=False):
     query: str
     intent: str
     current_user: dict
@@ -45,24 +46,35 @@ class PlannerState(TypedDict, total=False):
     plan_status: Optional[str]
     log_status: Optional[str]
     conflict: Optional[dict]
-    plan_id: Optional[str]
+    roadmap_id: Optional[str]
     suggestions: Optional[list]
     meal_slots: Optional[list]
+    roadmap: Optional[dict]
+    roadmap_status: Optional[str]
 
 
-graph = StateGraph(PlannerState)
+graph = StateGraph(LearningState)
 
 
-class LogOutput(BaseModel):
-    recipe: str
-    day_of_week: int
-    meal_type: str
-    conflict: bool
-    suggestion: Optional[str]
+class TopicNode(BaseModel):
+    order: int
+    title: str
+    description: str
+    prerequisites: List[str]
+    estimated_hours: Optional[int] = None
+    resources: Optional[List[str]] = None
+
+
+class RoadmapOutput(BaseModel):
+    topic: str
+    goal: str
+    total_estimated_hours: Optional[int] = None
+    stages: List[str]
+    topics: List[TopicNode]
 
 
 class GroceryItem(BaseModel):
-    plan_id: Optional[str] = None
+    roadmap_id: Optional[str] = None
     name: str
     qty: Optional[float] = None
     unit: Optional[str] = None
@@ -91,7 +103,7 @@ def get_monday(today: Optional[date] = None) -> str:
 
 
 # Shared prompt: given a recipe name, ask the LLM to fill in nutrients,
-# cooking time and ingredients. Used by both log_agent and conflict resolution.
+# cooking time and ingredients. Used by both roadmap_agent and conflict resolution.
 searchRecipePrompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -103,18 +115,21 @@ searchRecipePrompt = ChatPromptTemplate.from_messages(
 )
 
 
-async def classify_intent(state: PlannerState):
+async def classify_intent(state: LearningState):
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 "Classify the user message into one intent:\n"
-                "- log: recording a specific meal eaten or to be eaten (mentions a dish + day/meal slot)\n"
-                "- plan: generate a full weekly meal plan from scratch (no existing plan mentioned)\n"
-                "- update: regenerate or change an existing meal plan (words like update, change, redo, modify, regenerate)\n"
-                "- research: ask for food/nutrition info or suggestions (no specific slot)\n"
-                "- query: view or check what is already in the meal plan\n"
-                "Reply with one word only: log, plan, update, research, or query.",
+                "- whats_next: user asks what to study or do next in their learning roadmap\n"
+                "- explain: user asks for an explanation of a concept, topic, or step\n"
+                "- quiz: user requests a quiz or test on a topic\n"
+                "- submit_quiz: user is submitting answers to a quiz for evaluation\n"
+                "- find_resources: user asks for resources, links, books, or materials on a topic\n"
+                "- update_progress: user marks progress, completes a step, or logs learning activity\n"
+                "- query_roadmap: user wants to view or check the current state of their roadmap\n"
+                "- modify_roadmap: user wants to change, restructure, or regenerate their roadmap\n"
+                "Reply with one word only: whats_next, explain, quiz, submit_quiz, find_resources, update_progress, query_roadmap, or modify_roadmap.",
             ),
             ("human", "{text}"),
         ]
@@ -168,19 +183,19 @@ async def insertRecipeInMealSlot(data: dict):
     try:
         # Upsert (not insert) so re-logging the same plan/day/meal_type replaces
         # the slot instead of creating a duplicate row. Requires a unique
-        # constraint on (plan_id, day_of_week, meal_type) — see migrations/.
+        # constraint on (roadmap_id, day_of_week, meal_type) — see migrations/.
         res = (
             supabase.table("meal_slots")
             .upsert(
                 {
-                    "plan_id": data["plan_id"],
+                    "roadmap_id": data["roadmap_id"],
                     "day_of_week": data["day_of_week"],
                     "meal_type": data["meal_type"],
                     "recipe_id": data["recipe_id"],
                     "recipe_name": data["recipe_name"],
                     "protein_g": data["protein_g"],
                 },
-                on_conflict="plan_id,day_of_week,meal_type",
+                on_conflict="roadmap_id,day_of_week,meal_type",
             )
             .execute()
         )
@@ -192,11 +207,11 @@ async def insertRecipeInMealSlot(data: dict):
 
 
 async def log_recipe_to_slot(
-    plan_id: str, recipe_name: str, day_of_week: int, meal_type: str
+    roadmap_id: str, recipe_name: str, day_of_week: int, meal_type: str
 ):
     """Find-or-create a recipe by name, then attach it to a meal slot.
 
-    Shared by log_agent and the conflict-resolution endpoint so the
+    Shared by roadmap_agent and the conflict-resolution endpoint so the
     find/enrich/insert logic lives in exactly one place.
     """
     recipe_present = await findRecipeInDb(recipe_name)
@@ -216,7 +231,7 @@ async def log_recipe_to_slot(
 
     return await insertRecipeInMealSlot(
         {
-            "plan_id": plan_id,
+            "roadmap_id": roadmap_id,
             "day_of_week": day_of_week,
             "meal_type": meal_type.lower(),
             "recipe_id": recipe_id,
@@ -226,66 +241,131 @@ async def log_recipe_to_slot(
     )
 
 
-async def log_agent(state: PlannerState):
-    findPrompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Extract the recipe, day_of_week (Monday=0), and meal_type from the text.\n"
-                "User diet: {diet}. Disliked: {disliked}.\n"
-                "If the requested dish conflicts with their diet, set conflict=true "
-                "and suggest an alternative instead of extracting it.",
-            ),
-            ("human", "{text}"),
-        ]
-    )
+async def insertRoadmapToDb(
+    roadmap: RoadmapOutput, user_id: Optional[str] = None
+) -> Optional[str]:
+    try:
+        doc = roadmap.model_dump()
+        doc["user_id"] = user_id
+        doc["created_at"] = datetime.now(timezone.utc).isoformat()
+        res = await get_db()["roadmaps"].insert_one(doc)
+        logger.info("insertRoadmapToDb inserted: %s", res.inserted_id)
+        return str(res.inserted_id)
+    except Exception as e:
+        logger.error("insertRoadmapToDb error: %s", e)
+        return None
 
-    current_user = state.get("current_user") or {}
-    memory = state.get("memory") or {}
 
-    chain = findPrompt | llm.with_structured_output(LogOutput)
-    result: LogOutput = await chain.ainvoke(
-        {
-            "text": state["query"],
-            "diet": current_user.get("diet", "vegetarian"),
-            "disliked": memory.get("disliked_dishes", []),
-        }
-    )
-    logger.info("log data %s", result)
-    if result.conflict:
-        # Surface the full context so the client can call /resolve-conflict
-        # to accept the suggestion (log it) or reject it (record a dislike).
-        return {
-            "intent": "log",
-            "log_status": "conflict",
-            "suggestions": [result.suggestion] if result.suggestion else [],
-            "conflict": {
-                "original": result.recipe,
-                "suggestion": result.suggestion,
-                "day_of_week": result.day_of_week,
-                "meal_type": result.meal_type,
-            },
-        }
+async def roadmap_agent(state: LearningState):
+    is_modify = state.get("intent") == "modify_roadmap"
 
-    plan_id = state.get("plan_id")
-    if not plan_id:
-        return {"intent": "log", "log_status": "no_plan"}
+    if is_modify:
+        # Fetch the existing roadmap so the LLM can operate on it
+        existing_roadmap = None
+        roadmap_id = state.get("roadmap_id")
+        if roadmap_id:
+            try:
+                from bson import ObjectId
+                doc = await get_db()["roadmaps"].find_one({"_id": ObjectId(roadmap_id)})
+                if doc:
+                    doc.pop("_id", None)
+                    existing_roadmap = doc
+            except Exception as e:
+                logger.error("roadmap fetch error: %s", e)
 
-    await log_recipe_to_slot(
-        plan_id, result.recipe, result.day_of_week, result.meal_type
-    )
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert curriculum designer. The user wants to modify an existing learning roadmap.\n"
+                    "Apply the requested change (add topic, remove topic, reorder, adjust hours, update resources, etc.).\n"
+                    "Return the full updated roadmap — keep all unchanged topics intact.\n"
+                    "Maintain correct order values and prerequisite links after any structural change.\n"
+                    "Existing roadmap:\n{existing_roadmap}",
+                ),
+                ("human", "{text}"),
+            ]
+        )
+        chain = prompt | llm.with_structured_output(RoadmapOutput)
+        result: RoadmapOutput = await chain.ainvoke(
+            {"text": state["query"], "existing_roadmap": existing_roadmap or "none"}
+        )
+    else:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert curriculum designer and learning path architect.\n"
+                    "Given a topic the user wants to learn, produce a complete, sequenced roadmap:\n"
+                    "1. Break the subject into ordered topics (order field starts at 1).\n"
+                    "2. For each topic list its prerequisites by title — only topics that appear earlier in the list.\n"
+                    "3. Group topics into broad stages (e.g. Foundations, Intermediate, Advanced).\n"
+                    "4. Estimate realistic study hours per topic and a total.\n"
+                    "5. Suggest 1-2 free learning resources (course names, docs, book titles) per topic.\n"
+                    "Personalize based on the exact subject in the user query. Be specific and practical.",
+                ),
+                ("human", "{text}"),
+            ]
+        )
+        chain = prompt | llm.with_structured_output(RoadmapOutput)
+        result: RoadmapOutput = await chain.ainvoke({"text": state["query"]})
+    logger.info("roadmap_agent result: %s", result)
+
+    action_type = "update_roadmap" if is_modify else "save_roadmap"
+
+    # Pause here — send the generated/updated roadmap to the user for review
+    decision = interrupt({"type": action_type, "roadmap": result.model_dump()})
+
+    if decision != "approved":
+        return {"intent": state.get("intent"), "roadmap_status": "rejected"}
+
+    # User approved — record approval then persist
+    approval_id = None
+    try:
+        res = await get_db()["approvals"].insert_one(
+            {
+                "user_id": state.get("user_id"),
+                "thread_id": state.get("thread_id"),
+                "action_type": action_type,
+                "payload": result.model_dump(),
+                "status": "approved",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        approval_id = str(res.inserted_id)
+        logger.info("roadmap approval saved: %s", approval_id)
+    except Exception as e:
+        logger.error("roadmap approval insert error: %s", e)
+
+    if is_modify and state.get("roadmap_id"):
+        # Replace the existing roadmap document in-place
+        try:
+            from bson import ObjectId
+            await get_db()["roadmaps"].replace_one(
+                {"_id": ObjectId(state["roadmap_id"])},
+                {**result.model_dump(), "user_id": state.get("user_id"), "updated_at": datetime.now(timezone.utc).isoformat()},
+            )
+            saved_roadmap_id = state["roadmap_id"]
+        except Exception as e:
+            logger.error("roadmap update error: %s", e)
+            saved_roadmap_id = None
+    else:
+        saved_roadmap_id = await insertRoadmapToDb(result, state.get("user_id"))
+
     return {
-        "intent": "log",
-        "log_status": "logged",
+        "intent": state.get("intent"),
+        "roadmap_status": "approved",
+        "roadmap_id": saved_roadmap_id,
+        "roadmap": result.model_dump(),
     }
 
 
-async def findMealSlotsInDb(plan_id: str, meal_types: List[str]):
+async def findMealSlotsInDb(roadmap_id: str, meal_types: List[str]):
     try:
         res = (
             supabase.table("meal_slots")
             .select("day_of_week, meal_type, recipe_name, protein_g")
-            .eq("plan_id", plan_id)
+            .eq("roadmap_id", roadmap_id)
             .in_("meal_type", meal_types)
             .execute()
         )
@@ -296,7 +376,7 @@ async def findMealSlotsInDb(plan_id: str, meal_types: List[str]):
         return None
 
 
-async def query_agent(state: PlannerState):
+async def query_agent(state: LearningState):
     findPrompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -310,10 +390,10 @@ async def query_agent(state: PlannerState):
     chain = findPrompt | llm.with_structured_output(QueryOutput)
     result: QueryOutput = await chain.ainvoke({"text": state["query"]})
     logger.info("query data %s", result)
-    plan_id = state.get("plan_id")
-    if not plan_id:
+    roadmap_id = state.get("roadmap_id")
+    if not roadmap_id:
         return {"intent": "query", "meal_slots": []}
-    slots = await findMealSlotsInDb(plan_id, result.meal_type)
+    slots = await findMealSlotsInDb(roadmap_id, result.meal_type)
     return {
         "intent": "query",
         "meal_slots": slots or [],
@@ -377,7 +457,7 @@ _research_tool_node = ToolNode(_research_tools)
 _research_llm = llm.bind_tools(_research_tools)
 
 
-async def research_agent(state: PlannerState):
+async def research_agent(state: LearningState):
     current_user = state.get("current_user") or {}
     memory = state.get("memory") or {}
 
@@ -422,7 +502,7 @@ async def research_agent(state: PlannerState):
 
 
 class MealSlots(BaseModel):
-    plan_id: Optional[str] = None
+    roadmap_id: Optional[str] = None
     day_of_week: int = 0
     meal_type: Literal["dinner", "lunch", "breakfast"]
     recipe_id: Optional[str] = None
@@ -477,7 +557,7 @@ async def remove_disliked_dish(user_id: str, dish: str) -> list:
     return merged
 
 
-async def build_grocery_list(plan_id: str) -> list:
+async def build_grocery_list(roadmap_id: str) -> list:
     """Aggregate ingredients across every meal slot in a plan into a shopping
     list. Quantities accumulate per (ingredient name, unit), counting each slot
     separately so a dish eaten N times contributes N times."""
@@ -485,7 +565,7 @@ async def build_grocery_list(plan_id: str) -> list:
         slots_res = (
             supabase.table("meal_slots")
             .select("recipe_id, recipe_name")
-            .eq("plan_id", plan_id)
+            .eq("roadmap_id", roadmap_id)
             .execute()
         )
         slots = slots_res.data or []
@@ -543,7 +623,7 @@ async def build_grocery_list(plan_id: str) -> list:
     return sorted(agg.values(), key=lambda x: x["name"].lower())
 
 
-async def plan_agent(state: PlannerState):
+async def plan_agent(state: LearningState):
     # LangGraph re-runs this node from the top on resume. Check Supabase first
     # so we reuse the original proposal instead of creating a duplicate.
     week_start = get_monday()
@@ -607,7 +687,7 @@ async def plan_agent(state: PlannerState):
         except Exception as e:
             logger.error("approval insert error: %s", e)
 
-    is_update = state.get("intent") == "update" or bool(state.get("plan_id"))
+    is_update = state.get("intent") == "update" or bool(state.get("roadmap_id"))
     action_type = "update_plan" if is_update else "save_plan"
 
     decision = interrupt(
@@ -627,8 +707,8 @@ async def plan_agent(state: PlannerState):
         return {"intent": state.get("intent", "plan"), "plan_status": "rejected"}
 
     # Approved: for update reuse the existing plan row; for new plan create one.
-    plan_id = state.get("plan_id") if is_update else None
-    if not plan_id:
+    roadmap_id = state.get("roadmap_id") if is_update else None
+    if not roadmap_id:
         try:
             plan_row = (
                 supabase.table("meal_plans")
@@ -641,13 +721,13 @@ async def plan_agent(state: PlannerState):
                 )
                 .execute()
             )
-            plan_id = plan_row.data[0]["id"] if plan_row.data else None
+            roadmap_id = plan_row.data[0]["id"] if plan_row.data else None
         except Exception as e:
             logger.error("meal_plan insert error: %s", e)
     else:
         # Clear existing slots so we start fresh with the new proposal.
         try:
-            supabase.table("meal_slots").delete().eq("plan_id", plan_id).execute()
+            supabase.table("meal_slots").delete().eq("roadmap_id", roadmap_id).execute()
         except Exception as e:
             logger.error("meal_slots clear error: %s", e)
 
@@ -661,13 +741,13 @@ async def plan_agent(state: PlannerState):
         try:
             supabase.table("meal_slots").upsert(
                 {
-                    "plan_id": plan_id,
+                    "roadmap_id": roadmap_id,
                     "day_of_week": slot["day_of_week"],
                     "meal_type": slot["meal_type"].lower(),
                     "recipe_name": slot["recipe_name"],
                     "protein_g": slot["protein_g"],
                 },
-                on_conflict="plan_id,day_of_week,meal_type",
+                on_conflict="roadmap_id,day_of_week,meal_type",
             ).execute()
         except Exception as e:
             logger.error("slot insert error: %s", e)
@@ -680,64 +760,69 @@ async def plan_agent(state: PlannerState):
     return {
         "intent": state.get("intent", "plan"),
         "plan_status": "approved",
-        "plan_id": plan_id,
+        "roadmap_id": roadmap_id,
     }
 
 
-async def load_memory(state: PlannerState):
+async def load_memory(state: LearningState):
     user_id = state["user_id"]
     memory = {}
 
     try:
-        rows = (
-            supabase.table("memory")
-            .select("key, value")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if rows and rows.data:
-            memory = {r["key"]: r["value"] for r in rows.data}
+        memories = get_db()["memories"]
+        result = memories.find_one({userId: state["user_id"]})
+        if result:
+            print(result)
+            # memory = {r["key"]: r["value"] for r in rows.data}
     except Exception as e:
         logger.error("load memory error: %s", e)
 
     return {"memory": memory}
 
 
-def decide_agent(state: PlannerState):
+def decide_agent(state: LearningState):
     intent = state.get("intent")
-    if intent == "log":
-        return "log_agent"
-    elif intent == "query":
+    if intent == "whats_next":
+        return "roadmap_agent"
+    elif intent == "explain":
         return "query_agent"
-    elif intent == "research":
+    elif intent == "quiz":
         return "research_agent"
-    elif intent in ("plan", "update"):
+    elif intent == "submit_quiz":
+        return "research_agent"
+    elif intent == "find_resources":
+        return "research_agent"
+    elif intent == "update_progress":
+        return "roadmap_agent"
+    elif intent == "query_roadmap":
+        return "query_agent"
+    elif intent == "modify_roadmap":
         return "plan_agent"
     return END
 
 
 graph.add_node("load_memory", load_memory)
 graph.add_node("classify_intent", classify_intent)
-graph.add_node("log_agent", log_agent)
+graph.add_node("roadmap_agent", roadmap_agent)
 graph.add_node("query_agent", query_agent)
 graph.add_node("research_agent", research_agent)
 graph.add_node("plan_agent", plan_agent)
-graph.add_edge(START, "load_memory")
-graph.add_edge("load_memory", "classify_intent")
+graph.add_edge(START, "classify_intent")
+# graph.add_edge("load_memory", "classify_intent")
 graph.add_conditional_edges(
     "classify_intent",
     decide_agent,
-    ["log_agent", "query_agent", "research_agent", "plan_agent", END],
+    ["roadmap_agent", "query_agent", "research_agent", "plan_agent", END],
 )
 
 
-async def verify_plan_ownership(plan_id: str, user_id: str) -> bool:
+async def verify_plan_ownership(roadmap_id: str, user_id: str) -> bool:
     """Return True if the plan exists and belongs to the user."""
     try:
         res = (
             supabase.table("meal_plans")
             .select("id")
-            .eq("id", plan_id)
+            .eq("id", roadmap_id)
             .eq("user", user_id)
             .maybe_single()
             .execute()
@@ -756,21 +841,21 @@ async def ask(
 ):
     agent = request.app.state.agent
 
-    if body.plan_id and not await verify_plan_ownership(
-        body.plan_id, current_user["uid"]
+    if body.roadmap_id and not await verify_plan_ownership(
+        body.roadmap_id, current_user["uid"]
     ):
         raise HTTPException(
             status_code=403, detail="You do not have access to this plan."
         )
 
-    # "update" intent requires a plan_id to know which plan to regenerate.
+    # "update" intent requires a roadmap_id to know which plan to regenerate.
     # Do a lightweight pre-check so we fail fast with a readable error.
     text_lower = body.text.lower()
     update_keywords = ("update", "change", "redo", "modify", "regenerate")
-    if any(kw in text_lower for kw in update_keywords) and not body.plan_id:
+    if any(kw in text_lower for kw in update_keywords) and not body.roadmap_id:
         raise HTTPException(
             status_code=400,
-            detail="Provide plan_id to update an existing plan.",
+            detail="Provide roadmap_id to update an existing plan.",
         )
 
     thread_id = body.thread_id or str(uuid.uuid4())
@@ -782,7 +867,7 @@ async def ask(
             "query": body.text,
             "user_id": current_user["uid"],
             "thread_id": thread_id,
-            "plan_id": body.plan_id,
+            "roadmap_id": body.roadmap_id,
             "current_user": user_data,
         },
         config=config,
@@ -850,7 +935,7 @@ async def approve(
 
 
 class ResolveConflictRequest(BaseModel):
-    plan_id: str
+    roadmap_id: str
     recipe: str  # the suggested (or chosen) dish to act on
     day_of_week: int
     meal_type: Literal["dinner", "lunch", "breakfast"]
@@ -862,12 +947,12 @@ async def resolve_conflict(
     body: ResolveConflictRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    """Finish a 'conflict' from log_agent.
+    """Finish a 'conflict' from roadmap_agent.
 
     accept → log the suggested recipe into the slot.
     reject → record the suggestion as a disliked dish so it isn't offered again.
     """
-    if not await verify_plan_ownership(body.plan_id, current_user["uid"]):
+    if not await verify_plan_ownership(body.roadmap_id, current_user["uid"]):
         raise HTTPException(
             status_code=403, detail="You do not have access to this plan."
         )
@@ -877,7 +962,7 @@ async def resolve_conflict(
         return {"status": "done", "log_status": "rejected"}
 
     slot = await log_recipe_to_slot(
-        body.plan_id, body.recipe, body.day_of_week, body.meal_type
+        body.roadmap_id, body.recipe, body.day_of_week, body.meal_type
     )
     return {"status": "done", "log_status": "logged", "slot": slot}
 
@@ -909,12 +994,12 @@ async def delete_disliked(
     return {"status": "done", "result": merged}
 
 
-@mealRouter.get("/meal-slots/{plan_id}")
+@mealRouter.get("/meal-slots/{roadmap_id}")
 async def get_meal_slots(
-    plan_id: str,
+    roadmap_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    if not await verify_plan_ownership(plan_id, current_user["uid"]):
+    if not await verify_plan_ownership(roadmap_id, current_user["uid"]):
         raise HTTPException(
             status_code=403, detail="You do not have access to this plan."
         )
@@ -922,28 +1007,28 @@ async def get_meal_slots(
         res = (
             supabase.table("meal_slots")
             .select("id, day_of_week, meal_type, recipe_id, recipe_name, protein_g")
-            .eq("plan_id", plan_id)
+            .eq("roadmap_id", roadmap_id)
             .order("day_of_week")
             .order("meal_type")
             .execute()
         )
-        return {"status": "done", "plan_id": plan_id, "slots": res.data or []}
+        return {"status": "done", "roadmap_id": roadmap_id, "slots": res.data or []}
     except Exception as e:
         logger.error("get_meal_slots error: %s", e)
         raise HTTPException(status_code=500, detail="Failed to fetch meal slots.")
 
 
-@mealRouter.get("/grocery-list/{plan_id}")
+@mealRouter.get("/grocery-list/{roadmap_id}")
 async def grocery_list(
-    plan_id: str,
+    roadmap_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    if not await verify_plan_ownership(plan_id, current_user["uid"]):
+    if not await verify_plan_ownership(roadmap_id, current_user["uid"]):
         raise HTTPException(
             status_code=403, detail="You do not have access to this plan."
         )
-    items = await build_grocery_list(plan_id)
-    return {"status": "done", "plan_id": plan_id, "result": items}
+    items = await build_grocery_list(roadmap_id)
+    return {"status": "done", "roadmap_id": roadmap_id, "result": items}
 
 
 @mealRouter.get("/approve")
@@ -1064,7 +1149,7 @@ async def run_triggers(agent):
                 slots = latest.data.get("meal_slots", [])
                 proposed = [
                     {
-                        "plan_id": latest.data["id"],
+                        "roadmap_id": latest.data["id"],
                         "day_of_week": s["day_of_week"],
                         "meal_type": s["meal_type"],
                         "recipe_name": s["recipe_name"],

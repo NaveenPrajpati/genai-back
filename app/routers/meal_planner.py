@@ -677,7 +677,11 @@ async def plan_agent(state: PlannerState):
             {"status": "approved", "resolved_at": datetime.now().isoformat()}
         ).eq("id", approval_id).execute()
 
-    return {"intent": state.get("intent", "plan"), "plan_status": "approved", "plan_id": plan_id}
+    return {
+        "intent": state.get("intent", "plan"),
+        "plan_status": "approved",
+        "plan_id": plan_id,
+    }
 
 
 async def load_memory(state: PlannerState):

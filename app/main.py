@@ -6,16 +6,16 @@ from dotenv import load_dotenv
 
 from app.routers import (
     emailassistant,
+    learning_tracker,
     recipegenerator,
     users,
     webscraping,
-    meal_planner,
     personal_assistant,
 )
 from app.database import connect_db, close_db
 from app.routers import rag
 from app.routers import chat
-from app.routers.meal_planner import graph, run_triggers
+from app.routers.learning_tracker import graph, run_triggers
 from app.routers.personal_assistant import graph as pa_graph, run_pa_triggers
 from app.services.user_service import cleanup_expired_guests
 from app.database import get_db
@@ -118,7 +118,7 @@ app.add_middleware(
 app.include_router(prefix="/api/user", router=users.router)
 app.include_router(prefix="/api", router=rag.router)
 app.include_router(prefix="/api", router=chat.router)
-app.include_router(prefix="/api", router=meal_planner.mealRouter)
+app.include_router(prefix="/api", router=learning_tracker.mealRouter)
 app.include_router(prefix="/api", router=personal_assistant.paRouter)
 app.include_router(prefix="/api", router=webscraping.router)
 app.include_router(prefix="/api", router=emailassistant.router)
