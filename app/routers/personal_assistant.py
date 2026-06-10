@@ -71,10 +71,11 @@ class PAState(TypedDict, total=False):
     research: Optional[dict]
     suggestions: Optional[list]
     task_status: Optional[str]
+    response: Optional[str]
 
 
 class IntentOutput(BaseModel):
-    intent: str
+    intent: Literal["add", "list", "complete", "delete", "update", "research"]
 
 
 class TaskInput(BaseModel):
@@ -82,6 +83,24 @@ class TaskInput(BaseModel):
     details: Optional[str] = None
     priority: Optional[Literal["low", "medium", "high"]] = "medium"
     due_at: Optional[str] = None  # ISO date/datetime if the user gave one
+
+
+class TaskUpdateInput(BaseModel):
+    """Fields the LLM extracts when the user wants to modify an existing task."""
+
+    title: Optional[str] = None  # existing task to match
+    new_title: Optional[str] = None
+    new_priority: Optional[Literal["low", "medium", "high"]] = None
+    new_due_at: Optional[str] = None
+    new_details: Optional[str] = None
+
+
+class TaskUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    details: Optional[str] = None
+    priority: Optional[Literal["low", "medium", "high"]] = None
+    due_at: Optional[str] = None
+    status: Optional[Literal["pending", "done"]] = None
 
 
 class TaskSelector(BaseModel):
@@ -135,10 +154,16 @@ async def insert_todo(user_id: str, data: dict) -> dict:
     return _serialize(doc)
 
 
-async def fetch_todos(user_id: str, status: Optional[str] = None) -> list:
-    query = {"user_id": user_id}
+async def fetch_todos(
+    user_id: str,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+) -> list:
+    query: dict = {"user_id": user_id}
     if status:
         query["status"] = status
+    if priority:
+        query["priority"] = priority
     cursor = get_db()[TODOS].find(query).sort("created_at", -1)
     docs = await cursor.to_list(length=500)
     return [_serialize(d) for d in docs]
@@ -182,6 +207,58 @@ async def delete_todos_by_ids(user_id: str, ids: List[str]) -> int:
         {"user_id": user_id, "_id": {"$in": [ObjectId(i) for i in ids]}}
     )
     return res.deleted_count
+
+
+async def get_todo_by_id(user_id: str, task_id: str) -> Optional[dict]:
+    try:
+        doc = await get_db()[TODOS].find_one(
+            {"_id": ObjectId(task_id), "user_id": user_id}
+        )
+        return _serialize(doc) if doc else None
+    except Exception:
+        return None
+
+
+async def update_todo(user_id: str, title: str, updates: dict) -> Optional[dict]:
+    """Find a pending task by title and apply field updates (agent path)."""
+    matches = await find_pending_todos(user_id, title, match_all=False)
+    if not matches:
+        return None
+    target_id = matches[0]["id"]
+    updates["updated_at"] = datetime.now().isoformat()
+    await get_db()[TODOS].update_one(
+        {"_id": ObjectId(target_id), "user_id": user_id},
+        {"$set": updates},
+    )
+    doc = await get_db()[TODOS].find_one({"_id": ObjectId(target_id)})
+    return _serialize(doc) if doc else None
+
+
+async def update_todo_by_id(user_id: str, task_id: str, updates: dict) -> Optional[dict]:
+    """Update a task by its MongoDB ID (direct API path)."""
+    try:
+        updates["updated_at"] = datetime.now().isoformat()
+        result = await get_db()[TODOS].update_one(
+            {"_id": ObjectId(task_id), "user_id": user_id},
+            {"$set": updates},
+        )
+        if result.matched_count == 0:
+            return None
+        doc = await get_db()[TODOS].find_one({"_id": ObjectId(task_id)})
+        return _serialize(doc) if doc else None
+    except Exception:
+        return None
+
+
+async def delete_todo_by_id(user_id: str, task_id: str) -> bool:
+    """Delete a single task by its MongoDB ID (direct API path, no HITL)."""
+    try:
+        res = await get_db()[TODOS].delete_one(
+            {"_id": ObjectId(task_id), "user_id": user_id}
+        )
+        return res.deleted_count > 0
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -290,8 +367,9 @@ async def classify_intent(state: PAState):
                 "- list: view or check existing tasks\n"
                 "- complete: mark an existing task as done\n"
                 "- delete: remove/cancel an existing task (destructive)\n"
+                "- update: change an existing task's title, priority, due date, or details\n"
                 "- research: look up information about a topic or task\n"
-                "Reply with one word only: add, list, complete, delete, or research.",
+                "Reply with one word only: add, list, complete, delete, update, or research.",
             ),
             ("human", "{text}"),
         ]
@@ -356,6 +434,37 @@ async def todo_agent(state: PAState):
 
     if intent == "delete":
         return await _delete_with_approval(state)
+
+    if intent == "update":
+        chain = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "From the user's message, extract: which existing task to update "
+                    "(title field to match) and what changes to apply "
+                    "(new_title, new_priority, new_due_at, new_details). "
+                    "Only populate fields that the user explicitly wants to change.",
+                ),
+                ("human", "{text}"),
+            ]
+        ) | llm.with_structured_output(TaskUpdateInput)
+        update_input: TaskUpdateInput = await chain.ainvoke({"text": state["query"]})
+        updates = {
+            k: v
+            for k, v in {
+                "title": update_input.new_title,
+                "priority": update_input.new_priority,
+                "due_at": update_input.new_due_at,
+                "details": update_input.new_details,
+            }.items()
+            if v is not None
+        }
+        updated = await update_todo(
+            user_id, update_input.title or state["query"], updates
+        )
+        if not updated:
+            return {"intent": "update", "task_status": "not_found"}
+        return {"intent": "update", "task_status": "updated", "todos": [updated]}
 
     return {"intent": intent, "task_status": "unknown"}
 
@@ -475,11 +584,54 @@ async def research_agent(state: PAState):
 
 def decide_agent(state: PAState):
     intent = state.get("intent")
-    if intent in ("add", "list", "complete", "delete"):
+    if intent in ("add", "list", "complete", "delete", "update"):
         return "todo_agent"
     if intent == "research":
         return "research_agent"
     return END
+
+
+class SynthesisOutput(BaseModel):
+    response: str
+
+
+async def synthesize_response(state: PAState):
+    """Turn the structured operation result into a short, friendly plain-English reply."""
+    intent = state.get("intent", "")
+    task_status = state.get("task_status", "")
+    todos = state.get("todos") or []
+    research = state.get("research")
+
+    parts = [f"Intent: {intent}", f"Status: {task_status}"]
+    if todos:
+        task_lines = "\n".join(
+            f"  - [{t.get('priority', '?')}] {t.get('title', '')} "
+            f"(due: {t.get('due_at') or 'none'}, status: {t.get('status', '')})"
+            for t in todos[:20]
+        )
+        parts.append(f"Tasks:\n{task_lines}")
+    if research:
+        parts.append(f"Research summary: {research.get('summary', '')}")
+        if research.get("key_points"):
+            parts.append("Key points: " + "; ".join(research["key_points"]))
+
+    context = "\n".join(parts)
+    messages = [
+        SystemMessage(
+            content=(
+                "You are a concise personal assistant. Based on the operation result "
+                "below, write a short, friendly reply to the user. Describe what "
+                "happened in plain language — do not dump raw data."
+            )
+        ),
+        HumanMessage(
+            content=f'User said: "{state.get("query", "")}"\n\nResult:\n{context}'
+        ),
+    ]
+    result: SynthesisOutput = await llm.with_structured_output(SynthesisOutput).ainvoke(
+        messages
+    )
+    return {"response": result.response}
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +642,7 @@ graph.add_node("load_memory", load_memory)
 graph.add_node("classify_intent", classify_intent)
 graph.add_node("todo_agent", todo_agent)
 graph.add_node("research_agent", research_agent)
+graph.add_node("synthesize", synthesize_response)
 graph.add_edge(START, "load_memory")
 graph.add_edge("load_memory", "classify_intent")
 graph.add_conditional_edges(
@@ -497,6 +650,9 @@ graph.add_conditional_edges(
     decide_agent,
     ["todo_agent", "research_agent", END],
 )
+graph.add_edge("todo_agent", "synthesize")
+graph.add_edge("research_agent", "synthesize")
+graph.add_edge("synthesize", END)
 
 
 # --------------------------------------------------------------------------- #
@@ -603,13 +759,74 @@ async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@paRouter.get("/tasks/stats")
+async def task_stats(current_user: Annotated[dict, Depends(get_current_user)]):
+    pipeline = [
+        {"$match": {"user_id": current_user["uid"]}},
+        {
+            "$group": {
+                "_id": {"status": "$status", "priority": "$priority"},
+                "count": {"$sum": 1},
+            }
+        },
+    ]
+    docs = await get_db()[TODOS].aggregate(pipeline).to_list(length=100)
+    stats: dict = {"total": 0, "by_status": {}, "by_priority": {}}
+    for doc in docs:
+        s = doc["_id"]["status"]
+        p = doc["_id"].get("priority") or "none"
+        n = doc["count"]
+        stats["total"] += n
+        stats["by_status"][s] = stats["by_status"].get(s, 0) + n
+        stats["by_priority"][p] = stats["by_priority"].get(p, 0) + n
+    return {"status": "done", "result": stats}
+
+
 @paRouter.get("/tasks")
 async def list_tasks(
     current_user: Annotated[dict, Depends(get_current_user)],
     status: Optional[str] = None,
+    priority: Optional[str] = None,
 ):
-    todos = await fetch_todos(current_user["uid"], status=status)
+    todos = await fetch_todos(current_user["uid"], status=status, priority=priority)
     return {"status": "done", "result": todos}
+
+
+@paRouter.get("/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    todo = await get_todo_by_id(current_user["uid"], task_id)
+    if not todo:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"status": "done", "result": todo}
+
+
+@paRouter.put("/tasks/{task_id}")
+async def update_task(
+    task_id: str,
+    body: TaskUpdateRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    updated = await update_todo_by_id(current_user["uid"], task_id, updates)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"status": "done", "result": updated}
+
+
+@paRouter.delete("/tasks/{task_id}")
+async def delete_task(
+    task_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    deleted = await delete_todo_by_id(current_user["uid"], task_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return {"status": "done"}
 
 
 @paRouter.post("/toggle-trigger")
@@ -623,7 +840,9 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
             .eq("action_type", "pa_digest")
             .execute()
         )
+        new_enabled = True
         if existing and existing.data:
+            new_enabled = not existing.data[0]["enabled"]
             for t in existing.data:
                 supabase.table("triggers").update({"enabled": not t["enabled"]}).eq(
                     "id", t["id"]
@@ -639,7 +858,21 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
                     "last_run_at": None,
                 }
             ).execute()
-        return {"status": "done"}
+        return {"status": "done", "enabled": new_enabled}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@paRouter.get("/memory")
+async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
+    try:
+        rows = (
+            supabase.table("memory")
+            .select("key, value")
+            .eq("user_id", current_user["uid"])
+            .execute()
+        )
+        return {"status": "done", "result": rows.data or []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
