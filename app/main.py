@@ -79,9 +79,10 @@ async def lifespan(app: FastAPI):
         app.state.agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
 
+    # Daily learning digest: bullet-point tips on each user's active topic at 09:00.
     scheduler.add_job(
         run_triggers,
-        CronTrigger(hour=18, minute=30, day_of_week="sun"),
+        CronTrigger(hour=9, minute=0),
         args=[app.state.agent],
     )
     # Personal-assistant daily task digest at 08:00.
