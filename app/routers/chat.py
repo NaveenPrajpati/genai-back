@@ -1,16 +1,3 @@
-"""
-routers/chat.py
-===============
-CRUD for chat sessions and their messages. All persistence is delegated to
-app/services/storage.py, so this file is purely request/response shaping.
-
-Endpoints:
-  POST   /chat                    create a chat
-  GET    /chat                    list chats (most-recently-updated first)
-  GET    /chat/{chat_id}/messages messages for a chat (chronological)
-  DELETE /chat/{chat_id}          delete a chat (+ messages via cascade)
-"""
-
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -18,7 +5,9 @@ from pydantic import BaseModel
 
 from app.services import storage
 
-router = APIRouter(prefix="/chat", tags=["chat"], responses={404: {"description": "Not found"}})
+router = APIRouter(
+    prefix="/chat", tags=["chat"], responses={404: {"description": "Not found"}}
+)
 
 
 class CreateChatRequest(BaseModel):
@@ -50,7 +39,10 @@ async def get_messages(chat_id: str):
     try:
         return {
             "message": "messages fetched",
-            "data": {"chat": storage.get_chat(chat_id), "messages": storage.get_messages(chat_id)},
+            "data": {
+                "chat": storage.get_chat(chat_id),
+                "messages": storage.get_messages(chat_id),
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -11,18 +11,21 @@ logging.basicConfig(
 )
 
 from app.routers import (
-    emailassistant,
     learning_tracker,
     recipegenerator,
     users,
-    webscraping,
     personal_assistant,
+    meal_planner,
 )
 from app.database import connect_db, close_db
 from app.routers import rag
 from app.routers import chat
-from app.routers.learning_tracker import graph, run_triggers
-from app.routers.personal_assistant import graph as pa_graph, run_pa_triggers
+from app.agents.learning_tracker import graph, run_triggers
+from app.agents.personal_assistant import graph as pa_graph, run_pa_triggers
+from app.agents.meal_planner import (
+    graph as meal_graph,
+    run_triggers as run_meal_triggers,
+)
 from app.services.user_service import cleanup_expired_guests
 from app.database import get_db
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -68,6 +71,7 @@ async def lifespan(app: FastAPI):
 
         app.state.agent = graph.compile(checkpointer=checkpointer)
         app.state.pa_agent = pa_graph.compile(checkpointer=checkpointer)
+        app.state.meal_agent = meal_graph.compile(checkpointer=checkpointer)
         print("Using PostgresSaver checkpointer")
 
     except Exception as e:
@@ -78,6 +82,7 @@ async def lifespan(app: FastAPI):
 
         app.state.agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
+        app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
 
     # Daily learning digest: bullet-point tips on each user's active topic at 09:00.
     scheduler.add_job(
@@ -90,6 +95,12 @@ async def lifespan(app: FastAPI):
         run_pa_triggers,
         CronTrigger(hour=8, minute=0),
         args=[app.state.pa_agent],
+    )
+    # Meal-planner weekly plan generation: Sunday 18:30.
+    scheduler.add_job(
+        run_meal_triggers,
+        CronTrigger(day_of_week="sun", hour=18, minute=30),
+        args=[app.state.meal_agent],
     )
     # Failsafe: sweep any guests the TTL index missed (e.g. during downtime)
     scheduler.add_job(cleanup_expired_guests, "interval", hours=1)
@@ -125,10 +136,9 @@ app.add_middleware(
 app.include_router(prefix="/api/user", router=users.router)
 app.include_router(prefix="/api", router=rag.router)
 app.include_router(prefix="/api", router=chat.router)
-app.include_router(prefix="/api", router=learning_tracker.mealRouter)
-app.include_router(prefix="/api", router=personal_assistant.paRouter)
-app.include_router(prefix="/api", router=webscraping.router)
-app.include_router(prefix="/api", router=emailassistant.router)
+app.include_router(prefix="/api", router=learning_tracker.router)
+app.include_router(prefix="/api", router=personal_assistant.router)
+app.include_router(prefix="/api", router=meal_planner.router)
 app.include_router(prefix="/api", router=recipegenerator.router)
 
 

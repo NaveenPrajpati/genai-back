@@ -17,9 +17,6 @@ router = APIRouter(
 )
 
 
-# ── Tools ──
-
-
 @tool
 def generate_recipe(
     ingredients: str,
@@ -53,8 +50,6 @@ def get_nutritional_info(recipe_name: str) -> str:
     return f"NUTRITION_REQUEST: {recipe_name}"
 
 
-# ── Agent ──
-
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 
 agent = create_agent(
@@ -82,64 +77,171 @@ agent = create_agent(
 )
 
 
-# ── Request schema ──
-
 class RecipeRequest(BaseModel):
-    ingredients: str  # comma-separated
+    ingredients: str
     cuisine: str = "Indian"
-    diet: str = "veg"  # "veg" or "nonveg"
+    diet: str = "veg"
 
 
-# ── Ingredient suggestions data ──
-# Organized by category for the frontend autocomplete
 INGREDIENT_SUGGESTIONS = {
     "vegetables": [
-        "Potato", "Tomato", "Onion", "Garlic", "Ginger", "Green Chili",
-        "Capsicum", "Carrot", "Cauliflower", "Broccoli", "Spinach",
-        "Peas", "Corn", "Mushroom", "Cabbage", "Eggplant", "Okra",
-        "Bottle Gourd", "Bitter Gourd", "Ridge Gourd", "Pumpkin",
-        "Sweet Potato", "Beetroot", "Radish", "Cucumber", "Zucchini",
-        "Bell Pepper", "Spring Onion", "Lettuce", "Avocado",
-        "Asparagus", "Artichoke", "Celery", "Leek",
+        "Potato",
+        "Tomato",
+        "Onion",
+        "Garlic",
+        "Ginger",
+        "Green Chili",
+        "Capsicum",
+        "Carrot",
+        "Cauliflower",
+        "Broccoli",
+        "Spinach",
+        "Peas",
+        "Corn",
+        "Mushroom",
+        "Cabbage",
+        "Eggplant",
+        "Okra",
+        "Bottle Gourd",
+        "Bitter Gourd",
+        "Ridge Gourd",
+        "Pumpkin",
+        "Sweet Potato",
+        "Beetroot",
+        "Radish",
+        "Cucumber",
+        "Zucchini",
+        "Bell Pepper",
+        "Spring Onion",
+        "Lettuce",
+        "Avocado",
+        "Asparagus",
+        "Artichoke",
+        "Celery",
+        "Leek",
     ],
     "fruits": [
-        "Lemon", "Lime", "Mango", "Banana", "Apple", "Orange",
-        "Coconut", "Pineapple", "Tamarind", "Pomegranate",
+        "Lemon",
+        "Lime",
+        "Mango",
+        "Banana",
+        "Apple",
+        "Orange",
+        "Coconut",
+        "Pineapple",
+        "Tamarind",
+        "Pomegranate",
     ],
     "dairy": [
-        "Milk", "Curd", "Paneer", "Butter", "Ghee", "Cream",
-        "Cheese", "Mozzarella", "Parmesan", "Yogurt", "Cottage Cheese",
-        "Whipped Cream", "Condensed Milk",
+        "Milk",
+        "Curd",
+        "Paneer",
+        "Butter",
+        "Ghee",
+        "Cream",
+        "Cheese",
+        "Mozzarella",
+        "Parmesan",
+        "Yogurt",
+        "Cottage Cheese",
+        "Whipped Cream",
+        "Condensed Milk",
     ],
     "proteins_veg": [
-        "Tofu", "Soy Chunks", "Chickpeas", "Lentils", "Kidney Beans",
-        "Black Beans", "Green Gram", "Bengal Gram", "Peanuts",
-        "Cashew", "Almond", "Walnut", "Sesame Seeds", "Flax Seeds",
+        "Tofu",
+        "Soy Chunks",
+        "Chickpeas",
+        "Lentils",
+        "Kidney Beans",
+        "Black Beans",
+        "Green Gram",
+        "Bengal Gram",
+        "Peanuts",
+        "Cashew",
+        "Almond",
+        "Walnut",
+        "Sesame Seeds",
+        "Flax Seeds",
     ],
     "proteins_nonveg": [
-        "Chicken", "Chicken Breast", "Chicken Thigh", "Mutton",
-        "Lamb", "Fish", "Prawns", "Shrimp", "Eggs", "Egg White",
-        "Salmon", "Tuna", "Crab", "Squid", "Pork", "Beef",
-        "Turkey", "Duck", "Bacon", "Sausage",
+        "Chicken",
+        "Chicken Breast",
+        "Chicken Thigh",
+        "Mutton",
+        "Lamb",
+        "Fish",
+        "Prawns",
+        "Shrimp",
+        "Eggs",
+        "Egg White",
+        "Salmon",
+        "Tuna",
+        "Crab",
+        "Squid",
+        "Pork",
+        "Beef",
+        "Turkey",
+        "Duck",
+        "Bacon",
+        "Sausage",
     ],
     "grains": [
-        "Rice", "Basmati Rice", "Wheat Flour", "Maida", "Bread",
-        "Pasta", "Noodles", "Oats", "Semolina", "Poha",
-        "Quinoa", "Couscous", "Tortilla", "Roti", "Puff Pastry",
+        "Rice",
+        "Basmati Rice",
+        "Wheat Flour",
+        "Maida",
+        "Bread",
+        "Pasta",
+        "Noodles",
+        "Oats",
+        "Semolina",
+        "Poha",
+        "Quinoa",
+        "Couscous",
+        "Tortilla",
+        "Roti",
+        "Puff Pastry",
     ],
     "spices": [
-        "Turmeric", "Cumin", "Coriander Powder", "Red Chili Powder",
-        "Garam Masala", "Mustard Seeds", "Curry Leaves", "Bay Leaf",
-        "Cinnamon", "Cardamom", "Cloves", "Black Pepper",
-        "Fennel Seeds", "Fenugreek", "Asafoetida", "Saffron",
-        "Oregano", "Basil", "Thyme", "Rosemary", "Paprika",
-        "Star Anise", "Nutmeg",
+        "Turmeric",
+        "Cumin",
+        "Coriander Powder",
+        "Red Chili Powder",
+        "Garam Masala",
+        "Mustard Seeds",
+        "Curry Leaves",
+        "Bay Leaf",
+        "Cinnamon",
+        "Cardamom",
+        "Cloves",
+        "Black Pepper",
+        "Fennel Seeds",
+        "Fenugreek",
+        "Asafoetida",
+        "Saffron",
+        "Oregano",
+        "Basil",
+        "Thyme",
+        "Rosemary",
+        "Paprika",
+        "Star Anise",
+        "Nutmeg",
     ],
     "sauces_condiments": [
-        "Soy Sauce", "Tomato Ketchup", "Vinegar", "Mustard",
-        "Sriracha", "Hot Sauce", "Worcestershire Sauce", "Fish Sauce",
-        "Oyster Sauce", "Hoisin Sauce", "Tahini", "Pesto",
-        "Coconut Milk", "Cream Cheese",
+        "Soy Sauce",
+        "Tomato Ketchup",
+        "Vinegar",
+        "Mustard",
+        "Sriracha",
+        "Hot Sauce",
+        "Worcestershire Sauce",
+        "Fish Sauce",
+        "Oyster Sauce",
+        "Hoisin Sauce",
+        "Tahini",
+        "Pesto",
+        "Coconut Milk",
+        "Cream Cheese",
     ],
 }
 
@@ -155,22 +257,16 @@ async def get_suggestions(diet: str = "veg"):
     return {"suggestions": suggestions}
 
 
-# ── Non-streaming endpoint ──
-
 @router.post("/generate")
 async def generate(request: RecipeRequest):
     user_message = (
         f"Generate a {request.diet} {request.cuisine} recipe using these ingredients: "
         f"{request.ingredients}"
     )
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": user_message}]}
-    )
+    result = agent.invoke({"messages": [{"role": "user", "content": user_message}]})
     ai_message = result["messages"][-1].content
     return {"recipe": ai_message}
 
-
-# ── Streaming endpoint ──
 
 @router.post("/generate/stream")
 async def generate_stream(request: RecipeRequest):
