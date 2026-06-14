@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 
 from app.core.config import supabase
+from app.services.push_service import send_push_notification
 from .repository import get_monday
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,12 @@ async def run_triggers(agent):
                 logger.info(
                     f"[trigger] Approval created for existing plan, user={t['user_id']}"
                 )
+                await send_push_notification(
+                    t["user_id"],
+                    title="Next week's meal plan is ready",
+                    body=f"Review your plan for the week of {week_start}.",
+                    data={"type": "save_plan", "week_start": week_start},
+                )
             else:
                 # No existing plan: invoke agent to generate one
                 config = {"configurable": {"thread_id": thread_id}}
@@ -84,6 +91,12 @@ async def run_triggers(agent):
                 if "__interrupt__" in agent_result:
                     logger.info(
                         f"[trigger] New plan approval created, user={t['user_id']}"
+                    )
+                    await send_push_notification(
+                        t["user_id"],
+                        title="Next week's meal plan is ready",
+                        body=f"Review your plan for the week of {week_start}.",
+                        data={"type": "save_plan", "week_start": week_start},
                     )
 
             supabase.table("triggers").update({"last_run_at": now.isoformat()}).eq(

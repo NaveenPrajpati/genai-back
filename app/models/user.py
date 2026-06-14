@@ -67,6 +67,10 @@ class UserLogin(BaseModel):
     password: str = Field(..., min_length=1)
 
 
+class ExpoPushTokenUpdate(BaseModel):
+    expo_push_token: str = Field(..., min_length=1, max_length=200)
+
+
 class UserResponse(BaseModel):
     id: PyObjectId = Field(alias="_id")
     name: str
@@ -77,6 +81,7 @@ class UserResponse(BaseModel):
     expires_at: Optional[datetime] = None
     diet: str = "vegetarian"
     protein_target: int = 100
+    expo_push_token: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 

@@ -1,6 +1,12 @@
 from typing import Annotated
 from fastapi import APIRouter, HTTPException, Depends
-from app.models.user import UserCreate, UserLogin, UserResponse, AuthResponse
+from app.models.user import (
+    UserCreate,
+    UserLogin,
+    UserResponse,
+    AuthResponse,
+    ExpoPushTokenUpdate,
+)
 from app.services import user_service
 from app.dependencies import get_current_user
 
@@ -52,6 +58,20 @@ async def convert_guest(
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: Annotated[dict, Depends(get_current_user)]):
     return current_user
+
+
+@router.patch("/me/expo-push-token", response_model=UserResponse)
+async def update_expo_push_token(
+    payload: ExpoPushTokenUpdate,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Register or update the Expo push notification token for the current user."""
+    updated = await user_service.update_expo_push_token(
+        str(current_user["_id"]), payload.expo_push_token
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return updated
 
 
 @router.get("/", response_model=list[UserResponse])

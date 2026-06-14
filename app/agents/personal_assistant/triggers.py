@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 
 from app.core.config import supabase
+from app.services.push_service import send_push_notification
 from .repository import fetch_todos, categorize_agenda
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ async def run_pa_triggers(agent=None):
         try:
             pending = await fetch_todos(t["user_id"], status="pending")
             agenda = categorize_agenda(pending)
+            digest = _compose_digest(agenda)
             supabase.table("approvals").insert(
                 {
                     "user_id": t["user_id"],
@@ -59,7 +61,7 @@ async def run_pa_triggers(agent=None):
                     "payload": {
                         "generated_at": now.isoformat(),
                         "pending_count": len(pending),
-                        "digest": _compose_digest(agenda),
+                        "digest": digest,
                         "counts": {k: len(v) for k, v in agenda.items()},
                         "tasks": pending,
                     },
@@ -69,6 +71,12 @@ async def run_pa_triggers(agent=None):
             supabase.table("triggers").update({"last_run_at": now.isoformat()}).eq(
                 "id", t["id"]
             ).execute()
+            await send_push_notification(
+                t["user_id"],
+                title="Your daily agenda",
+                body=digest,
+                data={"type": "pa_digest", "pending_count": len(pending)},
+            )
             logger.info(
                 "pa digest created for user=%s (%d pending)",
                 t["user_id"],

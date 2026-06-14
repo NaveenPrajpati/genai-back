@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.llm import llm
 from app.database import get_db
+from app.services.push_service import send_push_notification
 from .state import TopicTipsOutput
 from .repository import active_topic
 from .tools import tavily_search_tool
@@ -104,6 +105,13 @@ async def run_triggers(agent=None):
                 )
                 logger.info(
                     "learning digest created user=%s topic=%s", userId, topic_title
+                )
+
+                await send_push_notification(
+                    userId,
+                    title=f"Today's tips: {topic_title}",
+                    body=result.bullets[0] if result.bullets else "Your daily learning digest is ready.",
+                    data={"type": "learning_digest", "topicId": topic.get("id")},
                 )
             except Exception as e:
                 logger.error(

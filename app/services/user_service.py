@@ -146,6 +146,19 @@ async def convert_guest_to_real(user_id: str, user: UserCreate) -> tuple[dict, s
     return updated, token
 
 
+async def update_expo_push_token(user_id: str, expo_push_token: str) -> dict | None:
+    col = _collection()
+    if not ObjectId.is_valid(user_id):
+        return None
+    result = await col.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"expo_push_token": expo_push_token}},
+    )
+    if result.matched_count == 0:
+        return None
+    return await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
+
+
 async def cleanup_expired_guests() -> int:
     """Failsafe cleanup — MongoDB TTL index is the primary mechanism."""
     col = _collection()
