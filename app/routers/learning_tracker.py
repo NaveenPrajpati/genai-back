@@ -1,11 +1,13 @@
 """HTTP routes for the learning-tracker agent. Agent logic lives in app.agents.learning_tracker."""
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Literal, Annotated
 
 from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from bson import ObjectId
 from langgraph.types import Command
@@ -22,7 +24,6 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
-# Intents whose messages are worth mining for durable learner facts.
 MEMORY_INTENTS = {
     "create_roadmap",
     "modify_roadmap",
@@ -36,6 +37,11 @@ class QueryRequest(BaseModel):
     text: str
     roadmapId: Optional[str] = None
     thread_id: Optional[str] = None
+
+
+def _sse(event: dict) -> str:
+    """Serialize one event as a Server-Sent Events frame."""
+    return f"data: {json.dumps(event)}\n\n"
 
 
 @router.post("/query")
@@ -81,6 +87,94 @@ async def ask(
         }
 
     return {"status": "done", "result": result}
+
+
+@router.post("/query/stream")
+async def ask_stream(
+    body: QueryRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Streaming counterpart of /query. Streams the tutor agent's explanation
+    token-by-token over SSE; for other intents (quiz, roadmap, …) no tokens are
+    emitted and the final state arrives in the `done` event."""
+    agent = request.app.state.agent
+
+    thread_id = body.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    _excluded = {"_id", "expires_at", "password_hash"}
+    user_data = {k: v for k, v in current_user.items() if k not in _excluded}
+    inputs = {
+        "query": body.text,
+        "userId": current_user["uid"],
+        "thread_id": thread_id,
+        "roadmapId": body.roadmapId,
+        "current_user": user_data,
+    }
+
+    async def generate():
+        try:
+            yield _sse({"type": "thread", "thread_id": thread_id})
+
+            # stream_mode="messages" yields (chunk, metadata) for every LLM token
+            # across all nodes. We only forward text tokens from tutor_agent —
+            # other nodes use structured output (empty .content) and would leak
+            # tool-call JSON otherwise.
+            async for chunk, metadata in agent.astream(
+                inputs, config=config, stream_mode="messages"
+            ):
+                if metadata.get("langgraph_node") == "tutor_agent" and chunk.content:
+                    yield _sse({"type": "token", "token": chunk.content})
+
+            snapshot = await agent.aget_state(config)
+            values = snapshot.values if snapshot else {}
+
+            # A node hit an interrupt (e.g. roadmap approval) — surface it instead
+            # of a normal result, mirroring /query.
+            interrupts = snapshot.interrupts if snapshot else None
+            if snapshot and snapshot.next and interrupts:
+                yield _sse(
+                    {
+                        "type": "needs_approval",
+                        "thread_id": thread_id,
+                        "proposal": interrupts[0].value,
+                    }
+                )
+                return
+
+            intent = values.get("intent")
+            if intent in MEMORY_INTENTS:
+                background_tasks.add_task(
+                    write_memory,
+                    current_user["uid"],
+                    body.text,
+                    values.get("memory", {}),
+                )
+
+            yield _sse(
+                {
+                    "type": "done",
+                    "result": {
+                        "intent": intent,
+                        "topic_explaination": values.get("topic_explaination"),
+                        "quiz": values.get("quiz"),
+                        "quizId": values.get("quizId"),
+                        "suggestions": values.get("suggestions"),
+                        "next_topic": values.get("next_topic"),
+                        "progress": values.get("progress"),
+                    },
+                }
+            )
+        except Exception as exc:
+            logger.exception("learning stream failed")
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 class ApproveRequest(BaseModel):

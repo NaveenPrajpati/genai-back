@@ -17,7 +17,11 @@ router = APIRouter()
 async def signup(user: UserCreate):
     try:
         created, token = await user_service.signup_user(user)
-        return {"message": "Account created successfully", "token": token, "user": created}
+        return {
+            "message": "Account created successfully",
+            "token": token,
+            "user": created,
+        }
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -45,12 +49,18 @@ async def convert_guest(
 ):
     """Convert the authenticated guest account into a permanent account."""
     if not current_user.get("is_guest"):
-        raise HTTPException(status_code=400, detail="Only guest accounts can be converted")
+        raise HTTPException(
+            status_code=400, detail="Only guest accounts can be converted"
+        )
     try:
         updated, token = await user_service.convert_guest_to_real(
             str(current_user["_id"]), user
         )
-        return {"message": "Account converted successfully", "token": token, "user": updated}
+        return {
+            "message": "Account converted successfully",
+            "token": token,
+            "user": updated,
+        }
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -66,6 +76,7 @@ async def update_expo_push_token(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Register or update the Expo push notification token for the current user."""
+    print(payload)
     updated = await user_service.update_expo_push_token(
         str(current_user["_id"]), payload.expo_push_token
     )

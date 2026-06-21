@@ -14,7 +14,6 @@ from .state import (
     LearningState,
     RoadmapOutput,
     IntentOutput,
-    TutorOutput,
     QuizOutput,
     UpdateProgressOutput,
     ResearchOutput,
@@ -218,18 +217,21 @@ async def tutor_agent(state: LearningState):
             ]
         )
 
-        chain = findPrompt | llm.with_structured_output(TutorOutput)
-        result: TutorOutput = await chain.ainvoke(
+        # Plain text (no structured output) so the tokens can stream as they are
+        # generated — see the /learning/query/stream route. The full text is also
+        # returned, so the non-streaming /query route keeps working unchanged.
+        chain = findPrompt | llm
+        response = await chain.ainvoke(
             {
                 "text": state["query"],
                 "existing_roadmap": roadmap_title,
                 "memory": state.get("memory") or "none",
             }
         )
-        logger.info("query data %s", result)
+        logger.info("query data %s", response.content)
 
         return {
-            "topic_explaination": result.topic_explaination,
+            "topic_explaination": response.content,
         }
     elif state.get("intent") == "quiz":
         findPrompt = ChatPromptTemplate.from_messages(

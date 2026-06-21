@@ -12,7 +12,6 @@ logging.basicConfig(
 
 from app.routers import (
     learning_tracker,
-    recipegenerator,
     users,
     personal_assistant,
     meal_planner,
@@ -139,7 +138,6 @@ app.include_router(prefix="/api", router=chat.router)
 app.include_router(prefix="/api", router=learning_tracker.router)
 app.include_router(prefix="/api", router=personal_assistant.router)
 app.include_router(prefix="/api", router=meal_planner.router)
-app.include_router(prefix="/api", router=recipegenerator.router)
 
 
 @app.get("/")
