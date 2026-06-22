@@ -19,18 +19,39 @@ def _now() -> str:
 
 # ── Ingestion logs ───────────────────────────────────────────────────────────
 
-def create_ingestion_log(doc_id: str, source: str, file_type: str, ingested_at: str) -> None:
-    supabase.table("rag_ingestion_logs").insert({
-        "doc_id": doc_id,
-        "source": source,
-        "file_type": file_type,
-        "status": "queued",
-        "ingested_at": ingested_at,
-    }).execute()
+
+def create_ingestion_log(
+    doc_id: str, source: str, file_type: str, ingested_at: str
+) -> None:
+    supabase.table("rag_ingestion_logs").insert(
+        {
+            "doc_id": doc_id,
+            "source": source,
+            "file_type": file_type,
+            "status": "queued",
+            "ingested_at": ingested_at,
+        }
+    ).execute()
 
 
 def update_ingestion_log(doc_id: str, updates: dict) -> None:
     supabase.table("rag_ingestion_logs").update(updates).eq("doc_id", doc_id).execute()
+
+
+def get_ingestion_log(doc_id: str):
+    """Return the ingestion log row for `doc_id`, or None if it doesn't exist."""
+    rows = (
+        supabase.table("rag_ingestion_logs")
+        .select("*")
+        .eq("doc_id", doc_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def delete_ingestion_log(doc_id: str) -> None:
+    supabase.table("rag_ingestion_logs").delete().eq("doc_id", doc_id).execute()
 
 
 def list_ingestion_logs() -> list:
@@ -42,8 +63,6 @@ def list_ingestion_logs() -> list:
         .data
     )
 
-
-# ── Chats ────────────────────────────────────────────────────────────────────
 
 def create_chat(title: str) -> str:
     """Insert a new chat and return its id."""
@@ -78,10 +97,9 @@ def get_chat(chat_id: str):
 
 
 def delete_chat(chat_id: str) -> None:
+    supabase.table("rag_messages").delete().eq("chat_id", chat_id).execute()
     supabase.table("rag_chats").delete().eq("id", chat_id).execute()
 
-
-# ── Messages ─────────────────────────────────────────────────────────────────
 
 def get_messages(chat_id: str) -> list:
     return (
@@ -103,20 +121,22 @@ def save_messages(
 ) -> None:
     """Insert the user + assistant message pair and bump the chat's updated_at."""
     now = _now()
-    supabase.table("rag_messages").insert([
-        {
-            "chat_id": chat_id,
-            "role": "user",
-            "content": question,
-            "ingestions": ingestions,
-            "created_at": now,
-        },
-        {
-            "chat_id": chat_id,
-            "role": "assistant",
-            "content": answer,
-            "sources": sources,
-            "created_at": now,
-        },
-    ]).execute()
+    supabase.table("rag_messages").insert(
+        [
+            {
+                "chat_id": chat_id,
+                "role": "user",
+                "content": question,
+                "ingestions": ingestions,
+                "created_at": now,
+            },
+            {
+                "chat_id": chat_id,
+                "role": "assistant",
+                "content": answer,
+                "sources": sources,
+                "created_at": now,
+            },
+        ]
+    ).execute()
     supabase.table("rag_chats").update({"updated_at": now}).eq("id", chat_id).execute()

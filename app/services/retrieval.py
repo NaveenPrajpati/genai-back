@@ -115,6 +115,7 @@ from pydantic import ConfigDict
 
 from app.core.config import (
     get_pinecone_index,
+    EMBEDDING_DIM,
     RETRIEVER_TOP_K,
     RERANK_TOP_N,
     RERANKER_MODEL,
@@ -208,6 +209,30 @@ def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
     or your stored vectors won't match your query vectors.
     """
     _get_default_hybrid().add_texts(texts, metadatas=metadatas)
+
+
+def delete_doc_vectors(doc_id: str) -> int:
+    """
+    INGESTION-SIDE delete: remove every Pinecone vector belonging to one ingestion,
+    identified by its `doc_id` metadata. Returns the number of vectors deleted.
+
+    Serverless indexes don't support delete-by-metadata-filter, so we first query
+    for the matching vector ids (the filter does the selection — the query vector
+    and scores are irrelevant), then delete those ids in one call. `top_k` is
+    capped at Pinecone's 10_000 limit, which comfortably covers a single document.
+    """
+    index = get_pinecone_index()
+    response = index.query(
+        vector=[1.0] * EMBEDDING_DIM,
+        filter={"doc_id": doc_id},
+        top_k=10_000,
+        include_values=False,
+        include_metadata=False,
+    )
+    ids = [match["id"] for match in response.get("matches", [])]
+    if ids:
+        index.delete(ids=ids)
+    return len(ids)
 
 
 def build_retriever(
