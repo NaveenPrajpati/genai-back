@@ -1,0 +1,3 @@
+# Captured LLM I/O may contain real user data — never commit it.
+*
+!.gitignore

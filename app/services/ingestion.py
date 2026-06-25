@@ -58,17 +58,15 @@ WHAT YOU COULD DO TO IMPROVE INGESTION
    ingestion time. You can't filter or cite on metadata you never captured.
 """
 
-from typing import Callable, List
+from typing import List
 
 import requests
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import AsyncHtmlLoader
+from langchain_community.document_transformers import Html2TextTransformer
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# URL loader
-# ─────────────────────────────────────────────────────────────────────────────
 
 def load_url(url: str) -> List[Document]:
     """
@@ -89,42 +87,19 @@ def load_url(url: str) -> List[Document]:
     return [Document(page_content=text, metadata={"source": url})]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File loaders
-# ─────────────────────────────────────────────────────────────────────────────
+def load_url2(url: str) -> List[Document]:
 
-def load_pdf(path: str) -> List[Document]:
-    """PyPDFLoader: one Document per page; sets metadata['page'] (0-indexed)."""
-    return PyPDFLoader(path).load()
+    loader = AsyncHtmlLoader([url])
+    docs = loader.load()
 
+    html2text = Html2TextTransformer()
+    docs_transformed = html2text.transform_documents(docs)
 
-def load_text(path: str) -> List[Document]:
-    """TextLoader: the whole .txt file as one Document."""
-    return TextLoader(path).load()
+    text = "\n".join([doc.page_content for doc in docs_transformed])
+    return [Document(page_content=text, metadata={"source": url})]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loader registry  — extend this to support new file types
-# ─────────────────────────────────────────────────────────────────────────────
-# Mapping MIME type → (loader builder, file_type label, file suffix).
-# To add .docx support later, you'd add one row here and nothing else changes.
 
 SUPPORTED_FILE_TYPES = {
-    "application/pdf": {"suffix": ".pdf", "file_type": "pdf", "loader": load_pdf},
-    "text/plain": {"suffix": ".txt", "file_type": "text", "loader": load_text},
+    "application/pdf": {"suffix": ".pdf", "file_type": "pdf", "loader": PyPDFLoader},
+    "text/plain": {"suffix": ".txt", "file_type": "text", "loader": TextLoader},
 }
-
-
-def build_file_loader(content_type: str, path: str) -> Callable[[], List[Document]]:
-    """
-    Return a zero-arg callable that loads the file when invoked.
-
-    We return a *callable* (not the documents) so the heavy load can be deferred
-    to a background thread in the ingestion worker — keeping the HTTP request fast.
-    """
-    spec = SUPPORTED_FILE_TYPES.get(content_type)
-    if not spec:
-        supported = ", ".join(SUPPORTED_FILE_TYPES)
-        raise ValueError(f"Unsupported content type '{content_type}'. Supported: {supported}")
-    loader = spec["loader"]
-    return lambda: loader(path)

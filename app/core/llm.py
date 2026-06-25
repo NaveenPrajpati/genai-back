@@ -13,10 +13,20 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
 from app.core.config import LLM_MODEL
+from app.core.llm_capture import build_capture_callbacks
 
 # temperature=0 → deterministic, grounded answers (you almost always want this
 # for RAG; creativity here just means more hallucination).
-llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+#
+# `callbacks` attaches the distillation capture handler when LLM_CAPTURE=1 (no-op
+# otherwise). Because callbacks propagate to the underlying model, this records
+# every call — plain, with_structured_output, and bind_tools — for fine-tuning
+# data, without touching any agent code. See core/llm_capture.py.
+llm = ChatOpenAI(
+    model=LLM_MODEL,
+    temperature=0,
+    callbacks=build_capture_callbacks() or None,
+)
 # llm = ChatOllama(
 #     model="llama3:latest",
 #     temperature=0,

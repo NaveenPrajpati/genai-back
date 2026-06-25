@@ -1,18 +1,3 @@
-"""
-routers/rag.py
-==============
-The HTTP layer for the RAG pipeline. ROUTES SHOULD BE THIN: parse the request,
-call services, shape the response. All real work lives in app/services/*.
-
-Endpoints:
-  GET    /rag/get-files          list ingestion logs
-  POST   /rag/ingest/{action}    queue a file/url for ingestion (returns job_id)
-  GET    /rag/ingest/status/{id} poll ingestion status
-  DELETE /rag/ingest/{doc_id}    delete an ingestion (vectors + log row)
-  POST /rag/query                one-shot answer (non-streaming)
-  POST /rag/query/stream         token-by-token SSE answer, with semantic cache
-"""
-
 import os
 import json
 import uuid
@@ -29,7 +14,7 @@ from pydantic import BaseModel
 
 from app.core.llm import llm, RAG_PROMPT
 from app.services import storage, cache
-from app.services.ingestion import load_url, build_file_loader, SUPPORTED_FILE_TYPES
+from app.services.ingestion import load_url, SUPPORTED_FILE_TYPES
 from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
 from app.services.retrieval import build_retriever, get_embeddings, delete_doc_vectors
 from app.services.generation import build_context, build_sources
@@ -42,9 +27,6 @@ router = APIRouter(
 )
 
 
-# ── Models ───────────────────────────────────────────────────────────────────
-
-
 class QueryRequest(BaseModel):
     question: str
     evaluate: bool = False
@@ -55,9 +37,6 @@ class QueryRequest(BaseModel):
 def _sse(event: dict) -> str:
     """Format one Server-Sent Event frame."""
     return f"data: {json.dumps(event)}\n\n"
-
-
-# ── Ingestion routes ─────────────────────────────────────────────────────────
 
 
 @router.get("/get-files", status_code=200)
@@ -102,7 +81,8 @@ async def ingest_document(
     if action == "url":
         if not data:
             raise HTTPException(
-                status_code=400, detail='`data` form field with JSON {"url": "..."} is required'
+                status_code=400,
+                detail='`data` form field with JSON {"url": "..."} is required',
             )
         url = json.loads(data)["url"]
         loader_fn = lambda: load_url(url)
@@ -116,12 +96,12 @@ async def ingest_document(
                 status_code=400, detail="Only PDF and text files are supported"
             )
 
-        suffix = SUPPORTED_FILE_TYPES[mime]["suffix"]
-        file_type = SUPPORTED_FILE_TYPES[mime]["file_type"]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        spec = SUPPORTED_FILE_TYPES[mime]
+        file_type, loader_cls = spec["file_type"], spec["loader"]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=spec["suffix"]) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
-        loader_fn = build_file_loader(mime, tmp_path)
+        loader_fn = lambda: loader_cls(tmp_path).load()
         display_source = file.filename
 
     queued_at = datetime.now(timezone.utc).isoformat()

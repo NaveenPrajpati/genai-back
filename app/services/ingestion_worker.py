@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 # Per-process job tracker for fast status polling.
 INGESTION_JOBS: dict[str, dict] = {}
 
-# Default splitter for ingestion (recursive is the sensible general default).
 _splitter = get_splitter(SplitStrategy.RECURSIVE)
 
 
@@ -47,7 +46,9 @@ async def run_ingestion(
 ) -> None:
     try:
         INGESTION_JOBS[job_id]["status"] = "processing"
-        await asyncio.to_thread(storage.update_ingestion_log, job_id, {"status": "processing"})
+        await asyncio.to_thread(
+            storage.update_ingestion_log, job_id, {"status": "processing"}
+        )
 
         # Step 1: load  ──────────────────────────────────────────────────────
         documents = await asyncio.to_thread(loader_fn)
@@ -74,12 +75,14 @@ async def run_ingestion(
         await asyncio.to_thread(hybrid_add_texts, texts, metadatas)
 
         completed_at = datetime.now(timezone.utc).isoformat()
-        INGESTION_JOBS[job_id].update({
-            "status": "completed",
-            "chunks": total,
-            "source": display_source,
-            "completed_at": completed_at,
-        })
+        INGESTION_JOBS[job_id].update(
+            {
+                "status": "completed",
+                "chunks": total,
+                "source": display_source,
+                "completed_at": completed_at,
+            }
+        )
         await asyncio.to_thread(
             storage.update_ingestion_log,
             job_id,
@@ -90,7 +93,9 @@ async def run_ingestion(
         logger.exception("Ingestion failed for job %s", job_id)
         INGESTION_JOBS[job_id].update({"status": "failed", "error": str(exc)})
         await asyncio.to_thread(
-            storage.update_ingestion_log, job_id, {"status": "failed", "error": str(exc)}
+            storage.update_ingestion_log,
+            job_id,
+            {"status": "failed", "error": str(exc)},
         )
 
     finally:

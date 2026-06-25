@@ -100,6 +100,7 @@ into the LLM prompt is its own discipline:
   • ORDERING: LongContextReorder (above) is your "lost in the middle" mitigation.
 """
 
+from functools import cache
 from typing import Any, Dict, List, Optional
 
 from langchain_openai import OpenAIEmbeddings
@@ -140,35 +141,26 @@ class _FilteredHybridRetriever(PineconeHybridSearchRetriever):
         return super()._get_relevant_documents(query, run_manager=run_manager, **kwargs)
 
 
-# ── Step 3: embedders (lazy — initialized on first request) ──────────────────
-_embeddings: Optional[OpenAIEmbeddings] = None
-_bm25_encoder: Optional[BM25Encoder] = None
-
-
+# ── Step 3: embedders (lazy — @cache builds once on first use) ───────────────
+@cache
 def get_embeddings() -> OpenAIEmbeddings:
-    global _embeddings
-    if _embeddings is None:
-        _embeddings = OpenAIEmbeddings()
-    return _embeddings
+    return OpenAIEmbeddings()
 
 
+@cache
 def _get_bm25_encoder() -> BM25Encoder:
     # BM25Encoder().default() downloads the MS MARCO model — defer to first use.
-    global _bm25_encoder
-    if _bm25_encoder is None:
-        _bm25_encoder = BM25Encoder().default()
-    return _bm25_encoder
+    return BM25Encoder().default()
 
 
 # ── Step 5: reranker + reorderer (built once; models are expensive to load) ──
-_cross_encoder = None
+@cache
+def _get_cross_encoder() -> HuggingFaceCrossEncoder:
+    return HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
 
 
-def _get_reranker():
-    global _cross_encoder
-    if _cross_encoder is None:
-        _cross_encoder = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
-    return CrossEncoderReranker(model=_cross_encoder, top_n=RERANK_TOP_N)
+def _get_reranker() -> CrossEncoderReranker:
+    return CrossEncoderReranker(model=_get_cross_encoder(), top_n=RERANK_TOP_N)
 
 
 reorder = LongContextReorder()
@@ -189,14 +181,9 @@ def _base_hybrid_retriever(doc_ids: Optional[List[str]]) -> _FilteredHybridRetri
 
 
 # Unscoped retriever — built lazily on first use.
-_default_hybrid: Optional[_FilteredHybridRetriever] = None
-
-
+@cache
 def _get_default_hybrid() -> _FilteredHybridRetriever:
-    global _default_hybrid
-    if _default_hybrid is None:
-        _default_hybrid = _base_hybrid_retriever(doc_ids=None)
-    return _default_hybrid
+    return _base_hybrid_retriever(doc_ids=None)
 
 
 def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
@@ -206,9 +193,18 @@ def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
 
     The same hybrid retriever object knows how to write the dual vectors, which
     is why ingestion lives next to retrieval — they must use the same encoders,
-    or your stored vectors won't match your query vectors.
+    or your stored vectors won't match your query vectors. The heavy encoders
+    (`get_embeddings` / `_get_bm25_encoder`) are cached, so wiring up the
+    retriever here per call is cheap.
     """
-    _get_default_hybrid().add_texts(texts, metadatas=metadatas)
+    retriever = _FilteredHybridRetriever(
+        embeddings=get_embeddings(),
+        sparse_encoder=_get_bm25_encoder(),
+        index=get_pinecone_index(),
+        top_k=RETRIEVER_TOP_K,
+        metadata_filter=None,
+    )
+    retriever.add_texts(texts, metadatas=metadatas)
 
 
 def delete_doc_vectors(doc_id: str) -> int:
