@@ -109,6 +109,18 @@ def gold_output(record: dict) -> Optional[dict]:
             return json.loads(fc["arguments"])
         except json.JSONDecodeError:
             return None
+    # json_schema / response_format channel: with_structured_output(method=
+    # "json_schema") returns the result as a JSON string in `content` with no
+    # tool_calls. Parse it so those records aren't silently dropped. Plain-text
+    # generations (prose) don't start with { or [, so they stay non-structured.
+    content = out.get("content") or out.get("text")
+    if isinstance(content, str):
+        s = content.strip()
+        if s[:1] in ("{", "["):
+            try:
+                return json.loads(s)
+            except json.JSONDecodeError:
+                return None
     return None
 
 

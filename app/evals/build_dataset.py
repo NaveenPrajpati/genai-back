@@ -18,6 +18,14 @@ generation. This script rebalances by **tier**:
 It also de-duplicates identical prompts and holds out a stratified eval split so
 every call site is represented in eval.
 
+Two output files, each in the shape its consumer needs:
+  * train.jsonl — SFT chat format `{"messages": [system, user, assistant]}` where
+    the assistant turn is the teacher's structured JSON. This is what the Llama
+    fine-tuner ingests.
+  * eval.jsonl  — the RAW capture records (prompt + offered schema + teacher
+    output), because evals/harness.py re-runs the candidate model on the prompt
+    and scores it against the teacher gold. (You never eval on the train split.)
+
 Name collisions: `IntentOutput`/`ResearchOutput` exist in several agents with
 different schemas but capture only records the class name. We resolve ambiguous
 names to the *stronger* tier (keep more data) — over-keeping is safe.
@@ -34,8 +42,12 @@ import json
 import os
 import random
 from collections import defaultdict
+from typing import Optional
 
-from app.evals.harness import load_records
+from app.evals.harness import gold_output, load_records
+
+# Capture roles -> OpenAI/Llama SFT chat roles.
+_PROMPT_ROLE = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool"}
 
 # call_site -> tier. Unknown sites default to "B".
 TIERS: dict[str, str] = {
@@ -129,6 +141,34 @@ def build_splits(
     return train, eval_, summary
 
 
+def to_sft_example(record: dict) -> Optional[dict]:
+    """Convert a raw capture record into one SFT chat example, or None if it has
+    no usable target. The assistant turn is the teacher's structured JSON (for
+    structured-output / tool calls) or the raw text (for plain generations).
+
+    Tool-loop traces (e.g. the meal-planner get_nutrition turns) carry the
+    prompt's prior ai/tool messages through unchanged, so multi-turn context is
+    preserved and the final assistant turn is the teacher's answer.
+    """
+    gold = gold_output(record)
+    if gold is not None:
+        target = json.dumps(gold, ensure_ascii=False)
+    else:
+        out = record.get("output") or {}
+        target = out.get("content") or out.get("text")
+    if not target:
+        return None
+
+    messages = [
+        {"role": _PROMPT_ROLE.get(m.get("role"), "user"), "content": m.get("content", "")}
+        for m in (record.get("messages") or [])
+    ]
+    if not messages:
+        return None
+    messages.append({"role": "assistant", "content": target})
+    return {"messages": messages}
+
+
 def _write_jsonl(path: str, rows: list[dict]) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -150,7 +190,12 @@ def main() -> None:
         records, cap=args.cap, eval_frac=args.eval_frac, seed=args.seed
     )
 
-    _write_jsonl(os.path.join(args.out_dir, "train.jsonl"), train)
+    # train.jsonl -> SFT chat format for the fine-tuner; eval.jsonl -> raw
+    # records for the harness to re-run the candidate against teacher gold.
+    sft_train = [ex for r in train if (ex := to_sft_example(r)) is not None]
+    skipped = len(train) - len(sft_train)
+
+    _write_jsonl(os.path.join(args.out_dir, "train.jsonl"), sft_train)
     _write_jsonl(os.path.join(args.out_dir, "eval.jsonl"), eval_)
 
     print(f"{'call_site':24} {'tier':4} {'total':>6} {'kept':>6} {'train':>6} {'eval':>6}")
@@ -159,7 +204,11 @@ def main() -> None:
             f"{site:24} {s['tier']:4} {s['total']:6} {s['kept']:6} "
             f"{s['train']:6} {s['eval']:6}"
         )
-    print(f"\nTOTAL  train={len(train)}  eval={len(eval_)}  -> {args.out_dir}/")
+    print(
+        f"\nTOTAL  train(SFT)={len(sft_train)}  eval(raw)={len(eval_)}"
+        + (f"  [skipped {skipped} train records with no target]" if skipped else "")
+        + f"  -> {args.out_dir}/"
+    )
 
 
 if __name__ == "__main__":

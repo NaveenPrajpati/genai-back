@@ -1,8 +1,8 @@
-from typing import Optional
+from typing import Optional, Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-
+from app.dependencies import get_current_user
 from app.services import storage
 
 router = APIRouter(
@@ -25,10 +25,11 @@ async def create_chat_route(body: CreateChatRequest):
 
 
 @router.get("", status_code=200)
-async def get_all_chats():
+async def get_all_chats(current_user: Annotated[dict, Depends(get_current_user)]):
     """Return all chats ordered by most recently updated."""
     try:
-        return {"message": "chats fetched", "data": storage.list_chats()}
+        userId = current_user["uid"]
+        return {"message": "chats fetched", "data": storage.list_chats(userId)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

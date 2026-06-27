@@ -6,6 +6,8 @@ from app.models.user import (
     UserResponse,
     AuthResponse,
     ExpoPushTokenUpdate,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
 )
 from app.services import user_service
 from app.dependencies import get_current_user
@@ -33,6 +35,30 @@ async def login(credentials: UserLogin):
         return {"message": "Login successful", "token": token, "user": user}
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@router.post("/forgot-password", status_code=202)
+async def forgot_password(payload: ForgotPasswordRequest):
+    """Send a one-time password-reset code to the account (via push).
+
+    Always returns the same response whether or not the email is registered,
+    to avoid leaking which accounts exist.
+    """
+    await user_service.request_password_reset(payload.email)
+    return {
+        "message": "If an account exists for that email, a reset code has been sent."
+    }
+
+
+@router.post("/reset-password", response_model=AuthResponse)
+async def reset_password(payload: ResetPasswordRequest):
+    try:
+        user, token = await user_service.reset_password(
+            payload.email, payload.code, payload.new_password
+        )
+        return {"message": "Password reset successful", "token": token, "user": user}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/guest", response_model=AuthResponse, status_code=201)

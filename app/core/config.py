@@ -37,11 +37,12 @@ PINECONE_METRIC = "dotproduct"  # REQUIRED for native sparse+dense hybrid search
 
 # --- Retrieval ---
 RETRIEVER_TOP_K = 10          # how many candidates the retriever pulls
-RERANK_TOP_N = 5              # how many survive the cross-encoder rerank
+RERANK_TOP_N = 5              # how many survive the rerank
 
 # --- Models ---
 LLM_MODEL = "gpt-4o-mini"
-RERANKER_MODEL = "BAAI/bge-reranker-base"
+# Hosted Jina reranker (free tier). Requires JINA_API_KEY in the environment.
+RERANKER_MODEL = "jina-reranker-v2-base-multilingual"
 
 # --- Semantic cache ---
 CACHE_PREFIX = "rag:cache:"

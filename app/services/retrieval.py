@@ -105,10 +105,9 @@ from typing import Any, Dict, List, Optional
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.document_compressors import JinaRerank
 from langchain_community.document_transformers import LongContextReorder
 from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from pinecone_text.sparse import BM25Encoder
@@ -153,14 +152,13 @@ def _get_bm25_encoder() -> BM25Encoder:
     return BM25Encoder().default()
 
 
-# ── Step 5: reranker + reorderer (built once; models are expensive to load) ──
+# ── Step 5: reranker + reorderer ─────────────────────────────────────────────
+# Hosted Jina reranker (free tier). The API call happens per-query; we only
+# cache the lightweight client. Set JINA_API_KEY in the environment.
 @cache
-def _get_cross_encoder() -> HuggingFaceCrossEncoder:
-    return HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
-
-
-def _get_reranker() -> CrossEncoderReranker:
-    return CrossEncoderReranker(model=_get_cross_encoder(), top_n=RERANK_TOP_N)
+def _get_reranker() -> JinaRerank:
+    # jina_api_key is read from the JINA_API_KEY environment variable.
+    return JinaRerank(model=RERANKER_MODEL, top_n=RERANK_TOP_N)
 
 
 reorder = LongContextReorder()

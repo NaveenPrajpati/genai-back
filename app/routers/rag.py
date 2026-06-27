@@ -6,12 +6,20 @@ import asyncio
 import logging
 import tempfile
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Form, UploadFile, File, HTTPException
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Form,
+    UploadFile,
+    File,
+    HTTPException,
+    Depends,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
+from app.dependencies import get_current_user
 from app.core.llm import llm, RAG_PROMPT
 from app.services import storage, cache
 from app.services.ingestion import load_url, SUPPORTED_FILE_TYPES
@@ -40,9 +48,13 @@ def _sse(event: dict) -> str:
 
 
 @router.get("/get-files", status_code=200)
-async def get_all_files():
+async def get_all_files(
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    userId = current_user["uid"]
     try:
-        return {"message": "list fetched", "data": storage.list_ingestion_logs()}
+
+        return {"message": "list fetched", "data": storage.list_ingestion_logs(userId)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch files: {e}")
 
@@ -66,6 +78,7 @@ def _resolve_file_mime(file: UploadFile) -> Optional[str]:
 async def ingest_document(
     background_tasks: BackgroundTasks,
     action: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
     data: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
@@ -77,7 +90,7 @@ async def ingest_document(
     """
     job_id = str(uuid.uuid4())
     tmp_path: Optional[str] = None
-
+    userId = current_user["uid"]
     if action == "url":
         if not data:
             raise HTTPException(
@@ -111,7 +124,7 @@ async def ingest_document(
         "queued_at": queued_at,
     }
     await asyncio.to_thread(
-        storage.create_ingestion_log, job_id, display_source, file_type, queued_at
+        storage.create_ingestion_log, job_id, display_source, file_type, queued_at,userId
     )
 
     background_tasks.add_task(
@@ -180,13 +193,13 @@ async def query_documents(request: QueryRequest):
 
 
 @router.post("/query/stream")
-async def query_documents_stream(request: QueryRequest):
+async def query_documents_stream(
+    request: QueryRequest, current_user: Annotated[dict, Depends(get_current_user)]
+):
     scope = cache.scope_key(request.ingestions)
 
-    # Resolve or create the chat session before streaming starts.
-    chat_id = request.chat_id or await asyncio.to_thread(
-        create_chat_title, request.question
-    )
+    chat_id = request.chat_id
+    userId = current_user["uid"]
 
     async def generate():
         try:
@@ -208,11 +221,12 @@ async def query_documents_stream(request: QueryRequest):
                 asyncio.ensure_future(
                     asyncio.to_thread(
                         storage.save_messages,
-                        chat_id,
-                        request.question,
-                        cached["answer"],
-                        cached["sources"],
-                        request.ingestions,
+                        chat_id=chat_id,
+                        question=request.question,
+                        answer=cached["answer"],
+                        userId=userId,
+                        sources=cached["sources"],
+                        ingestions=request.ingestions,
                     )
                 )
                 yield _sse({"type": "done", "cached": True, "chat_id": chat_id})
@@ -249,11 +263,12 @@ async def query_documents_stream(request: QueryRequest):
             asyncio.ensure_future(
                 asyncio.to_thread(
                     storage.save_messages,
-                    chat_id,
-                    request.question,
-                    full_answer,
-                    sources,
-                    request.ingestions,
+                    chat_id=chat_id,
+                    question=request.question,
+                    answer=full_answer,
+                    userId=userId,
+                    sources=sources,
+                    ingestions=request.ingestions,
                 )
             )
 
@@ -274,8 +289,3 @@ async def query_documents_stream(request: QueryRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
-
-def create_chat_title(question: str) -> str:
-    """Create a chat using the first 200 chars of the question as the title."""
-    return storage.create_chat(question[:200])

@@ -35,7 +35,7 @@ def build_sources(docs: list) -> List[dict]:
 
     Dedup key is the first 120 chars of the chunk — cheap way to drop near-
     duplicate hits. `relevance_score` is written into metadata by the
-    CrossEncoderReranker, so it doubles as a confidence signal for the UI.
+    JinaRerank reranker, so it doubles as a confidence signal for the UI.
     """
     seen: set = set()
     sources: List[dict] = []
