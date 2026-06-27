@@ -1,0 +1,9 @@
+# Test/dev-only dependencies. Compile with:
+#   pip-compile requirements-dev.in -o requirements-dev.txt
+#
+# Constrained against the runtime lockfile so shared deps stay on the same pins.
+-c requirements.txt
+
+pytest==9.0.3
+pytest-asyncio==1.4.0
+pip-tools
