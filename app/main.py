@@ -122,7 +122,12 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    title="My Awesome API",
+    version="1.0.0",
+    swagger_ui_parameters={"syntaxHighlight": {"theme": "obsidian"}},
+)
 
 app.add_middleware(
     CORSMiddleware,

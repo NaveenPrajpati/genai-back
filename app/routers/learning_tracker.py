@@ -408,6 +408,21 @@ class Trigger(BaseModel):
     last_run_at: Optional[str] = None
 
 
+@router.get("/triggers")
+async def get_triggers(current_user: Annotated[dict, Depends(get_current_user)]):
+    """Return the caller's trigger settings for rendering toggles in settings. A
+    user who has never opted in has no row, so the list may be empty — the UI
+    should treat a missing trigger as disabled."""
+    try:
+        cursor = get_db()["triggers"].find({"userId": current_user["uid"]})
+        docs = await cursor.to_list(None)
+        for doc in docs:
+            doc["_id"] = str(doc["_id"])
+        return {"status": "done", "result": docs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/toggle-trigger")
 async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)]):
     """Opt in/out of the daily learning digest. The first call creates an enabled
