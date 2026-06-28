@@ -83,22 +83,25 @@ async def lifespan(app: FastAPI):
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
         app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
 
-    # Daily learning digest: bullet-point tips on each user's active topic at 09:00.
+    # Learning digest: hourly sweep. run_triggers fires per user only when the
+    # current hour matches their chosen schedule_hour in their own timezone.
     scheduler.add_job(
         run_triggers,
-        CronTrigger(hour=9, minute=0),
+        CronTrigger(minute=0),
         args=[app.state.agent],
     )
-    # Personal-assistant daily task digest at 08:00.
+    # Personal-assistant task digest: hourly sweep, fires per user at their
+    # chosen schedule_hour/timezone (default 08:00 daily).
     scheduler.add_job(
         run_pa_triggers,
-        CronTrigger(hour=8, minute=0),
+        CronTrigger(minute=0),
         args=[app.state.pa_agent],
     )
-    # Meal-planner weekly plan generation: Sunday 18:30.
+    # Meal-planner plan generation: hourly sweep, fires per user at their chosen
+    # schedule_dow/schedule_hour/timezone (default Sunday 18:00).
     scheduler.add_job(
         run_meal_triggers,
-        CronTrigger(day_of_week="sun", hour=18, minute=30),
+        CronTrigger(minute=0),
         args=[app.state.meal_agent],
     )
     # Failsafe: sweep any guests the TTL index missed (e.g. during downtime)

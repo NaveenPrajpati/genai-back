@@ -5,6 +5,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Literal, Annotated
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
@@ -14,6 +15,7 @@ from langgraph.types import Command
 
 from app.dependencies import get_current_user
 from app.database import get_db
+from app.agents.approval_store import get_pending
 from app.agents.learning_tracker.repository import set_topic_covered, write_memory
 
 logger = logging.getLogger(__name__)
@@ -195,9 +197,7 @@ async def approve(
     # approves or rejects someone else's pending plan by guessing the thread_id).
     approval = None
     try:
-        approval = await get_db()["approvals"].find_one(
-            {"threadId": body.thread_id, "status": "pending"}
-        )
+        approval = await get_pending(body.thread_id)
         logger.info("approval found: %s", approval)
     except Exception as e:
         logger.error("approval ownership lookup error: %s", e)
@@ -403,9 +403,23 @@ class Trigger(BaseModel):
     userId: str
     action_type: str = "learning_digest"
     enabled: bool = True
+    # Local hour-of-day (0-23) the digest should fire, interpreted in `timezone`.
+    schedule_hour: int = 9
+    # IANA timezone name (e.g. "Asia/Kolkata"). The hourly sweep converts to this
+    # to decide whether it's the user's chosen hour right now.
+    timezone: str = "UTC"
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
     last_run_at: Optional[str] = None
+
+
+class TriggerSettings(BaseModel):
+    """Partial update for a user's trigger. Only provided fields are changed."""
+
+    action_type: str = "learning_digest"
+    enabled: Optional[bool] = None
+    schedule_hour: Optional[int] = None
+    timezone: Optional[str] = None
 
 
 @router.get("/triggers")
@@ -452,10 +466,61 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
                     "userId": userId,
                     "action_type": "learning_digest",
                     "enabled": True,
+                    "schedule_hour": 9,
+                    "timezone": "UTC",
                     "createdAt": datetime.now(timezone.utc).isoformat(),
                 }
             )
         return {"status": "done", "enabled": enabled}
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/trigger-settings")
+async def update_trigger_settings(
+    body: TriggerSettings,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Update a trigger's delivery settings (enabled / schedule_hour / timezone).
+    Creates the row if the user has never opted in, so the settings screen can
+    save without a prior toggle."""
+    try:
+        update: dict = {}
+        if body.enabled is not None:
+            update["enabled"] = body.enabled
+        if body.schedule_hour is not None:
+            if not 0 <= body.schedule_hour <= 23:
+                raise HTTPException(
+                    status_code=422, detail="schedule_hour must be 0-23."
+                )
+            update["schedule_hour"] = body.schedule_hour
+        if body.timezone is not None:
+            try:
+                ZoneInfo(body.timezone)
+            except ZoneInfoNotFoundError:
+                raise HTTPException(
+                    status_code=422, detail=f"Unknown timezone: {body.timezone}"
+                )
+            update["timezone"] = body.timezone
+        if not update:
+            raise HTTPException(status_code=422, detail="No settings provided.")
+
+        update["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        result = await get_db()["triggers"].update_one(
+            {"userId": current_user["uid"], "action_type": body.action_type},
+            {
+                "$set": update,
+                "$setOnInsert": {
+                    "userId": current_user["uid"],
+                    "action_type": body.action_type,
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                },
+            },
+            upsert=True,
+        )
+        return {"status": "done", "matched": result.matched_count, **update}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

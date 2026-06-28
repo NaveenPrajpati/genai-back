@@ -1,7 +1,6 @@
 """LangGraph nodes and graph wiring for the personal-assistant agent."""
 
 import logging
-from datetime import datetime
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -10,6 +9,7 @@ from langgraph.types import interrupt
 
 from app.core.llm import llm
 from app.core.config import supabase
+from app.agents.approval_store import get_pending, create_pending, resolve
 from .state import (
     PAState,
     IntentOutput,
@@ -213,20 +213,10 @@ async def _delete_with_approval(state: PAState):
 
     approval_id = None
     proposed = None
-    try:
-        existing = (
-            supabase.table("approvals")
-            .select("id, payload")
-            .eq("thread_id", thread_id)
-            .eq("status", "pending")
-            .maybe_single()
-            .execute()
-        )
-        if existing and existing.data:
-            approval_id = existing.data["id"]
-            proposed = existing.data["payload"]["tasks"]
-    except Exception as e:
-        logger.error("pa approval lookup error: %s", e)
+    existing = await get_pending(thread_id)
+    if existing:
+        approval_id = str(existing["_id"])
+        proposed = existing["payload"]["tasks"]
 
     if not approval_id:
         selector = await _extract_selector(state["query"])
@@ -234,40 +224,20 @@ async def _delete_with_approval(state: PAState):
         if not matches:
             return {"intent": "delete", "task_status": "not_found"}
         proposed = [{"id": m["id"], "title": m["title"]} for m in matches]
-        try:
-            res = (
-                supabase.table("approvals")
-                .insert(
-                    {
-                        "user_id": user_id,
-                        "thread_id": thread_id,
-                        "action_type": "pa_delete_task",
-                        "payload": {"tasks": proposed},
-                        "status": "pending",
-                    }
-                )
-                .execute()
-            )
-            approval_id = res.data[0]["id"] if res.data else None
-        except Exception as e:
-            logger.error("pa approval insert error: %s", e)
+        approval_id = await create_pending(
+            user_id, thread_id, "pa_delete_task", {"tasks": proposed}
+        )
 
     decision = interrupt(
         {"type": "pa_delete_task", "approval_id": approval_id, "tasks": proposed}
     )
 
     if decision != "approved":
-        if approval_id:
-            supabase.table("approvals").update(
-                {"status": "rejected", "resolved_at": datetime.now().isoformat()}
-            ).eq("id", approval_id).execute()
+        await resolve(approval_id, "rejected")
         return {"intent": "delete", "task_status": "delete_rejected"}
 
     deleted = await delete_todos_by_ids(user_id, [t["id"] for t in (proposed or [])])
-    if approval_id:
-        supabase.table("approvals").update(
-            {"status": "approved", "resolved_at": datetime.now().isoformat()}
-        ).eq("id", approval_id).execute()
+    await resolve(approval_id, "approved")
     return {
         "intent": "delete",
         "task_status": f"deleted:{deleted}",

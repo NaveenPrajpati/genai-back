@@ -2,9 +2,10 @@
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from app.core.config import supabase
+from app.agents.trigger_store import due_triggers, mark_ran
+from app.agents.approval_store import create_pending
 from app.services.push_service import send_push_notification
 from .repository import fetch_todos, categorize_agenda
 
@@ -35,52 +36,42 @@ async def run_pa_triggers(agent=None):
     """For each enabled pa_digest trigger, snapshot the user's pending tasks into
     an approvals-table notification the user can review via GET /approve."""
     logger.info("pa digest job running")
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     try:
-        triggers = (
-            supabase.table("triggers")
-            .select("*")
-            .eq("enabled", True)
-            .eq("action_type", "pa_digest")
-            .execute()
-        )
+        triggers = await due_triggers("pa_digest", now)
     except Exception as e:
         logger.error("run_pa_triggers fetch error: %s", e)
         return
 
-    for t in triggers.data or []:
+    for t in triggers:
+        userId = t.get("userId")
         try:
-            pending = await fetch_todos(t["user_id"], status="pending")
+            pending = await fetch_todos(userId, status="pending")
             agenda = categorize_agenda(pending)
             digest = _compose_digest(agenda)
-            supabase.table("approvals").insert(
+            await create_pending(
+                userId,
+                str(uuid.uuid4()),
+                "pa_digest",
                 {
-                    "user_id": t["user_id"],
-                    "thread_id": str(uuid.uuid4()),
-                    "action_type": "pa_digest",
-                    "payload": {
-                        "generated_at": now.isoformat(),
-                        "pending_count": len(pending),
-                        "digest": digest,
-                        "counts": {k: len(v) for k, v in agenda.items()},
-                        "tasks": pending,
-                    },
-                    "status": "pending",
-                }
-            ).execute()
-            supabase.table("triggers").update({"last_run_at": now.isoformat()}).eq(
-                "id", t["id"]
-            ).execute()
+                    "generated_at": now.isoformat(),
+                    "pending_count": len(pending),
+                    "digest": digest,
+                    "counts": {k: len(v) for k, v in agenda.items()},
+                    "tasks": pending,
+                },
+            )
+            await mark_ran(t, now)
             await send_push_notification(
-                t["user_id"],
+                userId,
                 title="Your daily agenda",
                 body=digest,
                 data={"type": "pa_digest", "pending_count": len(pending)},
             )
             logger.info(
                 "pa digest created for user=%s (%d pending)",
-                t["user_id"],
+                userId,
                 len(pending),
             )
         except Exception as e:
-            logger.error("pa digest error for user=%s: %s", t.get("user_id"), e)
+            logger.error("pa digest error for user=%s: %s", userId, e)

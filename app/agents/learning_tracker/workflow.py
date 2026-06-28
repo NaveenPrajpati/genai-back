@@ -10,6 +10,7 @@ from langgraph.types import interrupt
 
 from app.core.llm import llm
 from app.database import get_db
+from app.agents.approval_store import get_pending, create_pending, resolve
 from .state import (
     LearningState,
     RoadmapOutput,
@@ -58,14 +59,10 @@ async def classify_intent(state: LearningState):
 
 async def roadmap_agent(state: LearningState):
     is_modify = state.get("intent") == "modify_roadmap"
-    existingApproval = await get_db()["approvals"].find_one(
-        {"threadId": state.get("thread_id"), "status": "pending"}
-    )
+    action_type = "update_roadmap" if is_modify else "save_roadmap"
+    existingApproval = await get_pending(state.get("thread_id"))
     if existingApproval:
         approval_id = str(existingApproval["_id"])
-        action_type = existingApproval.get(
-            "action", "update_roadmap" if is_modify else "save_roadmap"
-        )
         result = RoadmapOutput(**existingApproval["payload"])
         logger.info("roadmap approval already exists: %s", approval_id)
     else:
@@ -119,25 +116,13 @@ async def roadmap_agent(state: LearningState):
             )
         logger.info("roadmap_agent result: %s", result)
 
-        action_type = "update_roadmap" if is_modify else "save_roadmap"
-
-        approval_id = None
-        try:
-
-            res = await get_db()["approvals"].insert_one(
-                {
-                    "userId": state.get("userId"),
-                    "threadId": state.get("thread_id"),
-                    "action": action_type,
-                    "payload": result.model_dump(),
-                    "status": "pending",
-                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            approval_id = str(res.inserted_id)
-            logger.info("roadmap pending approval created: %s", approval_id)
-        except Exception as e:
-            logger.error("roadmap approval insert error: %s", e)
+        approval_id = await create_pending(
+            state.get("userId"),
+            state.get("thread_id"),
+            action_type,
+            result.model_dump(),
+        )
+        logger.info("roadmap pending approval created: %s", approval_id)
 
     # Pause — send roadmap + approval_id to client for review
     decision = interrupt(
@@ -145,35 +130,11 @@ async def roadmap_agent(state: LearningState):
     )
 
     if decision != "approved":
-        if approval_id:
-            try:
-                await get_db()["approvals"].update_one(
-                    {"_id": ObjectId(approval_id)},
-                    {
-                        "$set": {
-                            "status": "rejected",
-                            "resolvedAt": datetime.now(timezone.utc).isoformat(),
-                        }
-                    },
-                )
-            except Exception as e:
-                logger.error("approval reject update error: %s", e)
+        await resolve(approval_id, "rejected")
         return {"intent": state.get("intent"), "roadmap_status": "rejected"}
 
     # Approved — update approval status then persist roadmap
-    if approval_id:
-        try:
-            await get_db()["approvals"].update_one(
-                {"_id": ObjectId(approval_id)},
-                {
-                    "$set": {
-                        "status": "approved",
-                        "resolvedAt": datetime.now(timezone.utc).isoformat(),
-                    }
-                },
-            )
-        except Exception as e:
-            logger.error("approval approve update error: %s", e)
+    await resolve(approval_id, "approved")
 
     if is_modify and state.get("roadmapId"):
         try:

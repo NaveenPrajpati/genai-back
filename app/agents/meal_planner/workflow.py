@@ -1,7 +1,6 @@
 """LangGraph nodes and graph wiring for the meal-planner agent."""
 
 import logging
-from datetime import datetime
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -10,6 +9,7 @@ from langgraph.types import interrupt
 
 from app.core.config import supabase
 from app.core.llm import llm
+from app.agents.approval_store import get_pending, create_pending, resolve
 from .state import (
     PlannerState,
     IntentOutput,
@@ -181,20 +181,10 @@ async def plan_agent(state: PlannerState):
     week_start = get_monday()
     approval_id = None
     proposed = None
-    try:
-        existing_row = (
-            supabase.table("approvals")
-            .select("id, payload")
-            .eq("thread_id", state["thread_id"])
-            .eq("status", "pending")
-            .maybe_single()
-            .execute()
-        )
-        if existing_row and existing_row.data:
-            approval_id = existing_row.data["id"]
-            proposed = existing_row.data["payload"]["plan"]
-    except Exception as e:
-        logger.error("approval lookup error: %s", e)
+    existing_row = await get_pending(state["thread_id"])
+    if existing_row:
+        approval_id = str(existing_row["_id"])
+        proposed = existing_row["payload"]["plan"]
 
     if not approval_id:
         # First run: generate plan via LLM and insert approval.
@@ -221,23 +211,12 @@ async def plan_agent(state: PlannerState):
         logger.info("plan data %s", result)
         proposed = [slot.model_dump(mode="json") for slot in result.plan]
 
-        try:
-            res = (
-                supabase.table("approvals")
-                .insert(
-                    {
-                        "user_id": state["user_id"],
-                        "thread_id": state["thread_id"],
-                        "action_type": "save_plan",
-                        "payload": {"week_start": week_start, "plan": proposed},
-                        "status": "pending",
-                    }
-                )
-                .execute()
-            )
-            approval_id = res.data[0]["id"] if res.data else None
-        except Exception as e:
-            logger.error("approval insert error: %s", e)
+        approval_id = await create_pending(
+            state["user_id"],
+            state["thread_id"],
+            "save_plan",
+            {"week_start": week_start, "plan": proposed},
+        )
 
     is_update = state.get("intent") == "update" or bool(state.get("plan_id"))
     action_type = "update_plan" if is_update else "save_plan"
@@ -252,10 +231,7 @@ async def plan_agent(state: PlannerState):
     )
 
     if decision != "approved":
-        if approval_id:
-            supabase.table("approvals").update(
-                {"status": "rejected", "resolved_at": datetime.now().isoformat()}
-            ).eq("id", approval_id).execute()
+        await resolve(approval_id, "rejected")
         return {"intent": state.get("intent", "plan"), "plan_status": "rejected"}
 
     # Approved: for update reuse the existing plan row; for new plan create one.
@@ -304,10 +280,7 @@ async def plan_agent(state: PlannerState):
         except Exception as e:
             logger.error("slot insert error: %s", e)
 
-    if approval_id:
-        supabase.table("approvals").update(
-            {"status": "approved", "resolved_at": datetime.now().isoformat()}
-        ).eq("id", approval_id).execute()
+    await resolve(approval_id, "approved")
 
     return {
         "intent": state.get("intent", "plan"),

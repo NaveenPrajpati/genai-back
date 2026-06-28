@@ -150,7 +150,7 @@ async def test_todo_agent_complete_not_found(monkeypatch):
 # Human-in-the-Loop deletion
 # --------------------------------------------------------------------------- #
 async def test_delete_not_found_skips_interrupt(monkeypatch):
-    monkeypatch.setattr(pa, "supabase", _supabase_seq(None))  # no existing approval
+    monkeypatch.setattr(pa, "get_pending", AsyncMock(return_value=None))  # no existing
     monkeypatch.setattr(
         pa, "_extract_selector", AsyncMock(return_value=pa.TaskSelector(match_all=True))
     )
@@ -166,8 +166,10 @@ async def test_delete_not_found_skips_interrupt(monkeypatch):
 
 
 async def test_delete_approved_path(monkeypatch):
-    # execute() sequence: existing-lookup, approval-insert, approval-update
-    monkeypatch.setattr(pa, "supabase", _supabase_seq(None, [{"id": "ap1"}], None))
+    # No existing approval -> create one, then resolve it after deletion.
+    monkeypatch.setattr(pa, "get_pending", AsyncMock(return_value=None))
+    monkeypatch.setattr(pa, "create_pending", AsyncMock(return_value="ap1"))
+    monkeypatch.setattr(pa, "resolve", AsyncMock())
     monkeypatch.setattr(
         pa, "_extract_selector", AsyncMock(return_value=pa.TaskSelector(match_all=True))
     )
@@ -189,7 +191,9 @@ async def test_delete_approved_path(monkeypatch):
 
 
 async def test_delete_rejected_path(monkeypatch):
-    monkeypatch.setattr(pa, "supabase", _supabase_seq(None, [{"id": "ap1"}], None))
+    monkeypatch.setattr(pa, "get_pending", AsyncMock(return_value=None))
+    monkeypatch.setattr(pa, "create_pending", AsyncMock(return_value="ap1"))
+    monkeypatch.setattr(pa, "resolve", AsyncMock())
     monkeypatch.setattr(
         pa, "_extract_selector", AsyncMock(return_value=pa.TaskSelector(match_all=True))
     )
@@ -331,7 +335,13 @@ async def test_breakdown_agent(monkeypatch):
 # endpoints: approve / resume cycle, tasks
 # --------------------------------------------------------------------------- #
 def test_pa_approve_happy_path(monkeypatch):
-    monkeypatch.setattr(pa_router, "supabase", _chainable({"id": "ap1", "user_id": "u1"}))
+    monkeypatch.setattr(
+        pa_router,
+        "get_pending",
+        AsyncMock(
+            return_value={"_id": "ap1", "userId": "u1", "action_type": "pa_delete_task"}
+        ),
+    )
     agent = MagicMock()
     agent.aget_state = AsyncMock(return_value=SimpleNamespace(next=("todo_agent",)))
     agent.ainvoke = AsyncMock(return_value={"task_status": "deleted:1"})
@@ -349,7 +359,15 @@ def test_pa_approve_happy_path(monkeypatch):
 
 def test_pa_approve_foreign_thread_forbidden(monkeypatch):
     monkeypatch.setattr(
-        pa_router, "supabase", _chainable({"id": "ap1", "user_id": "someone_else"})
+        pa_router,
+        "get_pending",
+        AsyncMock(
+            return_value={
+                "_id": "ap1",
+                "userId": "someone_else",
+                "action_type": "pa_delete_task",
+            }
+        ),
     )
     agent = MagicMock()
     agent.aget_state = AsyncMock()
@@ -366,7 +384,7 @@ def test_pa_approve_foreign_thread_forbidden(monkeypatch):
 
 
 def test_pa_approve_no_pending_is_404(monkeypatch):
-    monkeypatch.setattr(pa_router, "supabase", _chainable(None))
+    monkeypatch.setattr(pa_router, "get_pending", AsyncMock(return_value=None))
     agent = MagicMock()
     agent.aget_state = AsyncMock()
     agent.ainvoke = AsyncMock()
@@ -460,12 +478,16 @@ def test_categorize_agenda_buckets():
 # automation engine
 # --------------------------------------------------------------------------- #
 async def test_run_pa_triggers_creates_digest(monkeypatch):
-    # execute() sequence: triggers-select, approvals-insert, triggers-update
+    # One due trigger -> digest snapshot created in the Mongo approval store and
+    # the trigger stamped as run.
     monkeypatch.setattr(
         pa_triggers,
-        "supabase",
-        _supabase_seq([{"id": "tr1", "user_id": "u1"}], None, None),
+        "due_triggers",
+        AsyncMock(return_value=[{"_id": "tr1", "userId": "u1"}]),
     )
+    monkeypatch.setattr(pa_triggers, "create_pending", AsyncMock())
+    monkeypatch.setattr(pa_triggers, "mark_ran", AsyncMock())
+    monkeypatch.setattr(pa_triggers, "send_push_notification", AsyncMock())
     monkeypatch.setattr(
         pa_triggers, "fetch_todos", AsyncMock(return_value=[{"id": "t1", "title": "x"}])
     )
@@ -473,3 +495,5 @@ async def test_run_pa_triggers_creates_digest(monkeypatch):
     await pa_triggers.run_pa_triggers()
 
     pa_triggers.fetch_todos.assert_awaited_once_with("u1", status="pending")
+    pa_triggers.create_pending.assert_awaited_once()
+    pa_triggers.mark_ran.assert_awaited_once()

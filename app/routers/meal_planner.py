@@ -1,16 +1,20 @@
 """HTTP routes for the meal-planner agent. Agent logic lives in app.agents.meal_planner."""
 
+import json
 import logging
 import uuid
 from datetime import datetime
 from typing import Optional, Literal, Annotated
 
 from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
 
 from app.core.config import supabase
 from app.dependencies import get_current_user
+from app.agents.trigger_store import toggle
+from app.agents.approval_store import get_pending, list_pending, to_legacy
 from app.agents.meal_planner.repository import (
     verify_plan_ownership,
     get_disliked_dishes,
@@ -87,6 +91,87 @@ async def ask(
     return {"status": "done", "result": result}
 
 
+def _sse(event: dict) -> str:
+    """Serialize one event as a Server-Sent Events frame."""
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+@router.post("/query/stream")
+async def ask_stream(
+    body: QueryRequest,
+    request: Request,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Streaming counterpart of /query. Every node uses structured output, so
+    there are no text tokens to stream; instead we emit a `step` event as each
+    graph node completes (classify → research → plan …) for live progress, then
+    the final state in `done` (or `needs_approval` if the plan awaits review)."""
+    agent = request.app.state.meal_agent
+
+    if body.plan_id and not await verify_plan_ownership(
+        body.plan_id, current_user["uid"]
+    ):
+        raise HTTPException(
+            status_code=403, detail="You do not have access to this plan."
+        )
+
+    text_lower = body.text.lower()
+    update_keywords = ("update", "change", "redo", "modify", "regenerate")
+    if any(kw in text_lower for kw in update_keywords) and not body.plan_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide plan_id to update an existing plan.",
+        )
+
+    thread_id = body.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    _excluded = {"_id", "expires_at", "password_hash"}
+    user_data = {k: v for k, v in current_user.items() if k not in _excluded}
+    inputs = {
+        "query": body.text,
+        "user_id": current_user["uid"],
+        "thread_id": thread_id,
+        "plan_id": body.plan_id,
+        "current_user": user_data,
+    }
+
+    async def generate():
+        try:
+            yield _sse({"type": "thread", "thread_id": thread_id})
+
+            # stream_mode="updates" yields {node_name: state_delta} as each node
+            # finishes; we forward just the node name as a progress step.
+            async for update in agent.astream(
+                inputs, config=config, stream_mode="updates"
+            ):
+                for node in update:
+                    yield _sse({"type": "step", "node": node})
+
+            snapshot = await agent.aget_state(config)
+            values = snapshot.values if snapshot else {}
+            interrupts = snapshot.interrupts if snapshot else None
+            if snapshot and snapshot.next and interrupts:
+                yield _sse(
+                    {
+                        "type": "needs_approval",
+                        "thread_id": thread_id,
+                        "proposal": interrupts[0].value,
+                    }
+                )
+                return
+
+            yield _sse({"type": "done", "result": values})
+        except Exception as exc:
+            logger.exception("meal stream failed")
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 class ApproveRequest(BaseModel):
     thread_id: str
     decision: Literal["approved", "rejected"]
@@ -104,23 +189,16 @@ async def approve(
     # The thread/approval must belong to the caller (prevents IDOR where a user
     # approves or rejects someone else's pending plan by guessing the thread_id).
     try:
-        approval = (
-            supabase.table("approvals")
-            .select("id, user_id")
-            .eq("thread_id", body.thread_id)
-            .eq("status", "pending")
-            .maybe_single()
-            .execute()
-        )
+        approval = await get_pending(body.thread_id)
     except Exception as e:
         logger.error("approval ownership lookup error: %s", e)
         approval = None
 
-    if not approval or not approval.data:
+    if not approval:
         raise HTTPException(
             status_code=404, detail="No pending approval for this thread."
         )
-    if approval.data["user_id"] != current_user["uid"]:
+    if approval["userId"] != current_user["uid"]:
         raise HTTPException(
             status_code=403, detail="You do not have access to this approval."
         )
@@ -238,19 +316,11 @@ async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)
     user_id = current_user["uid"]
     logger.info("--- %s", user_id)
     try:
-        result = (
-            supabase.table("approvals")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("status", "pending")
-            .execute()
-        )
-        logger.info("%s", result)
-
-        if not result.data:
+        docs = await list_pending(user_id, ["save_plan", "update_plan"])
+        if not docs:
             return {"status": "done", "message": "no approval found", "result": []}
 
-        return {"status": "done", "result": result.data}
+        return {"status": "done", "result": [to_legacy(d) for d in docs]}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -284,28 +354,13 @@ class Trigger(BaseModel):
 
 @router.post("/toggle-trigger")
 async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)]):
-    user_id = current_user["uid"]
-
     try:
-        result = supabase.table("triggers").select("*").eq("user_id", user_id).execute()
-        if result and result.data:
-            for t in result.data or []:
-                supabase.table("triggers").update({"enabled": not t["enabled"]}).eq(
-                    "id", t["id"]
-                ).execute()
-        else:
-            supabase.table("triggers").insert(
-                {
-                    "user_id": user_id,
-                    "name": "plan my schedule",
-                    "schedule": "30 18 * * 0",
-                    "action_type": "schedule",
-                    "enabled": True,
-                    "last_run_at": None,
-                }
-            ).execute()
-
-        return {"status": "done"}
-
+        # Default cadence: Sunday (weekday 6) 18:00 in the user's timezone.
+        enabled = await toggle(
+            current_user["uid"],
+            "schedule",
+            defaults={"name": "plan my schedule", "schedule_hour": 18, "schedule_dow": 6},
+        )
+        return {"status": "done", "enabled": enabled}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

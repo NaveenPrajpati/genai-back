@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.llm import llm
 from app.database import get_db
+from app.agents.trigger_store import due_triggers, mark_ran
 from app.services.push_service import send_push_notification
 from .state import TopicTipsOutput
 from .repository import active_topic
@@ -16,9 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 async def run_triggers(agent=None):
-    """Daily 9am job: for every user who opted in via /toggle-trigger, generate
-    bullet-point tips (grounded in live Tavily search results) about the user's
-    current (next uncovered) topic and store them as a learning digest."""
+    """Hourly sweep: for every user who opted in via /toggle-trigger, fire only
+    when the current hour matches their chosen schedule_hour in their timezone,
+    then generate bullet-point tips (grounded in live Tavily search results)
+    about the user's current (next uncovered) topic and store them as a digest."""
     logger.info("learning digest job running")
     now = datetime.now(timezone.utc)
 
@@ -40,10 +42,7 @@ async def run_triggers(agent=None):
     chain = tipsPrompt | llm.with_structured_output(TopicTipsOutput)
 
     try:
-        cursor = get_db()["triggers"].find(
-            {"action_type": "learning_digest", "enabled": True}
-        )
-        triggers = await cursor.to_list(None)
+        triggers = await due_triggers("learning_digest", now)
     except Exception as e:
         logger.error("run_triggers trigger fetch error: %s", e)
         return
@@ -120,9 +119,6 @@ async def run_triggers(agent=None):
 
         # Record when this user's digest last ran.
         try:
-            await get_db()["triggers"].update_one(
-                {"_id": trig["_id"]},
-                {"$set": {"last_run_at": now.isoformat()}},
-            )
+            await mark_ran(trig, now)
         except Exception as e:
             logger.error("trigger last_run update error user=%s: %s", userId, e)

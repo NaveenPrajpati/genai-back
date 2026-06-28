@@ -1,16 +1,20 @@
 """HTTP routes for the personal-assistant agent. Agent logic lives in app.agents.personal_assistant."""
 
+import json
 import logging
 import uuid
 from typing import Optional, Literal, Annotated
 
 from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
 
 from app.core.config import supabase
 from app.database import get_db
 from app.dependencies import get_current_user
+from app.agents.trigger_store import toggle
+from app.agents.approval_store import get_pending, list_pending, to_legacy
 from app.agents.personal_assistant.repository import (
     TODOS,
     fetch_todos,
@@ -91,6 +95,68 @@ async def ask(
     return {"status": "done", "result": _jsonable(result)}
 
 
+def _sse(event: dict) -> str:
+    """Serialize one event as a Server-Sent Events frame."""
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+@router.post("/query/stream")
+async def ask_stream(
+    body: QueryRequest,
+    request: Request,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Streaming counterpart of /query. Nodes use structured output, so there are
+    no text tokens to stream; we emit a `step` event as each graph node completes
+    (classify → todo/research/notes → synthesize) for live progress, then the
+    final state in `done` (or `needs_approval` for a delete that awaits review)."""
+    agent = request.app.state.pa_agent
+    thread_id = body.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    _excluded = {"_id", "expires_at", "password_hash"}
+    user_data = {k: v for k, v in current_user.items() if k not in _excluded}
+    inputs = {
+        "query": body.text,
+        "user_id": current_user["uid"],
+        "thread_id": thread_id,
+        "current_user": user_data,
+    }
+
+    async def generate():
+        try:
+            yield _sse({"type": "thread", "thread_id": thread_id})
+
+            async for update in agent.astream(
+                inputs, config=config, stream_mode="updates"
+            ):
+                for node in update:
+                    yield _sse({"type": "step", "node": node})
+
+            snapshot = await agent.aget_state(config)
+            values = snapshot.values if snapshot else {}
+            interrupts = snapshot.interrupts if snapshot else None
+            if snapshot and snapshot.next and interrupts:
+                yield _sse(
+                    {
+                        "type": "needs_approval",
+                        "thread_id": thread_id,
+                        "proposal": interrupts[0].value,
+                    }
+                )
+                return
+
+            yield _sse({"type": "done", "result": _jsonable(values)})
+        except Exception as exc:
+            logger.exception("pa stream failed")
+            yield _sse({"type": "error", "message": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/approve")
 async def approve(
     body: ApproveRequest,
@@ -101,24 +167,17 @@ async def approve(
     config = {"configurable": {"thread_id": body.thread_id}}
 
     try:
-        approval = (
-            supabase.table("approvals")
-            .select("id, user_id")
-            .eq("thread_id", body.thread_id)
-            .eq("action_type", "pa_delete_task")
-            .eq("status", "pending")
-            .maybe_single()
-            .execute()
-        )
+        approval = await get_pending(body.thread_id)
     except Exception as e:
         logger.error("pa approval ownership lookup error: %s", e)
         approval = None
 
-    if not approval or not approval.data:
+    # Only a paused delete is resumable here; pa_digest rows are notifications.
+    if not approval or approval.get("action_type") != "pa_delete_task":
         raise HTTPException(
             status_code=404, detail="No pending approval for this thread."
         )
-    if approval.data["user_id"] != current_user["uid"]:
+    if approval["userId"] != current_user["uid"]:
         raise HTTPException(
             status_code=403, detail="You do not have access to this approval."
         )
@@ -138,15 +197,10 @@ async def approve(
 @router.get("/approve")
 async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)]):
     try:
-        result = (
-            supabase.table("approvals")
-            .select("*")
-            .eq("user_id", current_user["uid"])
-            .in_("action_type", ["pa_delete_task", "pa_digest"])
-            .eq("status", "pending")
-            .execute()
+        docs = await list_pending(
+            current_user["uid"], ["pa_delete_task", "pa_digest"]
         )
-        return {"status": "done", "result": result.data or []}
+        return {"status": "done", "result": [to_legacy(d) for d in docs]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -246,33 +300,13 @@ async def delete_task(
 
 @router.post("/toggle-trigger")
 async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)]):
-    user_id = current_user["uid"]
     try:
-        existing = (
-            supabase.table("triggers")
-            .select("*")
-            .eq("user_id", user_id)
-            .eq("action_type", "pa_digest")
-            .execute()
+        # Default cadence: every day at 08:00 in the user's timezone.
+        new_enabled = await toggle(
+            current_user["uid"],
+            "pa_digest",
+            defaults={"name": "daily task digest", "schedule_hour": 8},
         )
-        new_enabled = True
-        if existing and existing.data:
-            new_enabled = not existing.data[0]["enabled"]
-            for t in existing.data:
-                supabase.table("triggers").update({"enabled": not t["enabled"]}).eq(
-                    "id", t["id"]
-                ).execute()
-        else:
-            supabase.table("triggers").insert(
-                {
-                    "user_id": user_id,
-                    "name": "daily task digest",
-                    "schedule": "0 8 * * *",
-                    "action_type": "pa_digest",
-                    "enabled": True,
-                    "last_run_at": None,
-                }
-            ).execute()
         return {"status": "done", "enabled": new_enabled}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
