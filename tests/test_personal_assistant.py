@@ -17,17 +17,25 @@ from langgraph.graph import END
 # node/repository/state symbol the node tests patch); endpoint and trigger tests
 # patch their own modules so monkeypatch hits the namespace the code looks up.
 import app.agents.personal_assistant.workflow as pa
+import app.agents.personal_assistant.tools as pa_tools
 import app.agents.personal_assistant.triggers as pa_triggers
 import app.routers.personal_assistant as pa_router
 from app.dependencies import get_current_user
-
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 _CHAIN_METHODS = (
-    "select", "eq", "in_", "ilike", "order", "limit",
-    "maybe_single", "insert", "update", "upsert",
+    "select",
+    "eq",
+    "in_",
+    "ilike",
+    "order",
+    "limit",
+    "maybe_single",
+    "insert",
+    "update",
+    "upsert",
 )
 
 
@@ -53,9 +61,7 @@ def _supabase_seq(*results):
 
 def _llm_returning(model_obj):
     mock_llm = MagicMock()
-    mock_llm.with_structured_output.return_value = RunnableLambda(
-        lambda _: model_obj
-    )
+    mock_llm.with_structured_output.return_value = RunnableLambda(lambda _: model_obj)
     return mock_llm
 
 
@@ -176,7 +182,9 @@ async def test_delete_approved_path(monkeypatch):
     monkeypatch.setattr(
         pa,
         "find_pending_todos",
-        AsyncMock(return_value=[{"id": "t1", "title": "a"}, {"id": "t2", "title": "b"}]),
+        AsyncMock(
+            return_value=[{"id": "t1", "title": "a"}, {"id": "t2", "title": "b"}]
+        ),
     )
     monkeypatch.setattr(pa, "interrupt", lambda payload: "approved")
     monkeypatch.setattr(pa, "delete_todos_by_ids", AsyncMock(return_value=2))
@@ -215,15 +223,14 @@ async def test_delete_rejected_path(monkeypatch):
 # research_agent + search API
 # --------------------------------------------------------------------------- #
 async def test_research_agent(monkeypatch):
+    # The research model answers without calling a tool, so the ReAct loop ends
+    # after one turn and the final structured pass (on llm) produces the output.
+    # research_agent now builds its tool loop per-user via build_research_loop.
+    no_tool_reply = MagicMock(tool_calls=[])
+    research_model = MagicMock()
+    research_model.ainvoke = AsyncMock(return_value=no_tool_reply)
     monkeypatch.setattr(
-        pa,
-        "web_search",
-        AsyncMock(
-            return_value={
-                "answer": "ans",
-                "results": [{"title": "t", "url": "u", "content": "c"}],
-            }
-        ),
+        pa, "build_research_loop", lambda user_id: (research_model, MagicMock())
     )
     monkeypatch.setattr(
         pa,
@@ -245,7 +252,7 @@ async def test_research_agent(monkeypatch):
 
 async def test_web_search_without_key_is_empty(monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    out = await pa.web_search("anything")
+    out = await pa_tools.web_search("anything")
     assert out == {"answer": "", "results": []}
 
 
@@ -311,7 +318,9 @@ async def test_breakdown_agent(monkeypatch):
         pa,
         "llm",
         _llm_returning(
-            pa.BreakdownOutput(parent_title="Plan trip", subtasks=["book flight", "pack"])
+            pa.BreakdownOutput(
+                parent_title="Plan trip", subtasks=["book flight", "pack"]
+            )
         ),
     )
     monkeypatch.setattr(
@@ -339,7 +348,11 @@ def test_pa_approve_happy_path(monkeypatch):
         pa_router,
         "get_pending",
         AsyncMock(
-            return_value={"_id": "ap1", "userId": "u1", "action_type": "pa_delete_task"}
+            return_value={
+                "_id": "ap1",
+                "user_id": "u1",
+                "action_type": "pa_delete_task",
+            }
         ),
     )
     agent = MagicMock()
@@ -364,7 +377,7 @@ def test_pa_approve_foreign_thread_forbidden(monkeypatch):
         AsyncMock(
             return_value={
                 "_id": "ap1",
-                "userId": "someone_else",
+                "user_id": "someone_else",
                 "action_type": "pa_delete_task",
             }
         ),
@@ -440,16 +453,16 @@ def test_pa_notes_endpoints(monkeypatch):
     assert get_resp.status_code == 200
     assert get_resp.json()["result"][0]["content"] == "likes tea"
 
-    post_resp = client.post(
-        "/personal-assistant/notes", json={"content": "new fact"}
-    )
+    post_resp = client.post("/personal-assistant/notes", json={"content": "new fact"})
     assert post_resp.status_code == 200
     assert post_resp.json()["result"]["content"] == "new fact"
 
 
 def test_pa_subtasks_endpoint(monkeypatch):
     monkeypatch.setattr(
-        pa_router, "fetch_subtasks", AsyncMock(return_value=[{"id": "s1", "title": "step"}])
+        pa_router,
+        "fetch_subtasks",
+        AsyncMock(return_value=[{"id": "s1", "title": "step"}]),
     )
     client = _make_client(MagicMock())
 
@@ -483,7 +496,7 @@ async def test_run_pa_triggers_creates_digest(monkeypatch):
     monkeypatch.setattr(
         pa_triggers,
         "due_triggers",
-        AsyncMock(return_value=[{"_id": "tr1", "userId": "u1"}]),
+        AsyncMock(return_value=[{"_id": "tr1", "user_id": "u1"}]),
     )
     monkeypatch.setattr(pa_triggers, "create_pending", AsyncMock())
     monkeypatch.setattr(pa_triggers, "mark_ran", AsyncMock())

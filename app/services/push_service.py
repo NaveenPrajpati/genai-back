@@ -18,18 +18,18 @@ logger = logging.getLogger(__name__)
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 
-async def get_expo_push_token(userId: str) -> str | None:
+async def get_expo_push_token(user_id: str) -> str | None:
     """Look up the Expo push token stored on the user document, or None."""
-    if not userId or not ObjectId.is_valid(userId):
+    if not user_id or not ObjectId.is_valid(user_id):
         return None
     user = await get_db()["users"].find_one(
-        {"_id": ObjectId(userId)}, {"expo_push_token": 1}
+        {"_id": ObjectId(user_id)}, {"expo_push_token": 1}
     )
     return (user or {}).get("expo_push_token")
 
 
 async def send_push_notification(
-    userId: str,
+    user_id: str,
     title: str,
     body: str,
     data: dict | None = None,
@@ -40,9 +40,9 @@ async def send_push_notification(
     or delivery failed. Never raises — scheduler jobs must not abort on a
     notification error.
     """
-    token = await get_expo_push_token(userId)
+    token = await get_expo_push_token(user_id)
     if not token:
-        logger.info("push skipped: no expo token for user=%s", userId)
+        logger.info("push skipped: no expo token for user=%s", user_id)
         return False
 
     message = {"to": token, "title": title, "body": body, "sound": "default"}
@@ -62,12 +62,10 @@ async def send_push_notification(
         resp.raise_for_status()
         ticket = resp.json().get("data", {})
         if isinstance(ticket, dict) and ticket.get("status") == "error":
-            logger.error(
-                "expo push error user=%s: %s", userId, ticket.get("message")
-            )
+            logger.error("expo push error user=%s: %s", user_id, ticket.get("message"))
             return False
-        logger.info("push sent user=%s title=%s", userId, title)
+        logger.info("push sent user=%s title=%s", user_id, title)
         return True
     except Exception as e:
-        logger.error("push send failed user=%s: %s", userId, e)
+        logger.error("push send failed user=%s: %s", user_id, e)
         return False

@@ -51,10 +51,10 @@ def _sse(event: dict) -> str:
 async def get_all_files(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    userId = current_user["uid"]
+    user_id = current_user["uid"]
     try:
 
-        return {"message": "list fetched", "data": storage.list_ingestion_logs(userId)}
+        return {"message": "list fetched", "data": storage.list_ingestion_logs(user_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch files: {e}")
 
@@ -90,7 +90,7 @@ async def ingest_document(
     """
     job_id = str(uuid.uuid4())
     tmp_path: Optional[str] = None
-    userId = current_user["uid"]
+    user_id = current_user["uid"]
     if action == "url":
         if not data:
             raise HTTPException(
@@ -124,7 +124,12 @@ async def ingest_document(
         "queued_at": queued_at,
     }
     await asyncio.to_thread(
-        storage.create_ingestion_log, job_id, display_source, file_type, queued_at,userId
+        storage.create_ingestion_log,
+        job_id,
+        display_source,
+        file_type,
+        queued_at,
+        user_id,
     )
 
     background_tasks.add_task(
@@ -199,7 +204,7 @@ async def query_documents_stream(
     scope = cache.scope_key(request.ingestions)
 
     chat_id = request.chat_id
-    userId = current_user["uid"]
+    user_id = current_user["uid"]
 
     async def generate():
         try:
@@ -224,7 +229,7 @@ async def query_documents_stream(
                         chat_id=chat_id,
                         question=request.question,
                         answer=cached["answer"],
-                        userId=userId,
+                        user_id=user_id,
                         sources=cached["sources"],
                         ingestions=request.ingestions,
                     )
@@ -266,7 +271,7 @@ async def query_documents_stream(
                     chat_id=chat_id,
                     question=request.question,
                     answer=full_answer,
-                    userId=userId,
+                    user_id=user_id,
                     sources=sources,
                     ingestions=request.ingestions,
                 )

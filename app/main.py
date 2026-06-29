@@ -17,6 +17,7 @@ from app.routers import (
     meal_planner,
 )
 from app.database import connect_db, close_db
+from app.core.observability import init_tracing
 from app.routers import rag
 from app.routers import chat
 from app.agents.learning_tracker import graph, run_triggers
@@ -44,6 +45,9 @@ DB_URI = os.environ["DATABASE_URL"]
 async def lifespan(app: FastAPI):
     # --- STARTUP PHASE ---
     print("[Lifespan] Starting application initialization...")
+
+    # Opt-in LangSmith tracing (no-op unless LANGSMITH_TRACING is set).
+    init_tracing()
 
     scheduler = AsyncIOScheduler()
 

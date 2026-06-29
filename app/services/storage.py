@@ -21,7 +21,7 @@ def _now() -> str:
 
 
 def create_ingestion_log(
-    doc_id: str, source: str, file_type: str, ingested_at: str, userId: str
+    doc_id: str, source: str, file_type: str, ingested_at: str, user_id: str
 ) -> None:
     supabase.table("rag_ingestion_logs").insert(
         {
@@ -30,7 +30,7 @@ def create_ingestion_log(
             "file_type": file_type,
             "status": "queued",
             "ingested_at": ingested_at,
-            "userId": userId,
+            "user_id": user_id,
         }
     ).execute()
 
@@ -55,12 +55,12 @@ def delete_ingestion_log(doc_id: str) -> None:
     supabase.table("rag_ingestion_logs").delete().eq("doc_id", doc_id).execute()
 
 
-def list_ingestion_logs(userId) -> list:
+def list_ingestion_logs(user_id) -> list:
     return (
         supabase.table("rag_ingestion_logs")
         .select("*")
         .order("ingested_at", desc=True)
-        .eq("userId", userId)
+        .eq("user_id", user_id)
         .execute()
         .data
     )
@@ -77,12 +77,12 @@ def create_chat(title: str) -> str:
     return row.data[0]["id"]
 
 
-def list_chats(userId) -> list:
+def list_chats(user_id) -> list:
     return (
         supabase.table("rag_chats")
         .select("*")
         .order("updated_at", desc=True)
-        .eq("userId", userId)
+        .eq("user_id", user_id)
         .execute()
         .data
     )
@@ -119,7 +119,7 @@ def save_messages(
     chat_id: str,
     question: str,
     answer: str,
-    userId: str,
+    user_id: str,
     sources: list,
     ingestions: List[str],
 ) -> None:
@@ -134,7 +134,7 @@ def save_messages(
             supabase.table("rag_chats")
             .insert(
                 {
-                    "userId": userId,
+                    "user_id": user_id,
                     "updated_at": now,
                     "created_at": now,
                     "title": question[:50],

@@ -1,7 +1,7 @@
 """Shared MongoDB-backed trigger store + scheduling gate.
 
 Every agent's scheduled job (learning digest, meal plan, PA digest) opts users
-in via a single Mongo `triggers` collection keyed by (userId, action_type). Each
+in via a single Mongo `triggers` collection keyed by (user_id, action_type). Each
 row carries delivery settings — schedule_hour, timezone, and optional
 schedule_dow — so the hourly scheduler sweeps fire per user at their chosen local
 time rather than one fixed server-wide time.
@@ -25,7 +25,7 @@ def _zone(trig: dict) -> ZoneInfo:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
         logger.warning(
-            "unknown timezone %r for user=%s, using UTC", name, trig.get("userId")
+            "unknown timezone %r for user=%s, using UTC", name, trig.get("user_id")
         )
         return ZoneInfo("UTC")
 
@@ -67,12 +67,12 @@ async def mark_ran(trig: dict, now: datetime | None = None) -> None:
     )
 
 
-async def toggle(userId: str, action_type: str, defaults: dict | None = None) -> bool:
-    """Flip `enabled` for (userId, action_type); create an enabled row if absent.
+async def toggle(user_id: str, action_type: str, defaults: dict | None = None) -> bool:
+    """Flip `enabled` for (user_id, action_type); create an enabled row if absent.
     `defaults` seeds extra fields (schedule_hour, schedule_dow, name, …) on first
     create. Returns the resulting enabled state."""
     col = get_db()["triggers"]
-    existing = await col.find_one({"userId": userId, "action_type": action_type})
+    existing = await col.find_one({"user_id": user_id, "action_type": action_type})
     if existing:
         enabled = not existing.get("enabled", True)
         await col.update_one(
@@ -87,7 +87,7 @@ async def toggle(userId: str, action_type: str, defaults: dict | None = None) ->
         return enabled
 
     doc = {
-        "userId": userId,
+        "user_id": user_id,
         "action_type": action_type,
         "enabled": True,
         "schedule_hour": 9,

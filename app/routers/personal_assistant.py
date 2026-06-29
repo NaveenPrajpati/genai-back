@@ -5,16 +5,17 @@ import logging
 import uuid
 from typing import Optional, Literal, Annotated
 
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
 
-from app.core.config import supabase
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.agents.trigger_store import toggle
 from app.agents.approval_store import get_pending, list_pending, to_legacy
+from app.agents.memory_store import extract_and_save, get_profile
+from app.agents.personal_assistant.state import PAMemoryExtract, PA_MEMORY_INSTRUCTIONS
 from app.agents.personal_assistant.repository import (
     TODOS,
     fetch_todos,
@@ -68,6 +69,7 @@ def _jsonable(result: dict) -> dict:
 async def ask(
     body: QueryRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     agent = request.app.state.pa_agent
@@ -84,6 +86,16 @@ async def ask(
             "current_user": user_data,
         },
         config=config,
+    )
+
+    # Fire-and-forget: learn durable personal facts after the response is sent.
+    background_tasks.add_task(
+        extract_and_save,
+        current_user["uid"],
+        body.text,
+        PAMemoryExtract,
+        PA_MEMORY_INSTRUCTIONS,
+        result.get("memory"),
     )
 
     if "__interrupt__" in result:
@@ -104,6 +116,7 @@ def _sse(event: dict) -> str:
 async def ask_stream(
     body: QueryRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Streaming counterpart of /query. Nodes use structured output, so there are
@@ -113,6 +126,16 @@ async def ask_stream(
     agent = request.app.state.pa_agent
     thread_id = body.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
+
+    # Fire-and-forget: learn durable personal facts after the stream completes.
+    background_tasks.add_task(
+        extract_and_save,
+        current_user["uid"],
+        body.text,
+        PAMemoryExtract,
+        PA_MEMORY_INSTRUCTIONS,
+        None,
+    )
     _excluded = {"_id", "expires_at", "password_hash"}
     user_data = {k: v for k, v in current_user.items() if k not in _excluded}
     inputs = {
@@ -177,7 +200,7 @@ async def approve(
         raise HTTPException(
             status_code=404, detail="No pending approval for this thread."
         )
-    if approval["userId"] != current_user["uid"]:
+    if approval["user_id"] != current_user["uid"]:
         raise HTTPException(
             status_code=403, detail="You do not have access to this approval."
         )
@@ -197,9 +220,7 @@ async def approve(
 @router.get("/approve")
 async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)]):
     try:
-        docs = await list_pending(
-            current_user["uid"], ["pa_delete_task", "pa_digest"]
-        )
+        docs = await list_pending(current_user["uid"], ["pa_delete_task", "pa_digest"])
         return {"status": "done", "result": [to_legacy(d) for d in docs]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -315,13 +336,9 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
 @router.get("/memory")
 async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
     try:
-        rows = (
-            supabase.table("memory")
-            .select("key, value")
-            .eq("user_id", current_user["uid"])
-            .execute()
-        )
-        return {"status": "done", "result": rows.data or []}
+        profile = await get_profile(current_user["uid"])
+        result = [{"key": k, "value": v} for k, v in profile.items()]
+        return {"status": "done", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -8,8 +8,9 @@ from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
 from app.core.llm import llm
-from app.core.config import supabase
 from app.agents.approval_store import get_pending, create_pending, resolve
+from app.agents.react import run_tool_loop
+from app.agents.memory_store import get_profile
 from .state import (
     PAState,
     IntentOutput,
@@ -34,7 +35,7 @@ from .repository import (
     categorize_agenda,
     insert_subtasks,
 )
-from .tools import web_search
+from .tools import build_research_loop
 
 logger = logging.getLogger(__name__)
 
@@ -61,18 +62,9 @@ def _recent_history(state: PAState) -> str:
 
 async def load_memory(state: PAState):
     user_id = state["user_id"]
-    memory: dict = {}
-    try:
-        rows = (
-            supabase.table("memory")
-            .select("key, value")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if rows and rows.data:
-            memory = {r["key"]: r["value"] for r in rows.data}
-    except Exception as e:
-        logger.error("pa load memory error: %s", e)
+    # Long-term profile + app-managed memory (notes, history, prefs) all live in
+    # the shared Mongo `memories` doc.
+    memory: dict = await get_profile(user_id)
     # Record the user's turn in the conversation history (add_messages appends).
     return {"memory": memory, "messages": [HumanMessage(content=state.get("query", ""))]}
 
@@ -246,31 +238,39 @@ async def _delete_with_approval(state: PAState):
 
 
 async def research_agent(state: PAState):
-    """Researches the user's topic via the Search API and summarizes it."""
+    """Researches the user's topic via web search (ReAct: the LLM runs its own
+    searches, refining as needed) and summarizes the findings."""
     topic = state["query"]
-    search = await web_search(topic)
-
-    context_lines = []
-    if search.get("answer"):
-        context_lines.append(f"Search answer: {search['answer']}")
-    for r in search.get("results", []):
-        context_lines.append(f"- {r['title']} ({r['url']})\n  {r['content']}")
-    context = "\n".join(context_lines) or "No external results available."
 
     messages = [
         SystemMessage(
             content=(
-                "You are a research assistant. Using the provided search results, "
-                "write a concise summary, a few key points, and list the source "
-                "URLs. If the results are empty, answer from general knowledge and "
-                "leave sources empty."
+                "You are a research assistant. Use the web search tool to gather "
+                "up-to-date information on the user's topic, searching more than "
+                "once with refined queries if helpful. Then write a concise "
+                "summary, a few key points, and list the source URLs. If search "
+                "returns nothing, answer from general knowledge and leave sources "
+                "empty.\n"
+                "If the user's intent is to *learn or study* a subject (not just "
+                "look up a fact), call start_learning_roadmap to build them a "
+                "structured roadmap instead of only summarizing."
             )
         ),
-        HumanMessage(content=f"Topic: {topic}\n\nSearch results:\n{context}"),
+        HumanMessage(content=f"Topic: {topic}"),
     ]
+    research_model, tool_node = build_research_loop(state["user_id"])
+    messages = await run_tool_loop(research_model, tool_node, messages)
+
     structured: ResearchOutput = await llm.with_structured_output(
         ResearchOutput
-    ).ainvoke(messages)
+    ).ainvoke(
+        messages
+        + [
+            HumanMessage(
+                content="Return the summary, key points, and source URLs."
+            )
+        ]
+    )
 
     await append_memory_list(state["user_id"], MEMORY_RESEARCH_KEY, topic)
 
@@ -376,8 +376,22 @@ async def synthesize_response(state: PAState):
     notes = state.get("notes") or []
     agenda = state.get("agenda")
     subtasks = state.get("subtasks") or []
+    memory = state.get("memory") or {}
 
     parts = [f"Intent: {intent}", f"Status: {task_status}"]
+    # Surface the learned profile so the reply can reflect the user's standing
+    # priorities and preferred communication style.
+    profile_bits = [
+        f"{label}: {memory[key]}"
+        for key, label in (
+            ("communication_style", "Preferred style"),
+            ("priorities", "Standing priorities"),
+            ("work_hours", "Work hours"),
+        )
+        if memory.get(key)
+    ]
+    if profile_bits:
+        parts.append("User profile — " + "; ".join(profile_bits))
     if todos:
         task_lines = "\n".join(
             f"  - [{t.get('priority', '?')}] {t.get('title', '')} "
@@ -419,7 +433,8 @@ async def synthesize_response(state: PAState):
             content=(
                 "You are a concise personal assistant. Based on the operation result "
                 "below, write a short, friendly reply to the user. Describe what "
-                "happened in plain language — do not dump raw data."
+                "happened in plain language — do not dump raw data. If a user "
+                "profile is given, honor their preferred communication style."
             )
         ),
         HumanMessage(

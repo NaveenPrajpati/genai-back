@@ -62,7 +62,7 @@ async def ask(
     result = await agent.ainvoke(
         {
             "query": body.text,
-            "userId": current_user["uid"],
+            "user_id": current_user["uid"],
             "thread_id": thread_id,
             "roadmapId": body.roadmapId,
             "current_user": user_data,
@@ -109,7 +109,7 @@ async def ask_stream(
     user_data = {k: v for k, v in current_user.items() if k not in _excluded}
     inputs = {
         "query": body.text,
-        "userId": current_user["uid"],
+        "user_id": current_user["uid"],
         "thread_id": thread_id,
         "roadmapId": body.roadmapId,
         "current_user": user_data,
@@ -206,7 +206,7 @@ async def approve(
         raise HTTPException(
             status_code=404, detail="No pending approval for this thread."
         )
-    if approval["userId"] != current_user["uid"]:
+    if approval["user_id"] != current_user["uid"]:
         raise HTTPException(
             status_code=403, detail="You do not have access to this approval."
         )
@@ -236,11 +236,11 @@ class SubmitQuiz(BaseModel):
 async def submit_quiz(
     body: SubmitQuiz, current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    userId = current_user["uid"]
-    logger.info("--- %s", userId)
+    user_id = current_user["uid"]
+    logger.info("--- %s", user_id)
     try:
         quiz = await get_db()["quizzes"].find_one(
-            {"_id": ObjectId(body.quizId), "userId": userId}
+            {"_id": ObjectId(body.quizId), "user_id": user_id}
         )
         if not quiz:
             raise HTTPException(status_code=404, detail="Quiz not found.")
@@ -285,10 +285,10 @@ async def submit_quiz(
 
 @router.get("/roadmaps")
 async def getPlans(current_user: Annotated[dict, Depends(get_current_user)]):
-    userId = current_user["uid"]
-    logger.info("--- %s", userId)
+    user_id = current_user["uid"]
+    logger.info("--- %s", user_id)
     try:
-        cursor = get_db()["roadmaps"].find({"userId": userId})
+        cursor = get_db()["roadmaps"].find({"user_id": user_id})
         docs = await cursor.to_list(None)
         for doc in docs:
             doc["_id"] = str(doc["_id"])
@@ -307,7 +307,7 @@ async def getPlans(current_user: Annotated[dict, Depends(get_current_user)]):
 async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
     """Let the UI show the learner what the system remembers about them."""
     try:
-        doc = await get_db()["memories"].find_one({"userId": current_user["uid"]})
+        doc = await get_db()["memories"].find_one({"user_id": current_user["uid"]})
         return {"status": "done", "result": doc.get("data", {}) if doc else {}}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -327,7 +327,7 @@ async def put_memory(
         set_doc = {f"data.{k}": v for k, v in body.data.items()}
         set_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
         await get_db()["memories"].update_one(
-            {"userId": current_user["uid"]},
+            {"user_id": current_user["uid"]},
             {
                 "$set": set_doc,
                 "$setOnInsert": {"createdAt": datetime.now(timezone.utc).isoformat()},
@@ -343,7 +343,7 @@ async def put_memory(
 async def delete_memory(current_user: Annotated[dict, Depends(get_current_user)]):
     """Clear everything we remember about the learner (privacy / reset)."""
     try:
-        await get_db()["memories"].delete_one({"userId": current_user["uid"]})
+        await get_db()["memories"].delete_one({"user_id": current_user["uid"]})
         return {"status": "done"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -358,7 +358,7 @@ async def get_digests(
     try:
         cursor = (
             get_db()["learning_digests"]
-            .find({"userId": current_user["uid"]})
+            .find({"user_id": current_user["uid"]})
             .sort("createdAt", -1)
             .limit(limit)
         )
@@ -384,7 +384,7 @@ async def update_progress(
     checkbox in the UI, which already knows the topic id). No LLM involved."""
     try:
         updated = await set_topic_covered(
-            body.roadmapId, body.topicId, body.covered, userId=current_user["uid"]
+            body.roadmapId, body.topicId, body.covered, user_id=current_user["uid"]
         )
         if not updated:
             raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
@@ -400,7 +400,7 @@ async def update_progress(
 
 
 class Trigger(BaseModel):
-    userId: str
+    user_id: str
     action_type: str = "learning_digest"
     enabled: bool = True
     # Local hour-of-day (0-23) the digest should fire, interpreted in `timezone`.
@@ -428,7 +428,7 @@ async def get_triggers(current_user: Annotated[dict, Depends(get_current_user)])
     user who has never opted in has no row, so the list may be empty — the UI
     should treat a missing trigger as disabled."""
     try:
-        cursor = get_db()["triggers"].find({"userId": current_user["uid"]})
+        cursor = get_db()["triggers"].find({"user_id": current_user["uid"]})
         docs = await cursor.to_list(None)
         for doc in docs:
             doc["_id"] = str(doc["_id"])
@@ -443,10 +443,10 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
     entry; each subsequent call flips it on/off. run_triggers only generates a digest
     for users whose entry is enabled."""
     try:
-        userId = current_user["uid"]
+        user_id = current_user["uid"]
         col = get_db()["triggers"]
         existing = await col.find_one(
-            {"userId": userId, "action_type": "learning_digest"}
+            {"user_id": user_id, "action_type": "learning_digest"}
         )
         if existing:
             enabled = not existing.get("enabled", True)
@@ -463,7 +463,7 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
             enabled = True
             await col.insert_one(
                 {
-                    "userId": userId,
+                    "user_id": user_id,
                     "action_type": "learning_digest",
                     "enabled": True,
                     "schedule_hour": 9,
@@ -508,11 +508,11 @@ async def update_trigger_settings(
 
         update["updatedAt"] = datetime.now(timezone.utc).isoformat()
         result = await get_db()["triggers"].update_one(
-            {"userId": current_user["uid"], "action_type": body.action_type},
+            {"user_id": current_user["uid"], "action_type": body.action_type},
             {
                 "$set": update,
                 "$setOnInsert": {
-                    "userId": current_user["uid"],
+                    "user_id": current_user["uid"],
                     "action_type": body.action_type,
                     "createdAt": datetime.now(timezone.utc).isoformat(),
                 },

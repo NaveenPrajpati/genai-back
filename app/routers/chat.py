@@ -28,8 +28,8 @@ async def create_chat_route(body: CreateChatRequest):
 async def get_all_chats(current_user: Annotated[dict, Depends(get_current_user)]):
     """Return all chats ordered by most recently updated."""
     try:
-        userId = current_user["uid"]
-        return {"message": "chats fetched", "data": storage.list_chats(userId)}
+        user_id = current_user["uid"]
+        return {"message": "chats fetched", "data": storage.list_chats(user_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

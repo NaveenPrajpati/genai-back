@@ -5,10 +5,9 @@ from datetime import date, timedelta, datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
-from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.llm import llm
 from app.database import get_db
+from app.agents.memory_store import extract_and_save
 from .state import RoadmapOutput, TopicNode, MemoryExtract
 
 logger = logging.getLogger(__name__)
@@ -32,11 +31,11 @@ def active_topic(roadmap: dict) -> Optional[dict]:
 
 
 async def insertRoadmapToDb(
-    roadmap: RoadmapOutput, userId: Optional[str] = None
+    roadmap: RoadmapOutput, user_id: Optional[str] = None
 ) -> Optional[str]:
     try:
         doc = roadmap.model_dump()
-        doc["userId"] = userId
+        doc["user_id"] = user_id
         doc["createdAt"] = datetime.now(timezone.utc).isoformat()
         res = await get_db()["roadmaps"].insert_one(doc)
         logger.info("insertRoadmapToDb inserted: %s", res.inserted_id)
@@ -77,13 +76,13 @@ async def update_topic(roadmapId: str, topic: TopicNode) -> bool:
 
 
 async def set_topic_covered(
-    roadmapId: str, topicId: str, covered: bool, userId: Optional[str] = None
+    roadmapId: str, topicId: str, covered: bool, user_id: Optional[str] = None
 ) -> bool:
     """Flip a single topic's `covered` flag via a targeted positional update — no
-    LLM, no full-document rewrite. Optionally scope to userId for ownership."""
+    LLM, no full-document rewrite. Optionally scope to user_id for ownership."""
     query = {"_id": ObjectId(roadmapId), "topics.id": topicId}
-    if userId:
-        query["userId"] = userId
+    if user_id:
+        query["user_id"] = user_id
     try:
         res = await get_db()["roadmaps"].update_one(
             query, {"$set": {"topics.$.covered": covered}}
@@ -94,52 +93,18 @@ async def set_topic_covered(
         return False
 
 
-async def write_memory(userId: str, query: str, current: Optional[dict] = None):
+_LEARNER_MEMORY_INSTRUCTIONS = (
+    "Extract durable facts about the learner from their message — skill level "
+    "(beginner/intermediate/advanced), preferred resource types "
+    "(video/text/interactive), learning goals, weekly availability, and topics "
+    "they already know."
+)
+
+
+async def write_memory(user_id: str, query: str, current: Optional[dict] = None):
     """Background task: pull durable learner facts out of the latest message and
     merge them into the user's memory doc. Runs after the response is sent, so it
-    adds no latency to /query. Always upserts so memory stays a single doc."""
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Extract durable facts about the learner from their message — skill "
-                "level (beginner/intermediate/advanced), preferred resource types "
-                "(video/text/interactive), learning goals, weekly availability, and "
-                "topics they already know.\n"
-                "Only fill a field when the message gives clear evidence; otherwise "
-                "leave it null. Do not invent or restate the existing profile.\n"
-                "Known so far:\n{current}",
-            ),
-            ("human", "{text}"),
-        ]
+    adds no latency to /query. Delegates to the shared memory store."""
+    await extract_and_save(
+        user_id, query, MemoryExtract, _LEARNER_MEMORY_INSTRUCTIONS, current
     )
-    chain = prompt | llm.with_structured_output(MemoryExtract)
-    try:
-        extracted: MemoryExtract = await chain.ainvoke(
-            {"text": query, "current": current or "none"}
-        )
-    except Exception as e:
-        logger.error("write_memory extract error: %s", e)
-        return
-
-    # Keep only the fields the model actually filled in.
-    updates = {
-        k: v for k, v in extracted.model_dump().items() if v not in (None, [], "")
-    }
-    if not updates:
-        return
-
-    set_doc = {f"data.{k}": v for k, v in updates.items()}
-    set_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
-    try:
-        await get_db()["memories"].update_one(
-            {"userId": userId},
-            {
-                "$set": set_doc,
-                "$setOnInsert": {"createdAt": datetime.now(timezone.utc).isoformat()},
-            },
-            upsert=True,
-        )
-        logger.info("memory updated user=%s fields=%s", userId, list(updates))
-    except Exception as e:
-        logger.error("write_memory upsert error: %s", e)

@@ -48,12 +48,12 @@ async def run_triggers(agent=None):
         return
 
     for trig in triggers:
-        userId = trig.get("userId")
+        user_id = trig.get("user_id")
         try:
-            cursor = get_db()["roadmaps"].find({"userId": userId})
+            cursor = get_db()["roadmaps"].find({"user_id": user_id})
             roadmaps = await cursor.to_list(None)
         except Exception as e:
-            logger.error("run_triggers roadmap fetch error user=%s: %s", userId, e)
+            logger.error("run_triggers roadmap fetch error user=%s: %s", user_id, e)
             continue
 
         for roadmap in roadmaps:
@@ -93,7 +93,7 @@ async def run_triggers(agent=None):
 
                 await get_db()["learning_digests"].insert_one(
                     {
-                        "userId": userId,
+                        "user_id": user_id,
                         "roadmapId": str(roadmap["_id"]),
                         "topicId": topic.get("id"),
                         "topicTitle": topic_title,
@@ -103,13 +103,17 @@ async def run_triggers(agent=None):
                     }
                 )
                 logger.info(
-                    "learning digest created user=%s topic=%s", userId, topic_title
+                    "learning digest created user=%s topic=%s", user_id, topic_title
                 )
 
                 await send_push_notification(
-                    userId,
+                    user_id,
                     title=f"Today's tips: {topic_title}",
-                    body=result.bullets[0] if result.bullets else "Your daily learning digest is ready.",
+                    body=(
+                        result.bullets[0]
+                        if result.bullets
+                        else "Your daily learning digest is ready."
+                    ),
                     data={"type": "learning_digest", "topicId": topic.get("id")},
                 )
             except Exception as e:
@@ -121,4 +125,4 @@ async def run_triggers(agent=None):
         try:
             await mark_ran(trig, now)
         except Exception as e:
-            logger.error("trigger last_run update error user=%s: %s", userId, e)
+            logger.error("trigger last_run update error user=%s: %s", user_id, e)

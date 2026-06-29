@@ -44,13 +44,13 @@ async def run_pa_triggers(agent=None):
         return
 
     for t in triggers:
-        userId = t.get("userId")
+        user_id = t.get("user_id")
         try:
-            pending = await fetch_todos(userId, status="pending")
+            pending = await fetch_todos(user_id, status="pending")
             agenda = categorize_agenda(pending)
             digest = _compose_digest(agenda)
             await create_pending(
-                userId,
+                user_id,
                 str(uuid.uuid4()),
                 "pa_digest",
                 {
@@ -63,15 +63,15 @@ async def run_pa_triggers(agent=None):
             )
             await mark_ran(t, now)
             await send_push_notification(
-                userId,
+                user_id,
                 title="Your daily agenda",
                 body=digest,
                 data={"type": "pa_digest", "pending_count": len(pending)},
             )
             logger.info(
                 "pa digest created for user=%s (%d pending)",
-                userId,
+                user_id,
                 len(pending),
             )
         except Exception as e:
-            logger.error("pa digest error for user=%s: %s", userId, e)
+            logger.error("pa digest error for user=%s: %s", user_id, e)

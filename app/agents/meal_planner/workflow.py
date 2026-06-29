@@ -10,6 +10,8 @@ from langgraph.types import interrupt
 from app.core.config import supabase
 from app.core.llm import llm
 from app.agents.approval_store import get_pending, create_pending, resolve
+from app.agents.react import run_tool_loop
+from app.agents.memory_store import get_profile
 from .state import (
     PlannerState,
     IntentOutput,
@@ -148,14 +150,9 @@ async def research_agent(state: PlannerState):
         HumanMessage(content=state["query"]),
     ]
 
-    # Tool-calling loop: LLM calls get_nutrition for each meal it suggests
-    while True:
-        response = await research_llm.ainvoke(messages)
-        messages.append(response)
-        if not response.tool_calls:
-            break
-        tool_results = await research_tool_node.ainvoke({"messages": messages})
-        messages.extend(tool_results["messages"])
+    # ReAct loop: LLM calls get_nutrition for each meal it suggests, reads the
+    # nutrition data, and may suggest/look up more before finishing.
+    messages = await run_tool_loop(research_llm, research_tool_node, messages)
 
     # Final pass: extract structured output from the enriched conversation
     structured: ResearchOutput = await llm.with_structured_output(
@@ -193,7 +190,11 @@ async def plan_agent(state: PlannerState):
                 (
                     "system",
                     "You are an expert at planning diet plan , so plan diet for week my week start from monday means monday is day of week 0 ,recipes for dinner, lunch, breakfast for all days of week along with protien in grams in each meal "
-                    "User diet: {diet}. Disliked: {disliked}.\n",
+                    "User diet: {diet}. Disliked: {disliked}.\n"
+                    "Learned preferences (honor these strictly) — diet restrictions: "
+                    "{diet_restrictions}; allergies: {allergies}; preferred cuisines: "
+                    "{preferred_cuisines}; household size: {household_size}; cooking "
+                    "skill: {cooking_skill}; nutrition goals: {nutrition_goals}.\n",
                 ),
                 ("human", "{text}"),
             ]
@@ -206,6 +207,12 @@ async def plan_agent(state: PlannerState):
                 "text": state["query"],
                 "diet": current_user.get("diet", "vegetarian"),
                 "disliked": memory.get("disliked_dishes", []),
+                "diet_restrictions": memory.get("diet_restrictions") or "none",
+                "allergies": memory.get("allergies") or "none",
+                "preferred_cuisines": memory.get("preferred_cuisines") or "none",
+                "household_size": memory.get("household_size") or "unknown",
+                "cooking_skill": memory.get("cooking_skill") or "unknown",
+                "nutrition_goals": memory.get("nutrition_goals") or "none",
             }
         )
         logger.info("plan data %s", result)
@@ -291,19 +298,10 @@ async def plan_agent(state: PlannerState):
 
 async def load_memory(state: PlannerState):
     user_id = state["user_id"]
-    memory = {}
-
-    try:
-        rows = (
-            supabase.table("memory")
-            .select("key, value")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if rows and rows.data:
-            memory = {r["key"]: r["value"] for r in rows.data}
-    except Exception as e:
-        logger.error("load memory error: %s", e)
+    # Learned long-term profile (diet, allergies, cuisines …) from the shared
+    # Mongo store, layered under the user-managed Supabase prefs (which win on
+    # any key collision).
+    memory = await get_profile(user_id)
 
     return {"memory": memory}
 

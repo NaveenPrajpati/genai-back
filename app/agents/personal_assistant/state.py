@@ -89,3 +89,22 @@ class ResearchOutput(BaseModel):
 
 class SynthesisOutput(BaseModel):
     response: str
+
+
+class PAMemoryExtract(BaseModel):
+    """Durable personal facts that help the assistant tailor its help. Every
+    field is optional — only fill one when the message gives clear evidence."""
+
+    work_hours: Optional[str] = None  # e.g. "9-5 weekdays"
+    timezone: Optional[str] = None
+    priorities: Optional[List[str]] = None  # standing focuses, e.g. "fitness", "job hunt"
+    communication_style: Optional[str] = None  # e.g. "brief", "detailed"
+    recurring_commitments: Optional[List[str]] = None  # e.g. "gym Mon/Wed/Fri"
+
+
+PA_MEMORY_INSTRUCTIONS = (
+    "Extract durable personal facts about the user that would help an assistant "
+    "tailor its help — typical work hours, timezone, standing priorities/focuses, "
+    "preferred communication style (brief/detailed), and recurring commitments. "
+    "Do not extract one-off tasks or transient requests."
+)

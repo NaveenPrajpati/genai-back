@@ -6,7 +6,7 @@ workflow hand-rolling its own lookup/insert/resolve against a different store.
 
 Canonical document shape:
     {
-        _id, userId, threadId, action_type, payload,
+        _id, user_id, threadId, action_type, payload,
         status: "pending" | "approved" | "rejected",
         createdAt, resolvedAt
     }
@@ -38,13 +38,13 @@ def _now() -> str:
 
 
 async def create_pending(
-    userId: str, thread_id: str, action_type: str, payload: dict
+    user_id: str, thread_id: str, action_type: str, payload: dict
 ) -> str | None:
     """Insert a pending approval and return its id (used by schedulers)."""
     try:
         res = await _col().insert_one(
             {
-                "userId": userId,
+                "user_id": user_id,
                 "threadId": thread_id,
                 "action_type": action_type,
                 "payload": payload,
@@ -77,10 +77,10 @@ async def get_pending(thread_id: str) -> dict | None:
 
 
 async def list_pending(
-    userId: str, action_types: list[str] | None = None
+    user_id: str, action_types: list[str] | None = None
 ) -> list[dict]:
     """A user's pending approvals, optionally filtered to specific action_types."""
-    query: dict = {"userId": userId, "status": "pending"}
+    query: dict = {"user_id": user_id, "status": "pending"}
     if action_types:
         query["action_type"] = {"$in": action_types}
     cursor = _col().find(query)
@@ -95,7 +95,7 @@ def to_legacy(doc: dict) -> dict:
     historically received from Supabase, so those list endpoints stay non-breaking."""
     return {
         "id": str(doc.get("_id")),
-        "user_id": doc.get("userId"),
+        "user_id": doc.get("user_id"),
         "thread_id": doc.get("threadId"),
         "action_type": doc.get("action_type"),
         "payload": doc.get("payload"),

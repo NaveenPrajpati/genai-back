@@ -109,7 +109,7 @@ def test_decide_agent_unknown_intent_ends():
 # --------------------------------------------------------------------------- #
 def test_approve_happy_path_resumes_agent(monkeypatch):
     monkeypatch.setattr(
-        mp_router, "get_pending", AsyncMock(return_value={"_id": "a1", "userId": "u1"})
+        mp_router, "get_pending", AsyncMock(return_value={"_id": "a1", "user_id": "u1"})
     )
     agent = MagicMock()
     agent.aget_state = AsyncMock(return_value=SimpleNamespace(next=("plan_agent",)))
@@ -132,7 +132,7 @@ def test_approve_other_users_thread_is_forbidden(monkeypatch):
     monkeypatch.setattr(
         mp_router,
         "get_pending",
-        AsyncMock(return_value={"_id": "a1", "userId": "someone_else"}),
+        AsyncMock(return_value={"_id": "a1", "user_id": "someone_else"}),
     )
     agent = MagicMock()
     agent.aget_state = AsyncMock()
@@ -168,7 +168,7 @@ def test_approve_lost_thread_after_restart_is_404(monkeypatch):
     # Approval row exists and is owned, but the checkpointer has no paused thread
     # (e.g. server restarted with an in-memory saver).
     monkeypatch.setattr(
-        mp_router, "get_pending", AsyncMock(return_value={"_id": "a1", "userId": "u1"})
+        mp_router, "get_pending", AsyncMock(return_value={"_id": "a1", "user_id": "u1"})
     )
     agent = MagicMock()
     agent.aget_state = AsyncMock(return_value=SimpleNamespace(next=()))
@@ -313,9 +313,7 @@ def test_disliked_endpoints(monkeypatch):
     monkeypatch.setattr(
         mp_router, "add_disliked_dish", AsyncMock(return_value=["okra", "tofu"])
     )
-    monkeypatch.setattr(
-        mp_router, "remove_disliked_dish", AsyncMock(return_value=[])
-    )
+    monkeypatch.setattr(mp_router, "remove_disliked_dish", AsyncMock(return_value=[]))
     client = _make_client(MagicMock())
 
     assert client.get("/meal-planner/disliked").json()["result"] == ["okra"]

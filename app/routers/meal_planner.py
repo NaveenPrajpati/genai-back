@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Literal, Annotated
 
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
@@ -15,6 +15,8 @@ from app.core.config import supabase
 from app.dependencies import get_current_user
 from app.agents.trigger_store import toggle
 from app.agents.approval_store import get_pending, list_pending, to_legacy
+from app.agents.memory_store import extract_and_save
+from app.agents.meal_planner.state import MealMemoryExtract, MEAL_MEMORY_INSTRUCTIONS
 from app.agents.meal_planner.repository import (
     verify_plan_ownership,
     get_disliked_dishes,
@@ -43,6 +45,7 @@ class QueryRequest(BaseModel):
 async def ask(
     body: QueryRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     agent = request.app.state.meal_agent
@@ -80,6 +83,16 @@ async def ask(
     )
     logger.info("final -- %s", result)
 
+    # Fire-and-forget: learn durable food/diet facts after the response is sent.
+    background_tasks.add_task(
+        extract_and_save,
+        current_user["uid"],
+        body.text,
+        MealMemoryExtract,
+        MEAL_MEMORY_INSTRUCTIONS,
+        result.get("memory"),
+    )
+
     if "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
         return {
@@ -100,6 +113,7 @@ def _sse(event: dict) -> str:
 async def ask_stream(
     body: QueryRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Streaming counterpart of /query. Every node uses structured output, so
@@ -107,6 +121,16 @@ async def ask_stream(
     graph node completes (classify → research → plan …) for live progress, then
     the final state in `done` (or `needs_approval` if the plan awaits review)."""
     agent = request.app.state.meal_agent
+
+    # Fire-and-forget: learn durable food/diet facts after the stream completes.
+    background_tasks.add_task(
+        extract_and_save,
+        current_user["uid"],
+        body.text,
+        MealMemoryExtract,
+        MEAL_MEMORY_INSTRUCTIONS,
+        None,
+    )
 
     if body.plan_id and not await verify_plan_ownership(
         body.plan_id, current_user["uid"]
@@ -198,7 +222,7 @@ async def approve(
         raise HTTPException(
             status_code=404, detail="No pending approval for this thread."
         )
-    if approval["userId"] != current_user["uid"]:
+    if approval["user_id"] != current_user["uid"]:
         raise HTTPException(
             status_code=403, detail="You do not have access to this approval."
         )
@@ -359,7 +383,11 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
         enabled = await toggle(
             current_user["uid"],
             "schedule",
-            defaults={"name": "plan my schedule", "schedule_hour": 18, "schedule_dow": 6},
+            defaults={
+                "name": "plan my schedule",
+                "schedule_hour": 18,
+                "schedule_dow": 6,
+            },
         )
         return {"status": "done", "enabled": enabled}
     except Exception as e:

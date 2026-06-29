@@ -4,6 +4,10 @@ import logging
 import os
 
 import httpx
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
+
+from app.core.llm import llm
 
 logger = logging.getLogger(__name__)
 
@@ -46,3 +50,28 @@ async def web_search(query: str, max_results: int = 5) -> dict:
     except Exception as e:
         logger.error("web_search error: %s", e)
         return {"answer": "", "results": []}
+
+
+@tool
+async def web_search_tool(query: str) -> dict:
+    """Search the web for up-to-date information on a query. Returns an answer
+    plus a list of results (title, url, content). Call this when you need facts
+    you don't already know; refine the query and call again if results are thin."""
+    return await web_search(query)
+
+
+# ReAct wiring for research_agent: the LLM issues its own web searches.
+research_tools = [web_search_tool]
+research_tool_node = ToolNode(research_tools)
+research_llm = llm.bind_tools(research_tools)
+
+
+def build_research_loop(user_id: str):
+    """Per-request research loop that adds cross-agent handoff tools (which must
+    bind `user_id`) alongside web search. Returns (llm_with_tools, tool_node).
+    Imported lazily to avoid an import cycle: cross_agent_tools -> learning_tracker
+    -> personal_assistant.service."""
+    from app.agents.cross_agent_tools import make_start_learning_roadmap_tool
+
+    tools = [web_search_tool, make_start_learning_roadmap_tool(user_id)]
+    return llm.bind_tools(tools), ToolNode(tools)

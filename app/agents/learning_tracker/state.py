@@ -38,7 +38,7 @@ class LearningState(TypedDict, total=False):
     query: str
     intent: str
     current_user: dict
-    userId: str
+    user_id: str
     thread_id: str
     memory: dict
     plan_status: Optional[str]
@@ -49,6 +49,8 @@ class LearningState(TypedDict, total=False):
     meal_slots: Optional[list]
     roadmap: Optional[RoadmapOutput]
     roadmap_status: Optional[str]
+    # How many PA to-dos were created from this roadmap's topics (cross-agent).
+    pa_tasks_created: Optional[int]
     next_topic: str
     progress: Optional[dict]
     topic_explaination: str

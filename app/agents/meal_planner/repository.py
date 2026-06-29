@@ -1,16 +1,19 @@
 """Supabase persistence and domain helpers for the meal-planner agent."""
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional, List
 
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.config import supabase
 from app.core.llm import llm
+from app.database import get_db
 from .state import RecipeOutput, QueryOutput
 
 logger = logging.getLogger(__name__)
+
+MEMORIES = "memories"
 
 
 # Shared prompt: given a recipe name, ask the LLM to fill in nutrients,
@@ -145,11 +148,17 @@ async def findMealSlotsInDb(plan_id: str, meal_types: List[str]):
 
 
 async def remember(user_id: str, key: str, value):
+    """Set a single memory field in the user's Mongo `memories` doc."""
+    now = datetime.now(timezone.utc).isoformat()
     try:
-        supabase.table("memory").upsert(
-            {"user_id": user_id, "key": key, "value": value},
-            on_conflict="user_id,key",
-        ).execute()
+        await get_db()[MEMORIES].update_one(
+            {"user_id": user_id},
+            {
+                "$set": {f"data.{key}": value, "updatedAt": now},
+                "$setOnInsert": {"createdAt": now},
+            },
+            upsert=True,
+        )
     except Exception as e:
         logger.error("remember error: %s", e)
 
@@ -157,18 +166,12 @@ async def remember(user_id: str, key: str, value):
 async def get_disliked_dishes(user_id: str) -> list:
     """Return the user's current disliked_dishes list (empty on miss/error)."""
     try:
-        row = (
-            supabase.table("memory")
-            .select("value")
-            .eq("user_id", user_id)
-            .eq("key", "disliked_dishes")
-            .maybe_single()
-            .execute()
-        )
-        return list(row.data["value"]) if row and row.data else []
+        doc = await get_db()[MEMORIES].find_one({"user_id": user_id})
+        if doc:
+            return list((doc.get("data") or {}).get("disliked_dishes", []) or [])
     except Exception as e:
         logger.error("get_disliked_dishes error: %s", e)
-        return []
+    return []
 
 
 async def add_disliked_dish(user_id: str, dish: str) -> list:

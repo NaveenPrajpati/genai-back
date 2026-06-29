@@ -29,7 +29,7 @@ async def run_triggers(agent):
         return
 
     for t in triggers:
-        userId = t.get("userId")
+        user_id = t.get("user_id")
         # Per-user isolation: one user's failure must not abort the whole sweep.
         try:
             thread_id = str(uuid.uuid4())
@@ -38,7 +38,7 @@ async def run_triggers(agent):
             latest = (
                 supabase.table("meal_plans")
                 .select("id, meal_slots(*)")
-                .eq("user", userId)
+                .eq("user", user_id)
                 .eq("status", "approved")
                 .order("created_at", desc=True)
                 .limit(1)
@@ -60,16 +60,16 @@ async def run_triggers(agent):
                     for s in slots
                 ]
                 await create_pending(
-                    userId,
+                    user_id,
                     thread_id,
                     "save_plan",
                     {"week_start": week_start, "plan": proposed},
                 )
                 logger.info(
-                    f"[trigger] Approval created for existing plan, user={userId}"
+                    f"[trigger] Approval created for existing plan, user={user_id}"
                 )
                 await send_push_notification(
-                    userId,
+                    user_id,
                     title="Next week's meal plan is ready",
                     body=f"Review your plan for the week of {week_start}.",
                     data={"type": "save_plan", "week_start": week_start},
@@ -80,17 +80,15 @@ async def run_triggers(agent):
                 agent_result = await agent.ainvoke(
                     {
                         "query": "Plan my meals for next week",
-                        "user_id": userId,
+                        "user_id": user_id,
                         "thread_id": thread_id,
                     },
                     config=config,
                 )
                 if "__interrupt__" in agent_result:
-                    logger.info(
-                        f"[trigger] New plan approval created, user={userId}"
-                    )
+                    logger.info(f"[trigger] New plan approval created, user={user_id}")
                     await send_push_notification(
-                        userId,
+                        user_id,
                         title="Next week's meal plan is ready",
                         body=f"Review your plan for the week of {week_start}.",
                         data={"type": "save_plan", "week_start": week_start},
@@ -98,4 +96,4 @@ async def run_triggers(agent):
 
             await mark_ran(t, now)
         except Exception as e:
-            logger.error(f"[trigger] error for user={userId}: {e}")
+            logger.error(f"[trigger] error for user={user_id}: {e}")

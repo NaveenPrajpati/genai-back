@@ -1,15 +1,16 @@
-"""MongoDB to-do persistence and Supabase memory helpers for the personal-assistant agent."""
+"""MongoDB to-do and memory helpers for the personal-assistant agent."""
 
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional, List
 
 from bson import ObjectId
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 
-from app.core.config import supabase
 from app.database import get_db
+
+MEMORIES = "memories"
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,9 @@ async def insert_todo(user_id: str, data: dict) -> dict:
         "recurrence": data.get("recurrence"),
         # Set when this is a subtask spawned from a larger goal (breakdown).
         "parent_id": data.get("parent_id"),
+        # Provenance when another agent created this task (see service.create_tasks).
+        "source": data.get("source"),
+        "source_ref": data.get("source_ref"),
         "status": "pending",
         "created_at": now,
         "updated_at": now,
@@ -186,52 +190,42 @@ async def delete_todo_by_id(user_id: str, task_id: str) -> bool:
 
 
 async def remember(user_id: str, key: str, value):
+    """Set a single memory field in the user's Mongo `memories` doc."""
+    now = datetime.now(timezone.utc).isoformat()
     try:
-        supabase.table("memory").upsert(
-            {"user_id": user_id, "key": key, "value": value},
-            on_conflict="user_id,key",
-        ).execute()
+        await get_db()[MEMORIES].update_one(
+            {"user_id": user_id},
+            {
+                "$set": {f"data.{key}": value, "updatedAt": now},
+                "$setOnInsert": {"createdAt": now},
+            },
+            upsert=True,
+        )
     except Exception as e:
         logger.error("pa remember error: %s", e)
 
 
+async def _memory_value(user_id: str, key: str) -> list:
+    """Read one list-valued memory field from the user's `memories` doc."""
+    try:
+        doc = await get_db()[MEMORIES].find_one({"user_id": user_id})
+        if doc:
+            return list((doc.get("data") or {}).get(key, []) or [])
+    except Exception as e:
+        logger.error("pa memory read error key=%s: %s", key, e)
+    return []
+
+
 async def append_memory_list(user_id: str, key: str, item: str, cap: int = 50):
     """Append an item to a list-valued memory entry, de-duplicated and capped."""
-    try:
-        row = (
-            supabase.table("memory")
-            .select("value")
-            .eq("user_id", user_id)
-            .eq("key", key)
-            .maybe_single()
-            .execute()
-        )
-        existing = list(row.data["value"]) if row and row.data else []
-    except Exception as e:
-        logger.error("pa append_memory_list lookup error: %s", e)
-        existing = []
+    existing = await _memory_value(user_id, key)
     merged = list(dict.fromkeys(existing + [item]))[-cap:]
     await remember(user_id, key, merged)
     return merged
 
 
-# --------------------------------------------------------------------------- #
-# Notes / personal facts (stored as a list under the pa_notes memory key)
-# --------------------------------------------------------------------------- #
 async def fetch_notes(user_id: str) -> list:
-    try:
-        row = (
-            supabase.table("memory")
-            .select("value")
-            .eq("user_id", user_id)
-            .eq("key", NOTES_KEY)
-            .maybe_single()
-            .execute()
-        )
-        return list(row.data["value"]) if row and row.data else []
-    except Exception as e:
-        logger.error("pa fetch_notes error: %s", e)
-        return []
+    return await _memory_value(user_id, NOTES_KEY)
 
 
 async def add_note(

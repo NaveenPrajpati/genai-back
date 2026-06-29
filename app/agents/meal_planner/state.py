@@ -83,3 +83,23 @@ class MealSlots(BaseModel):
 
 class PlanOutput(BaseModel):
     plan: list[MealSlots] = []
+
+
+class MealMemoryExtract(BaseModel):
+    """Durable food/diet facts worth remembering across sessions. Every field is
+    optional — only fill one when the message gives clear evidence for it."""
+
+    diet_restrictions: Optional[List[str]] = None  # e.g. vegetarian, halal, gluten-free
+    allergies: Optional[List[str]] = None
+    preferred_cuisines: Optional[List[str]] = None
+    household_size: Optional[int] = None
+    cooking_skill: Optional[str] = None  # beginner | intermediate | advanced
+    nutrition_goals: Optional[str] = None  # e.g. "high protein", "~2000 kcal/day"
+
+
+MEAL_MEMORY_INSTRUCTIONS = (
+    "Extract durable food/diet facts about the user from their message — dietary "
+    "restrictions (vegetarian, halal, gluten-free …), allergies, preferred "
+    "cuisines, household size, cooking skill (beginner/intermediate/advanced), "
+    "and nutrition goals."
+)

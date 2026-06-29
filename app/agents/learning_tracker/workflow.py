@@ -5,12 +5,16 @@ from datetime import datetime, timezone
 
 from bson import ObjectId
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
 from app.core.llm import llm
 from app.database import get_db
 from app.agents.approval_store import get_pending, create_pending, resolve
+from app.agents.react import run_tool_loop
+from app.agents.memory_store import get_profile
+from .service import sync_roadmap_to_pa
 from .state import (
     LearningState,
     RoadmapOutput,
@@ -26,7 +30,7 @@ from .repository import (
     set_topic_covered,
     active_topic,
 )
-from .tools import tavily_search_tool
+from .tools import research_llm, research_tool_node
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +121,7 @@ async def roadmap_agent(state: LearningState):
         logger.info("roadmap_agent result: %s", result)
 
         approval_id = await create_pending(
-            state.get("userId"),
+            state.get("user_id"),
             state.get("thread_id"),
             action_type,
             result.model_dump(),
@@ -142,7 +146,7 @@ async def roadmap_agent(state: LearningState):
                 {"_id": ObjectId(state["roadmapId"])},
                 {
                     **result.model_dump(),
-                    "userId": state.get("userId"),
+                    "user_id": state.get("user_id"),
                     "updatedAt": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -151,13 +155,21 @@ async def roadmap_agent(state: LearningState):
             logger.error("roadmap update error: %s", e)
             saved_roadmapId = None
     else:
-        saved_roadmapId = await insertRoadmapToDb(result, state.get("userId"))
+        saved_roadmapId = await insertRoadmapToDb(result, state.get("user_id"))
+
+    # Cross-agent collaboration: hand each roadmap topic to the personal
+    # assistant as a tracked to-do, so study steps show up in the user's agenda.
+    # Provenance + source_ref dedup makes this safe on roadmap modifications.
+    pa_tasks_created = await sync_roadmap_to_pa(
+        state.get("user_id"), result, saved_roadmapId
+    )
 
     return {
         "intent": state.get("intent"),
         "roadmap_status": "approved",
         "roadmapId": saved_roadmapId,
         "roadmap": result.model_dump(),
+        "pa_tasks_created": pa_tasks_created,
     }
 
 
@@ -218,7 +230,7 @@ async def tutor_agent(state: LearningState):
         try:
             res = await get_db()["quizzes"].insert_one(
                 {
-                    "userId": state.get("userId"),
+                    "user_id": state.get("user_id"),
                     "roadmapId": state.get("roadmapId"),
                     "questions": [q.model_dump() for q in result.quiz],
                     "createdAt": datetime.now(timezone.utc).isoformat(),
@@ -292,7 +304,7 @@ async def progress_agent(state: LearningState):
             return {"roadmap": existing_roadmap, "log_status": "not_found"}
 
         updated = await set_topic_covered(
-            roadmapId, result.topicId, True, userId=state.get("userId")
+            roadmapId, result.topicId, True, user_id=state.get("user_id")
         )
         if updated:
             for t in topics:
@@ -310,30 +322,31 @@ async def research_agent(state: LearningState):
     active = state.get("active_topic")
     topic = (active.title if active else None) or state["query"]
 
-    results = []
-    try:
-        search = await tavily_search_tool.ainvoke(
-            {"query": f"best free learning resources for {topic}"}
-        )
-        results = search.get("results", []) if isinstance(search, dict) else search
-    except Exception as e:
-        logger.error("tavily search error: %s", e)
+    # ReAct loop: the LLM issues its own tavily searches (refining queries as
+    # needed) to gather the best free resources for the topic.
+    messages = [
+        SystemMessage(
+            content=(
+                "You are an expert at curating study resources. Use the search "
+                "tool to find the most useful free courses, docs, books, and "
+                "articles for the topic. Search more than once if a refined query "
+                f"would help. Topic: {topic}"
+            )
+        ),
+        HumanMessage(content=f"Find the best free learning resources for: {topic}"),
+    ]
+    messages = await run_tool_loop(research_llm, research_tool_node, messages)
 
-    # Distill the raw hits into a clean resource list (single structured pass).
-    findPrompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an expert at curating study resources. From the search "
-                "results, pick the most useful courses, docs, books, and articles "
-                "for the topic. Return each as a short label followed by its URL.\n"
-                "Topic: {topic}",
-            ),
-            ("human", "Search results:\n{results}"),
+    # Final pass: distill the gathered hits into a clean resource list.
+    structured = llm.with_structured_output(ResearchOutput)
+    result: ResearchOutput = await structured.ainvoke(
+        messages
+        + [
+            HumanMessage(
+                content="Return the curated resources as a short label plus URL each."
+            )
         ]
     )
-    chain = findPrompt | llm.with_structured_output(ResearchOutput)
-    result: ResearchOutput = await chain.ainvoke({"topic": topic, "results": results})
     logger.info("research data %s", result)
 
     if active and state.get("roadmapId"):
@@ -347,16 +360,7 @@ async def research_agent(state: LearningState):
 
 
 async def load_memory(state: LearningState):
-    userId = state["userId"]
-    memory = {}
-
-    try:
-        result = await get_db()["memories"].find_one({"userId": userId})
-        if result:
-            memory = result.get("data", {})
-    except Exception as e:
-        logger.error("load memory error: %s", e)
-
+    memory = await get_profile(state["user_id"])
     return {"memory": memory}
 
 
