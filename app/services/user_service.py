@@ -1,4 +1,6 @@
 import hashlib
+import hmac
+import logging
 import os
 import secrets
 import uuid
@@ -9,27 +11,84 @@ from app.database import get_db
 from app.services.email_service import send_email
 import jwt
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
+logger = logging.getLogger(__name__)
+
+# A forgeable token secret is a full account-takeover hole, so never fall back to
+# a known/placeholder value in production. In prod (APP_ENV=production) a strong
+# JWT_SECRET is mandatory; in dev/test we generate an ephemeral one (consistent
+# within the process) so tokens still work without committing a secret.
+_PLACEHOLDER_SECRET = "change-me-in-production"
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET or JWT_SECRET == _PLACEHOLDER_SECRET:
+    if os.getenv("APP_ENV", "development").lower() == "production":
+        raise RuntimeError(
+            "JWT_SECRET must be set to a strong, unique secret in production "
+            "(the insecure placeholder default is not allowed)."
+        )
+    logger.warning(
+        "JWT_SECRET is unset or using the insecure placeholder — generating an "
+        "ephemeral dev secret. Set JWT_SECRET in your environment."
+    )
+    JWT_SECRET = secrets.token_urlsafe(32)
+
 JWT_ALGORITHM = "HS256"
 GUEST_TTL_HOURS = 24
 USER_TOKEN_DAYS = 7
 RESET_CODE_TTL_MINUTES = 15
+EMAIL_VERIFY_TTL_MINUTES = 30
+MAX_RESET_ATTEMPTS = 5  # wrong-code guesses before the code is invalidated
+
+PBKDF2_ITERATIONS = 600_000  # OWASP 2023 guidance for PBKDF2-HMAC-SHA256
+_LEGACY_ITERATIONS = 260_000  # hashes written before the bump (salt:key, no count)
 
 
 def _hash_password(password: str) -> str:
+    # Format: salt_hex:iterations:key_hex — the iteration count travels with the
+    # hash so it can be raised over time without breaking existing credentials.
     salt = os.urandom(16)
-    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260000)
-    return salt.hex() + ":" + key.hex()
+    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return f"{salt.hex()}:{PBKDF2_ITERATIONS}:{key.hex()}"
 
 
 def _verify_password(password: str, stored: str) -> bool:
-    salt_hex, key_hex = stored.split(":")
-    salt = bytes.fromhex(salt_hex)
-    key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 260000)
-    return key.hex() == key_hex
+    try:
+        parts = stored.split(":")
+        if len(parts) == 3:
+            salt_hex, iter_str, key_hex = parts
+            iterations = int(iter_str)
+        elif len(parts) == 2:
+            # Legacy hashes had no embedded iteration count.
+            salt_hex, key_hex = parts
+            iterations = _LEGACY_ITERATIONS
+        else:
+            return False
+        key = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), iterations)
+        # Constant-time compare to avoid leaking match progress via timing.
+        return hmac.compare_digest(key.hex(), key_hex)
+    except (ValueError, AttributeError):
+        return False
 
 
-def create_access_token(user_id: str, is_guest: bool = False) -> str:
+def _needs_rehash(stored: str) -> bool:
+    """True if a stored hash predates the current cost (legacy 2-part format or
+    fewer iterations), so it can be upgraded transparently on next login."""
+    parts = stored.split(":")
+    if len(parts) == 3:
+        try:
+            return int(parts[1]) < PBKDF2_ITERATIONS
+        except ValueError:
+            return True
+    return True  # legacy salt:key or malformed → upgrade
+
+
+# A throwaway hash so the verify path runs even when an email is unknown,
+# equalizing login response time and preventing email enumeration via timing.
+_DUMMY_HASH = _hash_password("timing-equalizer-not-a-real-password")
+
+
+def create_access_token(
+    user_id: str, is_guest: bool = False, token_version: int = 0
+) -> str:
     expiry = (
         timedelta(hours=GUEST_TTL_HOURS)
         if is_guest
@@ -38,6 +97,8 @@ def create_access_token(user_id: str, is_guest: bool = False) -> str:
     payload = {
         "sub": user_id,
         "is_guest": is_guest,
+        # Bumped on password reset to invalidate all previously-issued tokens.
+        "tv": token_version,
         "exp": datetime.now(timezone.utc) + expiry,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -76,10 +137,14 @@ async def signup_user(user: UserCreate) -> tuple[dict, str]:
         "description": user.description,
         "password_hash": _hash_password(user.password),
         "is_guest": False,
+        "token_version": 0,
+        "email_verified": False,
         "diet": "vegetarian",
         "protein_target": 100,
     }
     result = await col.insert_one(record)
+    # Send a verification code (best-effort; never blocks account creation).
+    await _issue_email_verification(result.inserted_id, user.email, user.name)
     created = await col.find_one({"_id": result.inserted_id}, {"password_hash": 0})
 
     token = create_access_token(str(result.inserted_id), is_guest=False)
@@ -89,14 +154,22 @@ async def signup_user(user: UserCreate) -> tuple[dict, str]:
 async def login_user(credentials: UserLogin) -> tuple[dict, str]:
     col = _collection()
     user = await col.find_one({"email": credentials.email})
-    if (
-        not user
-        or user.get("is_guest")
-        or not _verify_password(credentials.password, user.get("password_hash", ""))
-    ):
+    # Always run a hash verify (against a dummy hash when the user is absent) so
+    # the response time doesn't reveal whether the email exists.
+    stored = user.get("password_hash", "") if user else _DUMMY_HASH
+    password_ok = _verify_password(credentials.password, stored or _DUMMY_HASH)
+    if not user or user.get("is_guest") or not password_ok:
         raise ValueError("Invalid email or password")
+    # Transparently upgrade old/low-cost hashes now that we have the plaintext.
+    if _needs_rehash(stored):
+        await col.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"password_hash": _hash_password(credentials.password)}},
+        )
     user.pop("password_hash", None)
-    token = create_access_token(str(user["_id"]), is_guest=False)
+    token = create_access_token(
+        str(user["_id"]), is_guest=False, token_version=user.get("token_version", 0)
+    )
     return user, token
 
 
@@ -140,12 +213,16 @@ async def convert_guest_to_real(user_id: str, user: UserCreate) -> tuple[dict, s
                 "description": user.description,
                 "password_hash": _hash_password(user.password),
                 "is_guest": False,
+                "token_version": 0,
+                "email_verified": False,
             },
             "$unset": {"expires_at": ""},
         },
     )
+    # The newly-attached email is unverified — send a code.
+    await _issue_email_verification(ObjectId(user_id), user.email, user.name)
     updated = await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
-    token = create_access_token(user_id, is_guest=False)
+    token = create_access_token(user_id, is_guest=False, token_version=0)
     return updated, token
 
 
@@ -169,6 +246,7 @@ async def request_password_reset(email: str) -> None:
             "$set": {
                 "reset_code_hash": _hash_password(code),
                 "reset_code_expires_at": expires_at,
+                "reset_code_attempts": 0,
             }
         },
     )
@@ -200,20 +278,146 @@ async def reset_password(email: str, code: str, new_password: str) -> tuple[dict
         or not stored
         or not expires_at
         or expires_at < datetime.now(timezone.utc)
-        or not _verify_password(code, stored)
     ):
         raise ValueError("Invalid or expired reset code")
+
+    if not _verify_password(code, stored):
+        # Count the failed guess; after MAX_RESET_ATTEMPTS, burn the code so a
+        # 6-digit code can't be brute-forced within its TTL.
+        attempts = (user.get("reset_code_attempts") or 0) + 1
+        if attempts >= MAX_RESET_ATTEMPTS:
+            await col.update_one(
+                {"_id": user["_id"]},
+                {"$unset": {
+                    "reset_code_hash": "",
+                    "reset_code_expires_at": "",
+                    "reset_code_attempts": "",
+                }},
+            )
+        else:
+            await col.update_one(
+                {"_id": user["_id"]}, {"$set": {"reset_code_attempts": attempts}}
+            )
+        raise ValueError("Invalid or expired reset code")
+
+    # Success: rotate the password, invalidate the code, and bump token_version
+    # so any previously-issued tokens (a possibly-compromised session) stop working.
+    new_tv = (user.get("token_version") or 0) + 1
+    await col.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {"password_hash": _hash_password(new_password), "token_version": new_tv},
+            "$unset": {
+                "reset_code_hash": "",
+                "reset_code_expires_at": "",
+                "reset_code_attempts": "",
+            },
+        },
+    )
+    updated = await col.find_one({"_id": user["_id"]}, {"password_hash": 0})
+    token = create_access_token(str(user["_id"]), is_guest=False, token_version=new_tv)
+    return updated, token
+
+
+async def _issue_email_verification(user_id, email: str, name: str | None) -> None:
+    """Generate a one-time email-verification code, store it (hashed, with TTL +
+    attempt counter), and email it. Best-effort — never raises, so it can't break
+    signup/conversion even if email delivery fails."""
+    try:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=EMAIL_VERIFY_TTL_MINUTES)
+        await _collection().update_one(
+            {"_id": user_id},
+            {"$set": {
+                "email_verify_code_hash": _hash_password(code),
+                "email_verify_expires_at": expires_at,
+                "email_verify_attempts": 0,
+            }},
+        )
+        await send_email(
+            to=email,
+            subject="Verify your email",
+            body=(
+                f"Hi {name or 'there'},\n\n"
+                f"Your email verification code is {code}.\n"
+                f"It expires in {EMAIL_VERIFY_TTL_MINUTES} minutes.\n"
+            ),
+        )
+    except Exception as e:
+        logger.error("issue email verification error: %s", e)
+
+
+async def verify_email(email: str, code: str) -> dict:
+    """Validate the verification code and mark the email verified. Mirrors the
+    reset-code flow: TTL + attempt counter so the code can't be brute-forced."""
+    col = _collection()
+    user = await col.find_one({"email": email})
+    if user and user.get("email_verified"):
+        # Already verified — treat as success (idempotent).
+        user.pop("password_hash", None)
+        return user
+
+    stored = user.get("email_verify_code_hash") if user else None
+    expires_at = user.get("email_verify_expires_at") if user else None
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if (
+        not user
+        or not stored
+        or not expires_at
+        or expires_at < datetime.now(timezone.utc)
+    ):
+        raise ValueError("Invalid or expired verification code")
+
+    if not _verify_password(code, stored):
+        attempts = (user.get("email_verify_attempts") or 0) + 1
+        if attempts >= MAX_RESET_ATTEMPTS:
+            await col.update_one(
+                {"_id": user["_id"]},
+                {"$unset": {
+                    "email_verify_code_hash": "",
+                    "email_verify_expires_at": "",
+                    "email_verify_attempts": "",
+                }},
+            )
+        else:
+            await col.update_one(
+                {"_id": user["_id"]}, {"$set": {"email_verify_attempts": attempts}}
+            )
+        raise ValueError("Invalid or expired verification code")
 
     await col.update_one(
         {"_id": user["_id"]},
         {
-            "$set": {"password_hash": _hash_password(new_password)},
-            "$unset": {"reset_code_hash": "", "reset_code_expires_at": ""},
+            "$set": {"email_verified": True},
+            "$unset": {
+                "email_verify_code_hash": "",
+                "email_verify_expires_at": "",
+                "email_verify_attempts": "",
+            },
         },
     )
     updated = await col.find_one({"_id": user["_id"]}, {"password_hash": 0})
-    token = create_access_token(str(user["_id"]), is_guest=False)
-    return updated, token
+    return updated
+
+
+async def resend_verification(email: str) -> None:
+    """Reissue a verification code. Non-enumerating: always returns None, and
+    no-ops for unknown, guest, or already-verified accounts."""
+    user = await _collection().find_one({"email": email})
+    if not user or user.get("is_guest") or user.get("email_verified"):
+        return None
+    await _issue_email_verification(user["_id"], email, user.get("name"))
+    return None
+
+
+async def bump_token_version(user_id: str) -> None:
+    """Invalidate every token previously issued to this user (logout-all)."""
+    if not ObjectId.is_valid(user_id):
+        return
+    await _collection().update_one(
+        {"_id": ObjectId(user_id)}, {"$inc": {"token_version": 1}}
+    )
 
 
 async def update_expo_push_token(user_id: str, expo_push_token: str) -> dict | None:

@@ -26,11 +26,12 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+# Intents worth extracting durable facts from. Read-only intents like
+# query_roadmap are excluded — checking your roadmap reveals no new facts.
 MEMORY_INTENTS = {
     "create_roadmap",
     "modify_roadmap",
     "explain",
-    "query_roadmap",
     "find_resources",
 }
 

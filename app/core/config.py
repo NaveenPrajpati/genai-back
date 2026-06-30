@@ -40,7 +40,12 @@ RETRIEVER_TOP_K = 10          # how many candidates the retriever pulls
 RERANK_TOP_N = 5              # how many survive the rerank
 
 # --- Models ---
-LLM_MODEL = "gpt-4o-mini"
+# Two-tier routing (see core/llm.py): the top model handles generation-heavy
+# work (roadmap, plan, research, synthesis); the fast model handles the ~40-50%
+# of calls that are trivial classification / extraction / selection, where a mini
+# model is ~10-15x cheaper at no real quality loss. Override either via env.
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+FAST_LLM_MODEL = os.getenv("FAST_LLM_MODEL", "gpt-4o-mini")
 # Hosted Jina reranker (free tier). Requires JINA_API_KEY in the environment.
 RERANKER_MODEL = "jina-reranker-v2-base-multilingual"
 
@@ -48,7 +53,14 @@ RERANKER_MODEL = "jina-reranker-v2-base-multilingual"
 CACHE_PREFIX = "rag:cache:"
 CACHE_INDEX_PREFIX = "rag:cache_idx:"   # one Redis Set per retrieval scope
 CACHE_TTL_SECONDS = 60 * 60 * 24        # 24 hours
-CACHE_SIMILARITY_THRESHOLD = 0.95       # cosine sim required for a cache hit
+# Cosine-sim required for a cache hit, tuned per task type:
+#  • Generation (RAG answers): strict — a near-miss query can need a different
+#    answer, and a wrong replay is user-visible. Keep high.
+#  • Classification (intent routing): loose — intent is robust to phrasing
+#    ("show my tasks" / "what do I have" → same label), so a looser match still
+#    lands the right intent, and a hit here is essentially free.
+CACHE_SIMILARITY_THRESHOLD = 0.95          # generation / RAG
+CACHE_CLASSIFY_THRESHOLD = 0.90            # intent classification
 
 
 def _require(name: str) -> str:

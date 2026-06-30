@@ -36,6 +36,10 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+# Read-only intents reveal no durable facts (the user is just checking existing
+# data), so we skip the memory-extraction call for them.
+READONLY_INTENTS = {"list", "agenda", "recall"}
+
 
 class QueryRequest(BaseModel):
     text: str
@@ -89,14 +93,15 @@ async def ask(
     )
 
     # Fire-and-forget: learn durable personal facts after the response is sent.
-    background_tasks.add_task(
-        extract_and_save,
-        current_user["uid"],
-        body.text,
-        PAMemoryExtract,
-        PA_MEMORY_INSTRUCTIONS,
-        result.get("memory"),
-    )
+    if result.get("intent") not in READONLY_INTENTS:
+        background_tasks.add_task(
+            extract_and_save,
+            current_user["uid"],
+            body.text,
+            PAMemoryExtract,
+            PA_MEMORY_INSTRUCTIONS,
+            result.get("memory"),
+        )
 
     if "__interrupt__" in result:
         return {
@@ -126,16 +131,6 @@ async def ask_stream(
     agent = request.app.state.pa_agent
     thread_id = body.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
-
-    # Fire-and-forget: learn durable personal facts after the stream completes.
-    background_tasks.add_task(
-        extract_and_save,
-        current_user["uid"],
-        body.text,
-        PAMemoryExtract,
-        PA_MEMORY_INSTRUCTIONS,
-        None,
-    )
     _excluded = {"_id", "expires_at", "password_hash"}
     user_data = {k: v for k, v in current_user.items() if k not in _excluded}
     inputs = {
@@ -167,6 +162,17 @@ async def ask_stream(
                     }
                 )
                 return
+
+            # Fire-and-forget extraction, now that the resolved intent is known.
+            if values.get("intent") not in READONLY_INTENTS:
+                background_tasks.add_task(
+                    extract_and_save,
+                    current_user["uid"],
+                    body.text,
+                    PAMemoryExtract,
+                    PA_MEMORY_INSTRUCTIONS,
+                    values.get("memory"),
+                )
 
             yield _sse({"type": "done", "result": _jsonable(values)})
         except Exception as exc:

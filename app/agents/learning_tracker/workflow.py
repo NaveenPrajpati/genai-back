@@ -9,7 +9,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
-from app.core.llm import llm
+from app.core.llm import llm, fast_llm
 from app.database import get_db
 from app.agents.approval_store import get_pending, create_pending, resolve
 from app.agents.react import run_tool_loop
@@ -31,6 +31,8 @@ from .repository import (
     active_topic,
 )
 from .tools import research_llm, research_tool_node
+from app.services.cache import cached_value
+from app.core.config import CACHE_CLASSIFY_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +55,20 @@ async def classify_intent(state: LearningState):
             ("human", "{text}"),
         ]
     )
-    chain = prompt | llm.with_structured_output(IntentOutput)
-    result: IntentOutput = await chain.ainvoke({"text": state.get("query", "")})
-    logger.info("%s", result)
-    return {
-        "intent": result.intent,
-    }
+    chain = prompt | fast_llm.with_structured_output(IntentOutput)
+    query = state.get("query", "")
+
+    async def produce():
+        result: IntentOutput = await chain.ainvoke({"text": query})
+        logger.info("%s", result)
+        return result.model_dump()
+
+    # Intent depends only on the message and is user-independent → global scope,
+    # shared across users, with the loose classification threshold.
+    data = await cached_value(
+        query, "agent:learning:classify_intent", CACHE_CLASSIFY_THRESHOLD, produce
+    )
+    return {"intent": data["intent"]}
 
 
 async def roadmap_agent(state: LearningState):
@@ -293,7 +303,7 @@ async def progress_agent(state: LearningState):
                 ("human", "{text}"),
             ]
         )
-        chain = findPrompt | llm.with_structured_output(UpdateProgressOutput)
+        chain = findPrompt | fast_llm.with_structured_output(UpdateProgressOutput)
         result: UpdateProgressOutput = await chain.ainvoke(
             {"text": state["query"], "topic_list": topic_list}
         )

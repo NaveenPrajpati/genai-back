@@ -8,7 +8,9 @@ from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
 from app.core.config import supabase
-from app.core.llm import llm
+from app.core.llm import llm, fast_llm
+from app.services.cache import cached_value
+from app.core.config import CACHE_CLASSIFY_THRESHOLD
 from app.agents.approval_store import get_pending, create_pending, resolve
 from app.agents.react import run_tool_loop
 from app.agents.memory_store import get_profile
@@ -47,11 +49,21 @@ async def classify_intent(state: PlannerState):
             ("human", "{text}"),
         ]
     )
-    chain = prompt | llm.with_structured_output(IntentOutput)
-    result: IntentOutput = await chain.ainvoke({"text": state.get("query", "")})
-    logger.info("%s", result)
+    chain = prompt | fast_llm.with_structured_output(IntentOutput)
+    query = state.get("query", "")
+
+    async def produce():
+        result: IntentOutput = await chain.ainvoke({"text": query})
+        logger.info("%s", result)
+        return result.model_dump()
+
+    # Intent depends only on the message and is user-independent → global scope,
+    # shared across users, with the loose classification threshold.
+    data = await cached_value(
+        query, "agent:meal:classify_intent", CACHE_CLASSIFY_THRESHOLD, produce
+    )
     return {
-        "intent": result.intent,
+        "intent": data["intent"],
     }
 
 
@@ -72,7 +84,7 @@ async def log_agent(state: PlannerState):
     current_user = state.get("current_user") or {}
     memory = state.get("memory") or {}
 
-    chain = findPrompt | llm.with_structured_output(LogOutput)
+    chain = findPrompt | fast_llm.with_structured_output(LogOutput)
     result: LogOutput = await chain.ainvoke(
         {
             "text": state["query"],
@@ -120,7 +132,7 @@ async def query_agent(state: PlannerState):
         ]
     )
 
-    chain = findPrompt | llm.with_structured_output(QueryOutput)
+    chain = findPrompt | fast_llm.with_structured_output(QueryOutput)
     result: QueryOutput = await chain.ainvoke({"text": state["query"]})
     logger.info("query data %s", result)
     plan_id = state.get("plan_id")
@@ -298,9 +310,8 @@ async def plan_agent(state: PlannerState):
 
 async def load_memory(state: PlannerState):
     user_id = state["user_id"]
-    # Learned long-term profile (diet, allergies, cuisines …) from the shared
-    # Mongo store, layered under the user-managed Supabase prefs (which win on
-    # any key collision).
+    # Learned long-term profile + app-managed prefs (diet, allergies, cuisines,
+    # disliked dishes …) all live in the shared Mongo `memories` doc.
     memory = await get_profile(user_id)
 
     return {"memory": memory}

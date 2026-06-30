@@ -77,7 +77,14 @@ def _make_client(agent, user=None):
 # intent classifier + routing
 # --------------------------------------------------------------------------- #
 async def test_classify_intent(monkeypatch):
-    monkeypatch.setattr(pa, "llm", _llm_returning(pa.IntentOutput(intent="research")))
+    # classify_intent runs the fast model behind the semantic cache. Patch the
+    # fast model and bypass the cache so the test stays offline & deterministic.
+    monkeypatch.setattr(pa, "fast_llm", _llm_returning(pa.IntentOutput(intent="research")))
+
+    async def _no_cache(text, scope, threshold, produce):
+        return await produce()
+
+    monkeypatch.setattr(pa, "cached_value", _no_cache)
     out = await pa.classify_intent({"query": "what is langgraph"})
     assert out == {"intent": "research"}
 
@@ -99,7 +106,7 @@ def test_decide_agent_routes():
 # --------------------------------------------------------------------------- #
 async def test_todo_agent_add(monkeypatch):
     monkeypatch.setattr(
-        pa, "llm", _llm_returning(pa.TaskInput(title="Buy milk", priority="high"))
+        pa, "fast_llm", _llm_returning(pa.TaskInput(title="Buy milk", priority="high"))
     )
     monkeypatch.setattr(
         pa, "insert_todo", AsyncMock(return_value={"id": "t1", "title": "Buy milk"})
@@ -261,7 +268,7 @@ async def test_web_search_without_key_is_empty(monkeypatch):
 # --------------------------------------------------------------------------- #
 async def test_notes_agent_note(monkeypatch):
     monkeypatch.setattr(
-        pa, "llm", _llm_returning(pa.NoteInput(content="wife's birthday is June 2"))
+        pa, "fast_llm", _llm_returning(pa.NoteInput(content="wife's birthday is June 2"))
     )
     monkeypatch.setattr(pa, "add_note", AsyncMock())
     monkeypatch.setattr(

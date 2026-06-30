@@ -86,6 +86,15 @@ class ResetPasswordRequest(BaseModel):
         return _validate_password_strength(v)
 
 
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(..., min_length=6, max_length=6)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
 class ExpoPushTokenUpdate(BaseModel):
     expo_push_token: str = Field(..., min_length=1, max_length=200)
 
@@ -97,6 +106,7 @@ class UserResponse(BaseModel):
     role: str
     description: Optional[str] = None
     is_guest: bool = False
+    email_verified: bool = False
     expires_at: Optional[datetime] = None
     diet: str = "vegetarian"
     protein_target: int = 100

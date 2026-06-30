@@ -7,7 +7,9 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
-from app.core.llm import llm
+from app.core.llm import llm, fast_llm
+from app.services.cache import cached_value
+from app.core.config import CACHE_CLASSIFY_THRESHOLD
 from app.agents.approval_store import get_pending, create_pending, resolve
 from app.agents.react import run_tool_loop
 from app.agents.memory_store import get_profile
@@ -95,12 +97,26 @@ async def classify_intent(state: PAState):
             ),
         ]
     )
-    chain = prompt | llm.with_structured_output(IntentOutput)
-    result: IntentOutput = await chain.ainvoke(
-        {"text": state.get("query", ""), "history": _recent_history(state)}
-    )
-    logger.info("pa intent: %s", result)
-    return {"intent": result.intent}
+    chain = prompt | fast_llm.with_structured_output(IntentOutput)
+    query = state.get("query", "")
+    history = _recent_history(state)
+
+    async def produce():
+        result: IntentOutput = await chain.ainvoke({"text": query, "history": history})
+        logger.info("pa intent: %s", result)
+        return result.model_dump()
+
+    if history:
+        # Follow-ups ("that one", "make it high priority") depend on context, so
+        # classify fresh — never serve a context-free cached intent for them.
+        data = await produce()
+    else:
+        # Fresh command (no history): intent depends only on the message and is
+        # user-independent → global scope shared across users, loose threshold.
+        data = await cached_value(
+            query, "agent:pa:classify_intent", CACHE_CLASSIFY_THRESHOLD, produce
+        )
+    return {"intent": data["intent"]}
 
 
 async def _extract_selector(text: str) -> TaskSelector:
@@ -114,7 +130,7 @@ async def _extract_selector(text: str) -> TaskSelector:
             ),
             ("human", "{text}"),
         ]
-    ) | llm.with_structured_output(TaskSelector)
+    ) | fast_llm.with_structured_output(TaskSelector)
     return await chain.ainvoke({"text": text})
 
 
@@ -136,7 +152,7 @@ async def todo_agent(state: PAState):
                 ),
                 ("human", "{text}"),
             ]
-        ) | llm.with_structured_output(TaskInput)
+        ) | fast_llm.with_structured_output(TaskInput)
         task: TaskInput = await chain.ainvoke({"text": state["query"]})
         created = await insert_todo(user_id, task.model_dump(exclude_none=True))
         return {"intent": "add", "task_status": "added", "todos": [created]}
@@ -172,7 +188,7 @@ async def todo_agent(state: PAState):
                 ),
                 ("human", "{text}"),
             ]
-        ) | llm.with_structured_output(TaskUpdateInput)
+        ) | fast_llm.with_structured_output(TaskUpdateInput)
         update_input: TaskUpdateInput = await chain.ainvoke({"text": state["query"]})
         updates = {
             k: v
@@ -297,7 +313,7 @@ async def notes_agent(state: PAState):
                 ),
                 ("human", "{text}"),
             ]
-        ) | llm.with_structured_output(NoteInput)
+        ) | fast_llm.with_structured_output(NoteInput)
         note: NoteInput = await chain.ainvoke({"text": state["query"]})
         await add_note(user_id, note.content, note.category)
         return {

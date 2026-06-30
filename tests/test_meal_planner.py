@@ -81,10 +81,17 @@ def _make_client(agent, user=None):
 # intent classifier + routing
 # --------------------------------------------------------------------------- #
 async def test_classify_intent_returns_llm_intent(monkeypatch):
+    # classify_intent runs the fast model behind the semantic cache. Patch the
+    # fast model and bypass the cache so the test stays offline & deterministic.
     fake_chain = RunnableLambda(lambda _: mp.IntentOutput(intent="plan"))
     mock_llm = MagicMock()
     mock_llm.with_structured_output.return_value = fake_chain
-    monkeypatch.setattr(mp, "llm", mock_llm)
+    monkeypatch.setattr(mp, "fast_llm", mock_llm)
+
+    async def _no_cache(text, scope, threshold, produce):
+        return await produce()
+
+    monkeypatch.setattr(mp, "cached_value", _no_cache)
 
     out = await mp.classify_intent({"query": "plan my whole week"})
 

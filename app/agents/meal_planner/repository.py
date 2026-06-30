@@ -7,7 +7,7 @@ from typing import Optional, List
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.config import supabase
-from app.core.llm import llm
+from app.core.llm import fast_llm
 from app.database import get_db
 from .state import RecipeOutput, QueryOutput
 
@@ -111,7 +111,7 @@ async def log_recipe_to_slot(
         protein = recipe_present["protein_g"]
     else:
         logger.info("recipe not present: %s", recipe_name)
-        chain = searchRecipePrompt | llm.with_structured_output(RecipeOutput)
+        chain = searchRecipePrompt | fast_llm.with_structured_output(RecipeOutput)
         details: RecipeOutput = await chain.ainvoke({"text": recipe_name})
         logger.info("recipe data %s", details)
         inserted = await insertRecipeInDb(details)

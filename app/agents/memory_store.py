@@ -22,7 +22,7 @@ from typing import Optional, Type
 from pydantic import BaseModel
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.llm import llm
+from app.core.llm import fast_llm
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ async def extract_and_save(
             ("human", "{text}"),
         ]
     )
-    chain = prompt | llm.with_structured_output(schema)
+    chain = prompt | fast_llm.with_structured_output(schema)
     try:
         extracted: BaseModel = await chain.ainvoke(
             {"text": text, "current": current or "none"}

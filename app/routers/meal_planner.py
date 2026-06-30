@@ -34,6 +34,10 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+# Read-only intents reveal no durable facts (the user is just viewing their
+# plan), so we skip the memory-extraction call for them.
+READONLY_INTENTS = {"query"}
+
 
 class QueryRequest(BaseModel):
     text: str
@@ -84,14 +88,15 @@ async def ask(
     logger.info("final -- %s", result)
 
     # Fire-and-forget: learn durable food/diet facts after the response is sent.
-    background_tasks.add_task(
-        extract_and_save,
-        current_user["uid"],
-        body.text,
-        MealMemoryExtract,
-        MEAL_MEMORY_INSTRUCTIONS,
-        result.get("memory"),
-    )
+    if result.get("intent") not in READONLY_INTENTS:
+        background_tasks.add_task(
+            extract_and_save,
+            current_user["uid"],
+            body.text,
+            MealMemoryExtract,
+            MEAL_MEMORY_INSTRUCTIONS,
+            result.get("memory"),
+        )
 
     if "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
@@ -121,16 +126,6 @@ async def ask_stream(
     graph node completes (classify → research → plan …) for live progress, then
     the final state in `done` (or `needs_approval` if the plan awaits review)."""
     agent = request.app.state.meal_agent
-
-    # Fire-and-forget: learn durable food/diet facts after the stream completes.
-    background_tasks.add_task(
-        extract_and_save,
-        current_user["uid"],
-        body.text,
-        MealMemoryExtract,
-        MEAL_MEMORY_INSTRUCTIONS,
-        None,
-    )
 
     if body.plan_id and not await verify_plan_ownership(
         body.plan_id, current_user["uid"]
@@ -183,6 +178,17 @@ async def ask_stream(
                     }
                 )
                 return
+
+            # Fire-and-forget extraction, now that the resolved intent is known.
+            if values.get("intent") not in READONLY_INTENTS:
+                background_tasks.add_task(
+                    extract_and_save,
+                    current_user["uid"],
+                    body.text,
+                    MealMemoryExtract,
+                    MEAL_MEMORY_INSTRUCTIONS,
+                    values.get("memory"),
+                )
 
             yield _sse({"type": "done", "result": values})
         except Exception as exc:
