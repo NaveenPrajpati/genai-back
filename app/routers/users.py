@@ -10,6 +10,7 @@ from app.models.user import (
     ResetPasswordRequest,
     VerifyEmailRequest,
     ResendVerificationRequest,
+    RefreshTokenRequest,
 )
 from app.services import user_service
 from app.services import rate_limit
@@ -22,10 +23,11 @@ router = APIRouter()
 async def signup(user: UserCreate, request: Request):
     await rate_limit.limit_ip(request, "signup", limit=10, window_seconds=3600)
     try:
-        created, token = await user_service.signup_user(user)
+        created, token, refresh_token = await user_service.signup_user(user)
         return {
             "message": "Account created successfully",
             "token": token,
+            "refresh_token": refresh_token,
             "user": created,
         }
     except ValueError as e:
@@ -38,8 +40,35 @@ async def login(credentials: UserLogin, request: Request):
     await rate_limit.limit_ip(request, "login", limit=20, window_seconds=300)
     await rate_limit.limit_key("login", credentials.email, limit=5, window_seconds=900)
     try:
-        user, token = await user_service.login_user(credentials)
-        return {"message": "Login successful", "token": token, "user": user}
+        user, token, refresh_token = await user_service.login_user(credentials)
+        return {
+            "message": "Login successful",
+            "token": token,
+            "refresh_token": refresh_token,
+            "user": user,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@router.post("/refresh", response_model=AuthResponse)
+async def refresh(payload: RefreshTokenRequest, request: Request):
+    """Exchange a valid refresh token for a fresh access + refresh token pair.
+
+    Access tokens are short(er)-lived; clients call this with their stored
+    refresh token to stay signed in without re-entering credentials.
+    """
+    await rate_limit.limit_ip(request, "refresh", limit=60, window_seconds=3600)
+    try:
+        user, token, refresh_token = await user_service.refresh_access_token(
+            payload.refresh_token
+        )
+        return {
+            "message": "Token refreshed",
+            "token": token,
+            "refresh_token": refresh_token,
+            "user": user,
+        }
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -66,10 +95,15 @@ async def reset_password(payload: ResetPasswordRequest, request: Request):
     await rate_limit.limit_ip(request, "reset", limit=10, window_seconds=900)
     await rate_limit.limit_key("reset", payload.email, limit=5, window_seconds=900)
     try:
-        user, token = await user_service.reset_password(
+        user, token, refresh_token = await user_service.reset_password(
             payload.email, payload.code, payload.new_password
         )
-        return {"message": "Password reset successful", "token": token, "user": user}
+        return {
+            "message": "Password reset successful",
+            "token": token,
+            "refresh_token": refresh_token,
+            "user": user,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -99,8 +133,13 @@ async def resend_verification(payload: ResendVerificationRequest, request: Reque
 async def create_guest(request: Request):
     """Create a temporary guest account valid for 24 hours."""
     await rate_limit.limit_ip(request, "guest", limit=20, window_seconds=3600)
-    created, token = await user_service.create_guest_user()
-    return {"message": "Guest account created", "token": token, "user": created}
+    created, token, refresh_token = await user_service.create_guest_user()
+    return {
+        "message": "Guest account created",
+        "token": token,
+        "refresh_token": refresh_token,
+        "user": created,
+    }
 
 
 @router.post("/convert-guest", response_model=AuthResponse)
@@ -114,12 +153,13 @@ async def convert_guest(
             status_code=400, detail="Only guest accounts can be converted"
         )
     try:
-        updated, token = await user_service.convert_guest_to_real(
+        updated, token, refresh_token = await user_service.convert_guest_to_real(
             str(current_user["_id"]), user
         )
         return {
             "message": "Account converted successfully",
             "token": token,
+            "refresh_token": refresh_token,
             "user": updated,
         }
     except ValueError as e:

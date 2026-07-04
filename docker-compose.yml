@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    image: aiengineer
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # depends_on: [redis]   # uncomment if you enable the local redis below
+
+  # --- Optional: run Redis locally for dev instead of the managed one --------
+  # Uncomment this block AND set REDIS_URL=redis://redis:6379 in .env to use it.
+  # redis:
+  #   image: redis:8-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped

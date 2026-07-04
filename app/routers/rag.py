@@ -133,13 +133,22 @@ async def ingest_document(
     )
 
     background_tasks.add_task(
-        run_ingestion, job_id, loader_fn, display_source, file_type, tmp_path
+        run_ingestion, job_id, loader_fn, display_source, file_type, tmp_path, user_id
     )
     return {"job_id": job_id, "status": "queued", "source": display_source}
 
 
 @router.get("/ingest/status/{job_id}")
-async def ingest_status(job_id: str):
+async def ingest_status(
+    job_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    # The in-memory job dict is keyed only by job_id, so authorize against the
+    # Supabase log (the source of truth for who owns this ingestion).
+    log = await asyncio.to_thread(storage.get_ingestion_log, job_id)
+    if not log or log.get("user_id") != current_user["uid"]:
+        raise HTTPException(status_code=404, detail="Job not found")
+
     job = INGESTION_JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -147,13 +156,18 @@ async def ingest_status(job_id: str):
 
 
 @router.delete("/ingest/{doc_id}", status_code=200)
-async def delete_ingestion(doc_id: str):
+async def delete_ingestion(
+    doc_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
     """
     Delete an ingestion entirely: drop its vectors from Pinecone and remove its
     Supabase log row. `doc_id` is the job_id returned by POST /rag/ingest/{action}.
     """
     log = await asyncio.to_thread(storage.get_ingestion_log, doc_id)
-    if not log:
+    # Return 404 (not 403) when the ingestion isn't the caller's — don't reveal
+    # that a doc_id belonging to another user exists.
+    if not log or log.get("user_id") != current_user["uid"]:
         raise HTTPException(status_code=404, detail="Ingestion not found")
 
     try:
@@ -171,8 +185,11 @@ async def delete_ingestion(doc_id: str):
 
 
 @router.post("/query")
-async def query_documents(request: QueryRequest):
-    retriever = build_retriever(request.ingestions or None)
+async def query_documents(
+    request: QueryRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    retriever = build_retriever(current_user["uid"], request.ingestions or None)
     docs = retriever.invoke(request.question)
 
     if not docs:
@@ -201,10 +218,9 @@ async def query_documents(request: QueryRequest):
 async def query_documents_stream(
     request: QueryRequest, current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    scope = cache.scope_key(request.ingestions)
-
     chat_id = request.chat_id
     user_id = current_user["uid"]
+    scope = cache.scope_key(user_id, request.ingestions)
 
     async def generate():
         try:
@@ -238,7 +254,7 @@ async def query_documents_stream(
                 return
 
             # ── Cache miss: retrieve → rerank → generate ────────────────────
-            retriever = build_retriever(request.ingestions or None)
+            retriever = build_retriever(user_id, request.ingestions or None)
             docs = await asyncio.to_thread(retriever.invoke, request.question)
             if not docs:
                 yield _sse(

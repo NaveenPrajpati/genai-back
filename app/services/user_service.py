@@ -34,6 +34,7 @@ if not JWT_SECRET or JWT_SECRET == _PLACEHOLDER_SECRET:
 JWT_ALGORITHM = "HS256"
 GUEST_TTL_HOURS = 24
 USER_TOKEN_DAYS = 7
+REFRESH_TOKEN_DAYS = 30  # long-lived; exchanged for fresh access tokens via /refresh
 RESET_CODE_TTL_MINUTES = 15
 EMAIL_VERIFY_TTL_MINUTES = 30
 MAX_RESET_ATTEMPTS = 5  # wrong-code guesses before the code is invalidated
@@ -97,11 +98,36 @@ def create_access_token(
     payload = {
         "sub": user_id,
         "is_guest": is_guest,
+        "type": "access",
         # Bumped on password reset to invalidate all previously-issued tokens.
         "tv": token_version,
         "exp": datetime.now(timezone.utc) + expiry,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token(user_id: str, token_version: int = 0) -> str:
+    """Long-lived token whose only purpose is to mint fresh access tokens at
+    /refresh. Carries the same `tv` as access tokens, so a password reset or
+    logout-all (which bumps token_version) invalidates it too."""
+    payload = {
+        "sub": user_id,
+        "type": "refresh",
+        "tv": token_version,
+        "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _issue_tokens(
+    user_id: str, is_guest: bool = False, token_version: int = 0
+) -> tuple[str, str | None]:
+    """Return (access_token, refresh_token). Guests get no refresh token — their
+    account is deleted after GUEST_TTL_HOURS, so a 30-day refresh token would
+    outlive it and is pointless."""
+    access = create_access_token(user_id, is_guest=is_guest, token_version=token_version)
+    refresh = None if is_guest else create_refresh_token(user_id, token_version)
+    return access, refresh
 
 
 def decode_token(token: str) -> dict:
@@ -125,7 +151,7 @@ async def get_user_by_id(user_id: str) -> dict | None:
     )
 
 
-async def signup_user(user: UserCreate) -> tuple[dict, str]:
+async def signup_user(user: UserCreate) -> tuple[dict, str, str | None]:
     col = _collection()
     if await col.find_one({"email": user.email}):
         raise ValueError("Email already registered")
@@ -147,11 +173,11 @@ async def signup_user(user: UserCreate) -> tuple[dict, str]:
     await _issue_email_verification(result.inserted_id, user.email, user.name)
     created = await col.find_one({"_id": result.inserted_id}, {"password_hash": 0})
 
-    token = create_access_token(str(result.inserted_id), is_guest=False)
-    return created, token
+    access, refresh = _issue_tokens(str(result.inserted_id), is_guest=False)
+    return created, access, refresh
 
 
-async def login_user(credentials: UserLogin) -> tuple[dict, str]:
+async def login_user(credentials: UserLogin) -> tuple[dict, str, str | None]:
     col = _collection()
     user = await col.find_one({"email": credentials.email})
     # Always run a hash verify (against a dummy hash when the user is absent) so
@@ -167,13 +193,13 @@ async def login_user(credentials: UserLogin) -> tuple[dict, str]:
             {"$set": {"password_hash": _hash_password(credentials.password)}},
         )
     user.pop("password_hash", None)
-    token = create_access_token(
+    access, refresh = _issue_tokens(
         str(user["_id"]), is_guest=False, token_version=user.get("token_version", 0)
     )
-    return user, token
+    return user, access, refresh
 
 
-async def create_guest_user() -> tuple[dict, str]:
+async def create_guest_user() -> tuple[dict, str, str | None]:
     col = _collection()
     short_id = uuid.uuid4().hex[:10]
     expires_at = datetime.now(timezone.utc) + timedelta(hours=GUEST_TTL_HOURS)
@@ -190,11 +216,13 @@ async def create_guest_user() -> tuple[dict, str]:
     }
     result = await col.insert_one(record)
     created = await col.find_one({"_id": result.inserted_id}, {"password_hash": 0})
-    token = create_access_token(str(result.inserted_id), is_guest=True)
-    return created, token
+    access, refresh = _issue_tokens(str(result.inserted_id), is_guest=True)
+    return created, access, refresh
 
 
-async def convert_guest_to_real(user_id: str, user: UserCreate) -> tuple[dict, str]:
+async def convert_guest_to_real(
+    user_id: str, user: UserCreate
+) -> tuple[dict, str, str | None]:
     col = _collection()
     if not ObjectId.is_valid(user_id):
         raise ValueError("Invalid user id")
@@ -222,8 +250,8 @@ async def convert_guest_to_real(user_id: str, user: UserCreate) -> tuple[dict, s
     # The newly-attached email is unverified — send a code.
     await _issue_email_verification(ObjectId(user_id), user.email, user.name)
     updated = await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
-    token = create_access_token(user_id, is_guest=False, token_version=0)
-    return updated, token
+    access, refresh = _issue_tokens(user_id, is_guest=False, token_version=0)
+    return updated, access, refresh
 
 
 async def request_password_reset(email: str) -> None:
@@ -264,7 +292,9 @@ async def request_password_reset(email: str) -> None:
     return None
 
 
-async def reset_password(email: str, code: str, new_password: str) -> tuple[dict, str]:
+async def reset_password(
+    email: str, code: str, new_password: str
+) -> tuple[dict, str, str | None]:
     col = _collection()
     user = await col.find_one({"email": email})
     stored = user.get("reset_code_hash") if user else None
@@ -315,8 +345,8 @@ async def reset_password(email: str, code: str, new_password: str) -> tuple[dict
         },
     )
     updated = await col.find_one({"_id": user["_id"]}, {"password_hash": 0})
-    token = create_access_token(str(user["_id"]), is_guest=False, token_version=new_tv)
-    return updated, token
+    access, refresh = _issue_tokens(str(user["_id"]), is_guest=False, token_version=new_tv)
+    return updated, access, refresh
 
 
 async def _issue_email_verification(user_id, email: str, name: str | None) -> None:
@@ -409,6 +439,40 @@ async def resend_verification(email: str) -> None:
         return None
     await _issue_email_verification(user["_id"], email, user.get("name"))
     return None
+
+
+async def refresh_access_token(refresh_token: str) -> tuple[dict, str, str]:
+    """Exchange a valid refresh token for a fresh access + refresh token pair
+    (rotation). Raises ValueError on any invalid/expired/revoked token.
+
+    Revocation piggybacks on token_version: a password reset or logout-all bumps
+    it, so refresh tokens minted before then fail the `tv` check here."""
+    try:
+        payload = decode_token(refresh_token)
+    except jwt.ExpiredSignatureError:
+        raise ValueError("Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise ValueError("Invalid refresh token")
+
+    if payload.get("type") != "refresh":
+        raise ValueError("Invalid refresh token")
+
+    user_id = payload.get("sub")
+    if not user_id or not ObjectId.is_valid(user_id):
+        raise ValueError("Invalid refresh token")
+
+    user = await _collection().find_one(
+        {"_id": ObjectId(user_id)}, {"password_hash": 0}
+    )
+    if not user or user.get("is_guest"):
+        raise ValueError("Invalid refresh token")
+    if payload.get("tv", 0) != user.get("token_version", 0):
+        raise ValueError("Refresh token no longer valid")
+
+    access, refresh = _issue_tokens(
+        user_id, is_guest=False, token_version=user.get("token_version", 0)
+    )
+    return user, access, refresh
 
 
 async def bump_token_version(user_id: str) -> None:

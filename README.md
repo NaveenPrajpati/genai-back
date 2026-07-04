@@ -2,8 +2,8 @@
 
 Production-style backend for three LLM agents (Learning Tracker, Meal Planner, Personal Assistant) plus a hybrid RAG chat service — built on FastAPI + LangGraph, with human-in-the-loop approvals, ReAct tool use, streaming, proactive scheduling, and an evaluation/fine-tuning pipeline.
 
-> **Live:** API → `<!-- TODO: Vercel API URL -->` · Mobile (Expo) → `<!-- TODO: Expo / store links -->`
-> Backend deployed on Vercel; Expo (React Native) frontend live on both platforms.
+> **Live:** API → https://aiengineer.duckdns.org · Mobile/Web (Expo) → https://genai-app.netlify.app
+> Backend deployed on **AWS EC2** (systemd + Caddy auto-HTTPS) with **GitHub Actions CI/CD**; Expo (React Native) frontend live on web and mobile.
 
 `63 tests passing` · `~7k LOC` · Python 3.13
 
@@ -115,9 +115,20 @@ Wiring: [app/core/observability.py](app/core/observability.py), called from the 
 
 ---
 
+## Deployment & CI/CD
+
+Deployed as a **single always-on instance** (not serverless) because the app runs an APScheduler cron loop and in-process background workers that must survive between requests — a constraint serverless would silently break.
+
+- **Host:** AWS EC2, run under **systemd** as a `gunicorn` + `uvicorn` worker (single worker: the scheduler and in-memory job state assume one process).
+- **TLS/reverse proxy:** **Caddy** terminates HTTPS with automatic Let's Encrypt certificates.
+- **CI/CD:** **GitHub Actions** SSHes to EC2 on every push to `main` — pulls code, installs changed deps, restarts the service, and verifies it came back healthy. See [.github/workflows/deploy.yml](.github/workflows/deploy.yml).
+- **Managed services:** Pinecone, Supabase/Postgres, Redis, and MongoDB run as external managed backends, so the instance stays lightweight.
+
+---
+
 ## Tech stack
 
-FastAPI · LangGraph / LangChain · OpenAI (gpt-4o-mini) · Pinecone · Jina rerank · MongoDB (motor) · Supabase/Postgres · Redis · APScheduler · Expo push · pytest · pip-tools.
+FastAPI · LangGraph / LangChain · OpenAI (gpt-4o-mini) · Llama 3 via Ollama · Pinecone · Jina rerank · MongoDB (motor) · Supabase/Postgres · Redis · APScheduler · LangSmith · AWS EC2 · GitHub Actions · Caddy · Expo push · pytest · pip-tools.
 
 ---
 

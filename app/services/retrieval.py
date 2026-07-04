@@ -5,7 +5,8 @@ STEPS 3, 4 & 5 OF THE RAG PIPELINE, assembled in one place because they form a
 single chain:  EMBEDDING → RETRIEVAL → RE-RANKING → CONTEXT ORDERING.
 
 This module builds the retriever once at import time and exposes a single
-`build_retriever(doc_ids)` helper that the routes call.
+`build_retriever(user_id, doc_ids)` helper that the routes call. Every query is
+scoped to the calling user's vectors (multi-tenant isolation).
 
 ══════════════════════════════════════════════════════════════════════════════
 STEP 3 — EMBEDDING
@@ -123,7 +124,11 @@ from app.core.config import (
 
 
 class _FilteredHybridRetriever(PineconeHybridSearchRetriever):
-    """Thin subclass that adds optional metadata filtering to Pinecone queries."""
+    """Thin subclass that adds a metadata filter to every Pinecone query.
+
+    The filter ALWAYS pins results to one `user_id` (multi-tenant isolation) and
+    optionally narrows to a set of `doc_id`s — see `_scope_filter`.
+    """
 
     metadata_filter: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
@@ -164,24 +169,37 @@ def _get_reranker() -> JinaRerank:
 reorder = LongContextReorder()
 
 
-def _base_hybrid_retriever(doc_ids: Optional[List[str]]) -> _FilteredHybridRetriever:
+def _scope_filter(
+    user_id: str, doc_ids: Optional[List[str]]
+) -> Dict[str, Any]:
     """
-    Step 4: the hybrid (dense + sparse) retriever, optionally scoped to a set of
-    document ids via Pinecone metadata filtering.
+    Build the Pinecone metadata filter. `user_id` is ALWAYS applied so a query
+    can only ever match the caller's own vectors (multi-tenant isolation); an
+    empty `ingestions` list therefore means "all of MY documents", never
+    everyone's. `doc_ids`, when given, narrows further to those ingestions.
+    """
+    metadata_filter: Dict[str, Any] = {"user_id": user_id}
+    if doc_ids:
+        metadata_filter["doc_id"] = {"$in": doc_ids}
+    return metadata_filter
+
+
+def _base_hybrid_retriever(
+    user_id: str, doc_ids: Optional[List[str]]
+) -> _FilteredHybridRetriever:
+    """
+    Step 4: the hybrid (dense + sparse) retriever, scoped to the caller's
+    documents (and optionally a subset of doc ids) via Pinecone metadata
+    filtering. Built per request — the heavy encoders it references are cached,
+    so this is cheap, and the filter is user-specific so it can't be shared.
     """
     return _FilteredHybridRetriever(
         embeddings=get_embeddings(),
         sparse_encoder=_get_bm25_encoder(),
         index=get_pinecone_index(),
         top_k=RETRIEVER_TOP_K,
-        metadata_filter={"doc_id": {"$in": doc_ids}} if doc_ids else None,
+        metadata_filter=_scope_filter(user_id, doc_ids),
     )
-
-
-# Unscoped retriever — built lazily on first use.
-@cache
-def _get_default_hybrid() -> _FilteredHybridRetriever:
-    return _base_hybrid_retriever(doc_ids=None)
 
 
 def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
@@ -230,6 +248,7 @@ def delete_doc_vectors(doc_id: str) -> int:
 
 
 def build_retriever(
+    user_id: str,
     doc_ids: Optional[List[str]] = None,
 ) -> ContextualCompressionRetriever:
     """
@@ -241,9 +260,11 @@ def build_retriever(
 
 
     Args:
-        doc_ids: restrict search to these ingestion ids. None = search everything.
+        user_id: REQUIRED. Results are always restricted to this user's vectors.
+        doc_ids: restrict search to these ingestion ids. None = all of the user's
+                 documents (never other users').
     """
-    base = _get_default_hybrid() if not doc_ids else _base_hybrid_retriever(doc_ids)
+    base = _base_hybrid_retriever(user_id, doc_ids)
     return ContextualCompressionRetriever(
         base_compressor=_get_reranker(), base_retriever=base
     )

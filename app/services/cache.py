@@ -39,9 +39,15 @@ from app.core.config import (
 logger = logging.getLogger(__name__)
 
 
-def scope_key(doc_ids: List[str]) -> str:
-    """Stable identifier for the set of sources being searched (order-independent)."""
-    return "|".join(sorted(doc_ids)) if doc_ids else "__all__"
+def scope_key(user_id: str, doc_ids: List[str]) -> str:
+    """Stable identifier for (who is asking, over which sources) — order-independent.
+
+    The `user_id` prefix keeps the cache multi-tenant: an empty `doc_ids` maps to
+    this user's `__all__`, never a global one, so a cached answer computed over
+    user A's documents can never be replayed to user B.
+    """
+    sources = "|".join(sorted(doc_ids)) if doc_ids else "__all__"
+    return f"{user_id}::{sources}"
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

@@ -1,0 +1,28 @@
+# Secrets & local env — never bake into an image
+.env
+.env.local
+*.pem
+
+# Python caches / virtualenvs
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Dev / VCS / editor
+.git/
+.github/
+.gitignore
+.vscode/
+.idea/
+
+# Local artifacts not needed in the image
+captures/
+*.log
+tests/

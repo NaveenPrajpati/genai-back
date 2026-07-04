@@ -1,6 +1,6 @@
 """
-services/ingestion_worker.py
-============================
+ingestion_worker
+
 The BACKGROUND TASK that runs the full ingest pipeline for one source:
 
     load (Step 1) → chunk (Step 2) → embed + upsert (Steps 3) → log status
@@ -43,6 +43,7 @@ async def run_ingestion(
     display_source: str,
     file_type: str,
     tmp_path: Optional[str],
+    user_id: str,
 ) -> None:
     try:
         INGESTION_JOBS[job_id]["status"] = "processing"
@@ -62,6 +63,7 @@ async def run_ingestion(
         metadatas = [
             {
                 "doc_id": job_id,
+                "user_id": user_id,
                 "source": display_source,
                 "file_type": file_type,
                 "ingested_at": ingested_at,

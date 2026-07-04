@@ -20,6 +20,11 @@ async def get_current_user(
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    # Refresh tokens are only valid at /refresh, never as a bearer access token.
+    # Tokens issued before the type claim existed omit it and are treated as access.
+    if payload.get("type") == "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     user_id = payload.get("sub")
     if not user_id or not ObjectId.is_valid(user_id):
         raise HTTPException(status_code=401, detail="Invalid token payload")

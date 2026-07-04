@@ -99,6 +99,10 @@ class ExpoPushTokenUpdate(BaseModel):
     expo_push_token: str = Field(..., min_length=1, max_length=200)
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1)
+
+
 class UserResponse(BaseModel):
     id: PyObjectId = Field(alias="_id")
     name: str
@@ -118,6 +122,8 @@ class UserResponse(BaseModel):
 class AuthResponse(BaseModel):
     message: str
     token: str
+    # Null for guest accounts, which cannot refresh.
+    refresh_token: Optional[str] = None
     user: UserResponse
 
 

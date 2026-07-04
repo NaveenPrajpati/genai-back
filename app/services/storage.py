@@ -78,14 +78,17 @@ def create_chat(title: str) -> str:
 
 
 def list_chats(user_id) -> list:
-    return (
-        supabase.table("rag_chats")
-        .select("*")
-        .order("updated_at", desc=True)
-        .eq("user_id", user_id)
-        .execute()
-        .data
-    )
+    try:
+        return (
+            supabase.table("rag_chats")
+            .select("*")
+            .order("updated_at", desc=True)
+            .eq("user_id", user_id)
+            .execute()
+            .data
+        )
+    except Exception as e:
+        print(f"Query failed: {e}")
 
 
 def get_chat(chat_id: str):
