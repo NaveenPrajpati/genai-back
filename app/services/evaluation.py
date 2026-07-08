@@ -27,9 +27,8 @@ small human-labelled gold set and measure against it.
 import asyncio
 from typing import List
 
-from langchain_core.messages import SystemMessage, HumanMessage
-
 from app.core.llm import llm
+from app.core.prompts import EVAL_RELEVANCE, EVAL_RECALL, EVAL_HALLUCINATION
 
 
 def _to_unit_float(text: str) -> float:
@@ -42,40 +41,25 @@ def _to_unit_float(text: str) -> float:
 
 async def _score_doc_relevance(question: str, content: str) -> float:
     """Binary relevance: 1.0 if this chunk helps answer the question, else 0.0."""
-    msg = await llm.ainvoke([
-        SystemMessage(content=(
-            "You are a relevance judge. Given a query and a document chunk, "
-            "reply only YES if the document helps answer the query, or NO if it does not."
-        )),
-        HumanMessage(content=f"Query: {question}\n\nDocument: {content[:600]}"),
-    ])
+    msg = await (EVAL_RELEVANCE | llm).ainvoke(
+        {"question": question, "content": content[:600]}
+    )
     return 1.0 if "YES" in msg.content.upper() else 0.0
 
 
 async def _score_recall(question: str, context: str) -> float:
     """How completely does the context cover the answer? 0 = useless, 1 = complete."""
-    msg = await llm.ainvoke([
-        SystemMessage(content=(
-            "You are an evaluation assistant. Rate how completely the context "
-            "contains the information needed to fully answer the question. "
-            "0.0 = context is useless, 1.0 = context fully covers the answer. "
-            "Return only a decimal number."
-        )),
-        HumanMessage(content=f"Question: {question}\n\nContext: {context[:2000]}"),
-    ])
+    msg = await (EVAL_RECALL | llm).ainvoke(
+        {"question": question, "context": context[:2000]}
+    )
     return _to_unit_float(msg.content)
 
 
 async def _score_hallucination(context: str, answer: str) -> float:
     """Fraction of the answer NOT supported by context. 0 = grounded, 1 = made up."""
-    msg = await llm.ainvoke([
-        SystemMessage(content=(
-            "You are a hallucination detector. Rate what fraction of the answer "
-            "contains claims NOT supported by the provided context. "
-            "0.0 = fully grounded, 1.0 = fully hallucinated. Return only a decimal number."
-        )),
-        HumanMessage(content=f"Context: {context[:2000]}\n\nAnswer: {answer}"),
-    ])
+    msg = await (EVAL_HALLUCINATION | llm).ainvoke(
+        {"context": context[:2000], "answer": answer}
+    )
     return _to_unit_float(msg.content)
 
 

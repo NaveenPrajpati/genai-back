@@ -71,6 +71,48 @@ Output is per-`call_site` and overall:
   "by_call_site": { "PlanOutput": {"n": 20, "valid": 0.9, "field_match": 0.72}, ... } }
 ```
 
+---
+
+# RAG answer-quality eval (`rag_eval.py`)
+
+A **separate** harness for the RAG pipeline. Where `harness.py` grades agent
+structured-output distillation, `rag_eval.py` grades **RAG answers**: are they
+faithful to the retrieved context, do they contain the right facts, and does the
+system correctly refuse when the docs don't cover the question? See the full
+rationale in [`../../RAG_EVALUATION_PLAN.md`](../../RAG_EVALUATION_PLAN.md).
+
+**Golden set** — `datasets/rag_golden.jsonl`, one hand-verified row per line:
+
+```jsonc
+{"id":"rev-q3","question":"What was Q3 revenue?","should_refuse":false,
+ "key_facts":["$4.2M"],"source_doc":"financials_q3.pdf",
+ "context":["Total revenue for the third quarter reached $4.2M ..."]}
+{"id":"refund-policy","question":"What is the refund policy?","should_refuse":true,
+ "key_facts":[],"source_doc":null,"context":["<near-but-unrelated chunks>"]}
+```
+
+`context` is the **frozen retrieved chunks** — the eval grades *generation* over
+them without touching Pinecone (cheap, low-flake). Keep ~20–30% `should_refuse`
+rows so the grounding gate can't regress into over- or under-refusal unnoticed.
+
+**Metrics:** `correctness` (fraction of `key_facts` in the answer — deterministic),
+`faithfulness` (LLM-judge, or RAGAS via `--scorer ragas`), `refusal_accuracy`, and
+`over_refusal`.
+
+```bash
+# offline: validate scoring + the golden set, no API keys
+.venv/bin/python -m app.evals.rag_eval --self-test
+
+# real eval against the configured llm
+.venv/bin/python -m app.evals.rag_eval --data app/evals/datasets/rag_golden.jsonl
+
+# enforce thresholds (CI hard gate); exits non-zero on a regression
+.venv/bin/python -m app.evals.rag_eval --data app/evals/datasets/rag_golden.jsonl --gate
+```
+
+CI runs this **report-only** on every PR (`.github/workflows/eval.yml`). Flip it to
+a blocking gate by adding `--gate` there once thresholds are calibrated.
+
 - **valid** — prediction is a dict with every required schema field.
 - **field_match** — mean agreement with the teacher on the gold fields.
 

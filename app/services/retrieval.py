@@ -162,16 +162,13 @@ def _get_bm25_encoder() -> BM25Encoder:
 # cache the lightweight client. Set JINA_API_KEY in the environment.
 @cache
 def _get_reranker() -> JinaRerank:
-    # jina_api_key is read from the JINA_API_KEY environment variable.
     return JinaRerank(model=RERANKER_MODEL, top_n=RERANK_TOP_N)
 
 
 reorder = LongContextReorder()
 
 
-def _scope_filter(
-    user_id: str, doc_ids: Optional[List[str]]
-) -> Dict[str, Any]:
+def _scope_filter(user_id: str, doc_ids: Optional[List[str]]) -> Dict[str, Any]:
     """
     Build the Pinecone metadata filter. `user_id` is ALWAYS applied so a query
     can only ever match the caller's own vectors (multi-tenant isolation); an

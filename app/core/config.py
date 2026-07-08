@@ -32,12 +32,18 @@ logger = logging.getLogger(__name__)
 
 # --- Vector index ---
 INDEX_NAME = "rag-hybrid"
-EMBEDDING_DIM = 1536          # text-embedding-3-small / ada-002 dimension
+EMBEDDING_DIM = 1536  # text-embedding-3-small / ada-002 dimension
 PINECONE_METRIC = "dotproduct"  # REQUIRED for native sparse+dense hybrid search
 
 # --- Retrieval ---
-RETRIEVER_TOP_K = 10          # how many candidates the retriever pulls
-RERANK_TOP_N = 5              # how many survive the rerank
+RETRIEVER_TOP_K = 10  # how many candidates the retriever pulls
+RERANK_TOP_N = 5  # how many survive the rerank
+
+# --- Grounding / citation enforcement ---
+# When on, an answerability gate (a cheap fast-model check) runs before every RAG
+# answer and refuses when the retrieved context can't support one — see
+# services/grounding.py. Kill switch for debugging / latency-sensitive callers.
+RAG_GROUNDING_GATE = os.getenv("RAG_GROUNDING_GATE", "1") == "1"
 
 # --- Models ---
 # Two-tier routing (see core/llm.py): the top model handles generation-heavy
@@ -49,18 +55,21 @@ FAST_LLM_MODEL = os.getenv("FAST_LLM_MODEL", "gpt-4o-mini")
 # Hosted Jina reranker (free tier). Requires JINA_API_KEY in the environment.
 RERANKER_MODEL = "jina-reranker-v2-base-multilingual"
 
+GROQ_LLM_MODEL = "qwen/qwen3-32b"
+GROQ_FAST_LLM_MODEL = "openai/gpt-oss-20b"
+
 # --- Semantic cache ---
 CACHE_PREFIX = "rag:cache:"
-CACHE_INDEX_PREFIX = "rag:cache_idx:"   # one Redis Set per retrieval scope
-CACHE_TTL_SECONDS = 60 * 60 * 24        # 24 hours
+CACHE_INDEX_PREFIX = "rag:cache_idx:"  # one Redis Set per retrieval scope
+CACHE_TTL_SECONDS = 60 * 60 * 24  # 24 hours
 # Cosine-sim required for a cache hit, tuned per task type:
 #  • Generation (RAG answers): strict — a near-miss query can need a different
 #    answer, and a wrong replay is user-visible. Keep high.
 #  • Classification (intent routing): loose — intent is robust to phrasing
 #    ("show my tasks" / "what do I have" → same label), so a looser match still
 #    lands the right intent, and a hit here is essentially free.
-CACHE_SIMILARITY_THRESHOLD = 0.95          # generation / RAG
-CACHE_CLASSIFY_THRESHOLD = 0.90            # intent classification
+CACHE_SIMILARITY_THRESHOLD = 0.95  # generation / RAG
+CACHE_CLASSIFY_THRESHOLD = 0.90  # intent classification
 
 
 def _require(name: str) -> str:

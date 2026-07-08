@@ -20,12 +20,14 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.dependencies import get_current_user
-from app.core.llm import llm, RAG_PROMPT
+from app.core.llm import llm
+from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE, INSUFFICIENT_CONTEXT
 from app.services import storage, cache
 from app.services.ingestion import load_url, SUPPORTED_FILE_TYPES
 from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
 from app.services.retrieval import build_retriever, get_embeddings, delete_doc_vectors
-from app.services.generation import build_context, build_sources
+from app.services.generation import prepare_context, cited_sources
+from app.services.grounding import is_answerable, is_refusal, cited_numbers
 from app.services.evaluation import run_evaluation
 
 logger = logging.getLogger(__name__)
@@ -198,15 +200,30 @@ async def query_documents(
             "sources": [],
         }
 
-    context = build_context(docs)
-    response = await (RAG_PROMPT | llm).ainvoke(
+    context, sources = prepare_context(docs)
+
+    # Grounding gate: refuse up front if the context can't support an answer.
+    if not await is_answerable(request.question, context):
+        return {"answer": REFUSAL_MESSAGE, "sources": [], "grounded": False}
+
+    response = await (RAG_ANSWER | llm).ainvoke(
         {"context": context, "question": request.question}
     )
+    answer = response.content
 
-    result: dict = {"answer": response.content, "sources": build_sources(docs)}
+    # Backstop: the model itself judged the context insufficient.
+    if is_refusal(answer):
+        return {"answer": REFUSAL_MESSAGE, "sources": [], "grounded": False}
+
+    cited = cited_numbers(answer)
+    result: dict = {
+        "answer": answer,
+        "sources": cited_sources(sources, cited),
+        "grounded": bool(cited),  # an answer that cited nothing isn't traceable
+    }
     if request.evaluate:
         result["evaluation"] = await run_evaluation(
-            request.question, docs, context, response.content
+            request.question, docs, context, answer
         )
     return result
 
@@ -265,33 +282,76 @@ async def query_documents_stream(
                 )
                 return
 
-            context = build_context(docs)
-            sources = build_sources(docs)
+            context, sources = prepare_context(docs)
+
+            def _persist(answer: str, srcs: list) -> None:
+                """Fire-and-forget: save one Q&A turn to chat history."""
+                asyncio.ensure_future(
+                    asyncio.to_thread(
+                        storage.save_messages,
+                        chat_id=chat_id,
+                        question=request.question,
+                        answer=answer,
+                        user_id=user_id,
+                        sources=srcs,
+                        ingestions=request.ingestions,
+                    )
+                )
+
+            # ── Grounding gate: decide to refuse BEFORE emitting any token ────
+            if not await is_answerable(request.question, context):
+                yield _sse({"type": "sources", "sources": []})
+                yield _sse({"type": "token", "token": REFUSAL_MESSAGE})
+                _persist(REFUSAL_MESSAGE, [])
+                yield _sse({"type": "done", "grounded": False, "chat_id": chat_id})
+                return
+
             yield _sse({"type": "sources", "sources": sources})
 
+            # Stream, but hold back the leading text until we know it isn't the
+            # refusal sentinel — so we never leak "INSUFFICIENT_CONTEXT" to the UI.
             full_answer = ""
-            async for chunk in (RAG_PROMPT | llm).astream(
+            buffer = ""
+            streaming = False
+            async for chunk in (RAG_ANSWER | llm).astream(
                 {"context": context, "question": request.question}
             ):
-                if chunk.content:
-                    full_answer += chunk.content
+                if not chunk.content:
+                    continue
+                full_answer += chunk.content
+                if streaming:
                     yield _sse({"type": "token", "token": chunk.content})
+                    continue
+                buffer += chunk.content
+                if len(buffer) < len(INSUFFICIENT_CONTEXT):
+                    continue
+                if is_refusal(buffer):
+                    break  # sentinel confirmed — nothing has been streamed yet
+                streaming = True  # safe: flush what we held and go live
+                yield _sse({"type": "token", "token": buffer})
 
-            # Fire-and-forget: cache the result + persist the messages.
-            asyncio.ensure_future(
-                cache.save(query_embedding, scope, sources, full_answer)
-            )
-            asyncio.ensure_future(
-                asyncio.to_thread(
-                    storage.save_messages,
-                    chat_id=chat_id,
-                    question=request.question,
-                    answer=full_answer,
-                    user_id=user_id,
-                    sources=sources,
-                    ingestions=request.ingestions,
-                )
-            )
+            # Stream ended (or broke) while still buffering — a short answer or the
+            # sentinel. If it wasn't a refusal, flush the held text now.
+            if not streaming and not is_refusal(full_answer):
+                if buffer:
+                    yield _sse({"type": "token", "token": buffer})
+                    streaming = True
+
+            if is_refusal(full_answer):
+                yield _sse({"type": "token", "token": REFUSAL_MESSAGE})
+                _persist(REFUSAL_MESSAGE, [])
+                yield _sse({"type": "done", "grounded": False, "chat_id": chat_id})
+                return
+
+            # Surface which sources the answer actually cited, and keep only those.
+            cited = cited_numbers(full_answer)
+            used = cited_sources(sources, cited)
+            yield _sse({"type": "citations", "cited": sorted(cited)})
+
+            # Fire-and-forget: cache the result + persist the messages. Only real,
+            # grounded answers are cached — never a refusal.
+            asyncio.ensure_future(cache.save(query_embedding, scope, used, full_answer))
+            _persist(full_answer, used)
 
             if request.evaluate:
                 evaluation = await run_evaluation(
@@ -299,7 +359,7 @@ async def query_documents_stream(
                 )
                 yield _sse({"type": "evaluation", "evaluation": evaluation})
 
-            yield _sse({"type": "done", "chat_id": chat_id})
+            yield _sse({"type": "done", "grounded": bool(cited), "chat_id": chat_id})
 
         except Exception as exc:
             logger.exception("Stream generation failed")

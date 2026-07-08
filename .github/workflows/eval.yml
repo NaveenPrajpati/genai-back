@@ -1,0 +1,53 @@
+name: RAG eval (report-only)
+
+# Runs the offline RAG answer-quality eval on every PR. Currently REPORT-ONLY:
+# it prints the scorecard but does not block the merge. To turn it into a hard
+# gate once thresholds are calibrated, add `--gate` to the eval command and drop
+# `continue-on-error` from that step (see RAG_EVALUATION_PLAN.md).
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  rag-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+      # Deterministic, no keys required — guards the harness/scoring logic itself.
+      # This step DOES block: if it fails, the eval code is broken.
+      - name: Harness self-test (offline)
+        run: .venv/bin/python -m app.evals.rag_eval --self-test
+
+      # Real eval against the golden set. Report-only: never blocks the merge yet.
+      # Frozen-context mode needs no Pinecone/Redis — only OpenAI for generation +
+      # the faithfulness judge. Supabase vars are placeholders so config imports.
+      - name: RAG answer eval (report-only)
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_URL: "https://placeholder.supabase.co"
+          SUPABASE_KEY: "placeholder-unused-in-frozen-context-eval"
+        run: |
+          .venv/bin/python -m app.evals.rag_eval \
+            --data app/evals/datasets/rag_golden.jsonl | tee eval-report.json
+
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-eval-report
+          path: eval-report.json
+          if-no-files-found: ignore

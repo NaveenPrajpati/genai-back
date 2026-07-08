@@ -44,3 +44,5 @@ ENV/
 chroma_langchain_db
 
 finetune
+
+RAG_EVALUATION_PLAN.md
