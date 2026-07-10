@@ -101,8 +101,9 @@ into the LLM prompt is its own discipline:
   • ORDERING: LongContextReorder (above) is your "lost in the middle" mitigation.
 """
 
+import time
 from functools import cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
@@ -120,6 +121,7 @@ from app.core.config import (
     RETRIEVER_TOP_K,
     RERANK_TOP_N,
     RERANKER_MODEL,
+    EMBEDDING_MODEL,
 )
 
 
@@ -148,7 +150,7 @@ class _FilteredHybridRetriever(PineconeHybridSearchRetriever):
 # ── Step 3: embedders (lazy — @cache builds once on first use) ───────────────
 @cache
 def get_embeddings() -> OpenAIEmbeddings:
-    return OpenAIEmbeddings()
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
 
 
 @cache
@@ -265,3 +267,32 @@ def build_retriever(
     return ContextualCompressionRetriever(
         base_compressor=_get_reranker(), base_retriever=base
     )
+
+
+def retrieve_and_rerank(
+    user_id: str, doc_ids: Optional[List[str]], question: str
+) -> Tuple[List[Document], Dict[str, Any]]:
+    """
+    The same two steps `build_retriever` chains together, run separately so each
+    can be timed — the stream route emits these timings as pipeline telemetry.
+    Behaviour is identical to ContextualCompressionRetriever.invoke (hybrid
+    retrieve, then rerank the candidates).
+
+    Returns (reranked_docs, timings) where timings holds `retrieve_ms`,
+    `rerank_ms`, and the raw `candidates` count. Blocking — call via
+    `asyncio.to_thread` from async code.
+    """
+    base = _base_hybrid_retriever(user_id, doc_ids)
+    t0 = time.perf_counter()
+    candidates = base.invoke(question)
+    t1 = time.perf_counter()
+    timings: Dict[str, Any] = {
+        "retrieve_ms": (t1 - t0) * 1000.0,
+        "rerank_ms": 0.0,
+        "candidates": len(candidates),
+    }
+    if not candidates:
+        return [], timings
+    docs = list(_get_reranker().compress_documents(candidates, question))
+    timings["rerank_ms"] = (time.perf_counter() - t1) * 1000.0
+    return docs, timings

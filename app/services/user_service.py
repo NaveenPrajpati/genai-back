@@ -210,8 +210,11 @@ async def create_guest_user() -> tuple[dict, str, str | None]:
         "role": "user",
         "description": None,
         "is_guest": True,
+        "deactivated": False,
         "diet": "vegetarian",
         "protein_target": 100,
+        # Deadline after which the guest is *deactivated* (not deleted) — see
+        # deactivate_expired_guests.
         "expires_at": expires_at,
     }
     result = await col.insert_one(record)
@@ -497,15 +500,20 @@ async def update_expo_push_token(user_id: str, expo_push_token: str) -> dict | N
     return await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
 
 
-async def cleanup_expired_guests() -> int:
-    """Failsafe cleanup — MongoDB TTL index is the primary mechanism."""
+async def deactivate_expired_guests() -> int:
+    """Soft-expire guests past their deadline: mark them `deactivated` rather than
+    deleting, so their data (tasks, roadmaps, memory) is retained. Deactivated
+    accounts are rejected at auth (see get_current_user). Runs hourly."""
     col = _collection()
-    result = await col.delete_many(
+    now = datetime.now(timezone.utc)
+    result = await col.update_many(
         {
             "is_guest": True,
-            "expires_at": {"$lt": datetime.now(timezone.utc)},
-        }
+            "deactivated": {"$ne": True},
+            "expires_at": {"$lt": now},
+        },
+        {"$set": {"deactivated": True, "deactivated_at": now}},
     )
-    if result.deleted_count:
-        print(f"[cleanup] Deleted {result.deleted_count} expired guest account(s)")
-    return result.deleted_count
+    if result.modified_count:
+        logger.info("deactivated %d expired guest account(s)", result.modified_count)
+    return result.modified_count

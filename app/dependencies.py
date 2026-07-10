@@ -34,6 +34,9 @@ async def get_current_user(
     )
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # Deactivated guests are retained but no longer usable — force re-auth.
+    if user.get("deactivated"):
+        raise HTTPException(status_code=401, detail="Account deactivated")
     # Reject tokens issued before the last password reset (session invalidation).
     if payload.get("tv", 0) != user.get("token_version", 0):
         raise HTTPException(status_code=401, detail="Token no longer valid")

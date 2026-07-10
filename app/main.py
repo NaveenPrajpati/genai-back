@@ -26,7 +26,7 @@ from app.agents.meal_planner import (
     graph as meal_graph,
     run_triggers as run_meal_triggers,
 )
-from app.services.user_service import cleanup_expired_guests
+from app.services.user_service import deactivate_expired_guests
 from app.database import get_db
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -54,11 +54,10 @@ async def lifespan(app: FastAPI):
     # 1. Initialize MongoDB
     try:
         await connect_db()
-        # TTL index so MongoDB auto-deletes guest accounts after their expires_at
-        await get_db()["users"].create_index(
-            "expires_at", expireAfterSeconds=0, sparse=True
-        )
-        print("[Lifespan] MongoDB TTL index on users.expires_at ready")
+        # NOTE: guests are now *deactivated* at expiry (not deleted), so we no
+        # longer create a TTL index on users.expires_at. If a previous deploy
+        # created one, drop it by hand or it will keep hard-deleting guests:
+        #   db.users.dropIndex("expires_at_1")
     except Exception as e:
         print(f"MongoDB connection failed (non-fatal): {e}")
 
@@ -108,8 +107,8 @@ async def lifespan(app: FastAPI):
         CronTrigger(minute=0),
         args=[app.state.meal_agent],
     )
-    # Failsafe: sweep any guests the TTL index missed (e.g. during downtime)
-    scheduler.add_job(cleanup_expired_guests, "interval", hours=1)
+    # Hourly sweep: deactivate (not delete) guests past their 24h deadline.
+    scheduler.add_job(deactivate_expired_guests, "interval", hours=1)
     scheduler.start()
 
     # --- ACTIVE PHASE ---

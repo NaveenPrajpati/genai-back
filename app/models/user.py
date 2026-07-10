@@ -111,6 +111,7 @@ class UserResponse(BaseModel):
     description: Optional[str] = None
     is_guest: bool = False
     email_verified: bool = False
+    deactivated: bool = False
     expires_at: Optional[datetime] = None
     diet: str = "vegetarian"
     protein_target: int = 100

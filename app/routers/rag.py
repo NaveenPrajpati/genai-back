@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import uuid
 import shutil
 import asyncio
@@ -20,12 +21,18 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.dependencies import get_current_user
+from app.core.config import EMBEDDING_MODEL
 from app.core.llm import llm
 from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE, INSUFFICIENT_CONTEXT
 from app.services import storage, cache
 from app.services.ingestion import load_url, SUPPORTED_FILE_TYPES
 from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
-from app.services.retrieval import build_retriever, get_embeddings, delete_doc_vectors
+from app.services.retrieval import (
+    build_retriever,
+    get_embeddings,
+    delete_doc_vectors,
+    retrieve_and_rerank,
+)
 from app.services.generation import prepare_context, cited_sources
 from app.services.grounding import is_answerable, is_refusal, cited_numbers
 from app.services.evaluation import run_evaluation
@@ -178,6 +185,9 @@ async def delete_ingestion(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete ingestion: {e}")
 
+    # Drop this user's cached answers — some may cite the doc we just removed.
+    await cache.invalidate_user(current_user["uid"])
+
     INGESTION_JOBS.pop(doc_id, None)  # drop any stale in-memory job state
     return {
         "message": "ingestion deleted",
@@ -241,21 +251,60 @@ async def query_documents_stream(
 
     async def generate():
         try:
-            # Embed once; reused for both the cache check and (on miss) retrieval.
+            t_start = time.perf_counter()
+            timings: dict = {}  # stage name -> ms, summarised on the `done` event
+
+            def _stage(name: str, ms: float = 0.0, info: str = "", skipped: bool = False) -> str:
+                """One pipeline-stage SSE frame with a REAL server-side timing."""
+                evt: dict = {"type": "stage", "name": name}
+                if skipped:
+                    evt["skipped"] = True
+                else:
+                    evt["ms"] = round(ms, 1)
+                    timings[name] = evt["ms"]
+                if info:
+                    evt["info"] = info
+                return _sse(evt)
+
+            def _done(**extra) -> str:
+                total_ms = round((time.perf_counter() - t_start) * 1000, 1)
+                return _sse(
+                    {
+                        "type": "done",
+                        "chat_id": chat_id,
+                        "timings": timings,
+                        "total_ms": total_ms,
+                        **extra,
+                    }
+                )
+
+            # ── Embed (once; reused for the cache check and retrieval) ──────
+            t = time.perf_counter()
             query_embedding = await asyncio.to_thread(
                 get_embeddings().embed_query, request.question
             )
+            yield _stage("embed", (time.perf_counter() - t) * 1000, EMBEDDING_MODEL)
 
             # ── Semantic cache check ────────────────────────────────────────
+            t = time.perf_counter()
             cached = await cache.lookup(query_embedding, scope)
+            yield _stage(
+                "cache", (time.perf_counter() - t) * 1000, "hit" if cached else "miss"
+            )
+
             if cached:
                 logger.info("Semantic cache hit: %s", request.question[:60])
+                for skipped_stage in ("retrieve", "rerank", "gate"):
+                    yield _stage(skipped_stage, skipped=True)
                 yield _sse(
                     {"type": "sources", "sources": cached["sources"], "cached": True}
                 )
+                t = time.perf_counter()
                 for word in cached["answer"].split(" "):
                     yield _sse({"type": "token", "token": word + " "})
                     await asyncio.sleep(0)
+                yield _stage("stream", (time.perf_counter() - t) * 1000, "cache replay")
+                t = time.perf_counter()
                 asyncio.ensure_future(
                     asyncio.to_thread(
                         storage.save_messages,
@@ -267,13 +316,17 @@ async def query_documents_stream(
                         ingestions=request.ingestions,
                     )
                 )
-                yield _sse({"type": "done", "cached": True, "chat_id": chat_id})
+                yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                yield _done(cached=True)
                 return
 
-            # ── Cache miss: retrieve → rerank → generate ────────────────────
-            retriever = build_retriever(user_id, request.ingestions or None)
-            docs = await asyncio.to_thread(retriever.invoke, request.question)
+            # ── Cache miss: retrieve → rerank (timed separately) ────────────
+            docs, rt = await asyncio.to_thread(
+                retrieve_and_rerank, user_id, request.ingestions or None, request.question
+            )
+            yield _stage("retrieve", rt["retrieve_ms"], f"{rt['candidates']} candidates")
             if not docs:
+                yield _stage("rerank", skipped=True)
                 yield _sse(
                     {
                         "type": "error",
@@ -281,6 +334,7 @@ async def query_documents_stream(
                     }
                 )
                 return
+            yield _stage("rerank", rt["rerank_ms"], f"kept {len(docs)}")
 
             context, sources = prepare_context(docs)
 
@@ -299,17 +353,28 @@ async def query_documents_stream(
                 )
 
             # ── Grounding gate: decide to refuse BEFORE emitting any token ────
-            if not await is_answerable(request.question, context):
+            t = time.perf_counter()
+            answerable = await is_answerable(request.question, context)
+            yield _stage(
+                "gate",
+                (time.perf_counter() - t) * 1000,
+                "answerable" if answerable else "refused",
+            )
+            if not answerable:
                 yield _sse({"type": "sources", "sources": []})
                 yield _sse({"type": "token", "token": REFUSAL_MESSAGE})
+                yield _stage("stream", skipped=True)
+                t = time.perf_counter()
                 _persist(REFUSAL_MESSAGE, [])
-                yield _sse({"type": "done", "grounded": False, "chat_id": chat_id})
+                yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                yield _done(grounded=False)
                 return
 
             yield _sse({"type": "sources", "sources": sources})
 
             # Stream, but hold back the leading text until we know it isn't the
             # refusal sentinel — so we never leak "INSUFFICIENT_CONTEXT" to the UI.
+            t_gen = time.perf_counter()
             full_answer = ""
             buffer = ""
             streaming = False
@@ -339,9 +404,18 @@ async def query_documents_stream(
 
             if is_refusal(full_answer):
                 yield _sse({"type": "token", "token": REFUSAL_MESSAGE})
+                yield _stage("stream", (time.perf_counter() - t_gen) * 1000, "refused")
+                t = time.perf_counter()
                 _persist(REFUSAL_MESSAGE, [])
-                yield _sse({"type": "done", "grounded": False, "chat_id": chat_id})
+                yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                yield _done(grounded=False)
                 return
+
+            yield _stage(
+                "stream",
+                (time.perf_counter() - t_gen) * 1000,
+                f"{len(full_answer)} chars",
+            )
 
             # Surface which sources the answer actually cited, and keep only those.
             cited = cited_numbers(full_answer)
@@ -350,16 +424,20 @@ async def query_documents_stream(
 
             # Fire-and-forget: cache the result + persist the messages. Only real,
             # grounded answers are cached — never a refusal.
+            t = time.perf_counter()
             asyncio.ensure_future(cache.save(query_embedding, scope, used, full_answer))
             _persist(full_answer, used)
+            yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
 
             if request.evaluate:
+                t = time.perf_counter()
                 evaluation = await run_evaluation(
                     request.question, docs, context, full_answer
                 )
+                timings["evaluate"] = round((time.perf_counter() - t) * 1000, 1)
                 yield _sse({"type": "evaluation", "evaluation": evaluation})
 
-            yield _sse({"type": "done", "grounded": bool(cited), "chat_id": chat_id})
+            yield _done(grounded=bool(cited))
 
         except Exception as exc:
             logger.exception("Stream generation failed")

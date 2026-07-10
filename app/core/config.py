@@ -36,7 +36,7 @@ EMBEDDING_DIM = 1536  # text-embedding-3-small / ada-002 dimension
 PINECONE_METRIC = "dotproduct"  # REQUIRED for native sparse+dense hybrid search
 
 # --- Retrieval ---
-RETRIEVER_TOP_K = 10  # how many candidates the retriever pulls
+RETRIEVER_TOP_K = 25  # how many candidates the retriever pulls
 RERANK_TOP_N = 5  # how many survive the rerank
 
 # --- Grounding / citation enforcement ---
@@ -52,6 +52,7 @@ RAG_GROUNDING_GATE = os.getenv("RAG_GROUNDING_GATE", "1") == "1"
 # model is ~10-15x cheaper at no real quality loss. Override either via env.
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 FAST_LLM_MODEL = os.getenv("FAST_LLM_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 # Hosted Jina reranker (free tier). Requires JINA_API_KEY in the environment.
 RERANKER_MODEL = "jina-reranker-v2-base-multilingual"
 

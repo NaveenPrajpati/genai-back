@@ -27,7 +27,7 @@ from typing import Callable, Optional
 
 from app.utils.chunking import get_splitter, SplitStrategy
 from app.services.retrieval import hybrid_add_texts
-from app.services import storage
+from app.services import storage, cache
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,11 @@ async def run_ingestion(
 
         # Step 3: embed (dense + sparse) and upsert into Pinecone ─────────────
         await asyncio.to_thread(hybrid_add_texts, texts, metadatas)
+
+        # The new vectors are now searchable — drop this user's stale cached
+        # answers so the next question reflects the freshly-ingested content
+        # instead of replaying a pre-ingest reply for up to CACHE_TTL_SECONDS.
+        await cache.invalidate_user(user_id)
 
         completed_at = datetime.now(timezone.utc).isoformat()
         INGESTION_JOBS[job_id].update(

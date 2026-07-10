@@ -50,6 +50,36 @@ def scope_key(user_id: str, doc_ids: List[str]) -> str:
     return f"{user_id}::{sources}"
 
 
+async def invalidate_user(user_id: str) -> int:
+    """Drop every cached answer belonging to `user_id`. Returns scopes cleared.
+
+    Called after a user INGESTS or DELETES a document: their cached answers were
+    computed over the OLD document set, so replaying them would hide freshly-added
+    content (or resurrect deleted content) until the entries expire on their own
+    (CACHE_TTL_SECONDS = 24h). We clear the whole user namespace rather than reason
+    about exactly which scopes went stale — ingest/delete are rare, and a dropped
+    entry simply gets recomputed and re-cached on the next question.
+
+    `user_id` is a UUID/ObjectId hex (no Redis glob metacharacters), so it's safe
+    to interpolate into the SCAN match. Never raises — a cache-clear failure must
+    not break ingestion.
+    """
+    cleared = 0
+    try:
+        pattern = f"{CACHE_INDEX_PREFIX}{user_id}::*"
+        async for index_key in redis_client.scan_iter(match=pattern):
+            members = await redis_client.smembers(index_key)
+            if members:
+                await redis_client.delete(*members)  # the cached payloads
+            await redis_client.delete(index_key)  # the scope's index set
+            cleared += 1
+        if cleared:
+            logger.info("cache invalidated for user=%s (%d scopes)", user_id, cleared)
+    except Exception:
+        logger.warning("cache invalidation failed for user=%s", user_id)
+    return cleared
+
+
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     va, vb = np.array(a), np.array(b)
     denom = np.linalg.norm(va) * np.linalg.norm(vb)
