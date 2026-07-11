@@ -62,9 +62,14 @@ from typing import List
 
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from langchain_core.documents import Document
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.document_loaders import AsyncHtmlLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    Docx2txtLoader,
+    AsyncHtmlLoader,
+)
 from langchain_community.document_transformers import Html2TextTransformer
 
 
@@ -99,7 +104,93 @@ def load_url2(url: str) -> List[Document]:
     return [Document(page_content=text, metadata={"source": url})]
 
 
-SUPPORTED_FILE_TYPES = {
-    "application/pdf": {"suffix": ".pdf", "file_type": "pdf", "loader": PyPDFLoader},
-    "text/plain": {"suffix": ".txt", "file_type": "text", "loader": TextLoader},
+def is_digital_pdf(path):
+    reader = PdfReader(path)
+    for page in reader.pages:
+        text = page.extract_text()
+        if text and text.strip():
+            return True  # has real text
+    return False  # likely scanned
+
+
+def load_pdf(path: str) -> List[Document]:
+
+    isDigital = is_digital_pdf(path)
+    if isDigital:
+        loader = PyPDFLoader(path)
+        docs = loader.load()
+
+        text = "\n".join([doc.page_content for doc in docs])
+        return [Document(page_content=text, metadata={"source": ""})]
+    else:
+        # TODO: OCR fallback for scanned PDFs
+        raise ValueError(
+            "Scanned PDF detected — no extractable text (OCR not supported yet)"
+        )
+
+
+def load_txt(path: str) -> List[Document]:
+
+    loader = TextLoader(path)
+    docs = loader.load()
+
+    text = "\n".join([doc.page_content for doc in docs])
+    return [Document(page_content=text, metadata={"source": ""})]
+
+
+def load_docx(path: str) -> List[Document]:
+
+    loader = Docx2txtLoader(path)
+    docs = loader.load()
+
+    text = "\n".join([doc.page_content for doc in docs])
+    return [Document(page_content=text, metadata={"source": ""})]
+
+
+SUPPORTED_FILE = {
+    # Images (requires OCR)
+    # "image/jpeg": ".jpg",
+    # "image/png": ".png",
+    # "image/gif": ".gif",
+    # "image/webp": ".webp",
+    # "image/svg+xml": ".svg",
+    # "image/bmp": ".bmp",
+    # "image/tiff": ".tiff",
+    # "image/x-icon": ".ico",
+    # Documents & Applications
+    "application/pdf": ".pdf",
+    # "application/json": ".json",
+    # "application/xml": ".xml",
+    # "application/zip": ".zip",
+    # "application/x-7z-compressed": ".7z",
+    # "application/x-rar-compressed": ".rar",
+    # "application/x-tar": ".tar",
+    # "application/octet-stream": ".bin",
+    # Microsoft Office / Open Office Documents
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    # "application/msword": ".doc",
+    # "application/vnd.ms-excel": ".xls",
+    # "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    # "application/vnd.ms-powerpoint": ".ppt",
+    # "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    # Text Files
+    "text/plain": ".txt",
+    # "text/html": ".html",
+    # "text/css": ".css",
+    # "text/csv": ".csv",
+    # "text/javascript": ".js",
+    # "text/markdown": ".md",
+    # Video (requires transcription)
+    # "video/mp4": ".mp4",
+    # "video/webm": ".webm",
+    # "video/ogg": ".ogv",
+    # "video/quicktime": ".mov",
+    # "video/x-msvideo": ".avi",
+    # Audio (requires transcription)
+    # "audio/mpeg": ".mp3",
+    # "audio/wav": ".wav",
+    # "audio/webm": ".weba",
+    # "audio/ogg": ".ogg",
+    # "audio/midi": ".mid",
+    # "audio/aac": ".aac",
 }

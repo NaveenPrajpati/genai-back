@@ -110,10 +110,9 @@ from langchain_community.retrievers import PineconeHybridSearchRetriever
 from langchain_community.document_compressors import JinaRerank
 from langchain_community.document_transformers import LongContextReorder
 from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
+from langchain_core.runnables import Runnable
 from pinecone_text.sparse import BM25Encoder
-from pydantic import ConfigDict
 
 from app.core.config import (
     get_pinecone_index,
@@ -123,28 +122,6 @@ from app.core.config import (
     RERANKER_MODEL,
     EMBEDDING_MODEL,
 )
-
-
-class _FilteredHybridRetriever(PineconeHybridSearchRetriever):
-    """Thin subclass that adds a metadata filter to every Pinecone query.
-
-    The filter ALWAYS pins results to one `user_id` (multi-tenant isolation) and
-    optionally narrows to a set of `doc_id`s — see `_scope_filter`.
-    """
-
-    metadata_filter: Optional[Dict[str, Any]] = None
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
-
-    def _get_relevant_documents(
-        self,
-        query: str,
-        *,
-        run_manager: CallbackManagerForRetrieverRun,
-        **kwargs: Any,
-    ) -> List[Document]:
-        if self.metadata_filter:
-            kwargs["filter"] = self.metadata_filter
-        return super()._get_relevant_documents(query, run_manager=run_manager, **kwargs)
 
 
 # ── Step 3: embedders (lazy — @cache builds once on first use) ───────────────
@@ -185,20 +162,25 @@ def _scope_filter(user_id: str, doc_ids: Optional[List[str]]) -> Dict[str, Any]:
 
 def _base_hybrid_retriever(
     user_id: str, doc_ids: Optional[List[str]]
-) -> _FilteredHybridRetriever:
+) -> Runnable[str, List[Document]]:
     """
     Step 4: the hybrid (dense + sparse) retriever, scoped to the caller's
     documents (and optionally a subset of doc ids) via Pinecone metadata
     filtering. Built per request — the heavy encoders it references are cached,
     so this is cheap, and the filter is user-specific so it can't be shared.
+
+    `.bind(filter=...)` pins the scope filter onto every `invoke`, so it rides
+    along whether the retriever is called directly or wrapped by the
+    ContextualCompressionRetriever — no retriever subclass needed. The Pinecone
+    retriever forwards the `filter` kwarg straight to `index.query`.
     """
-    return _FilteredHybridRetriever(
+    retriever = PineconeHybridSearchRetriever(
         embeddings=get_embeddings(),
         sparse_encoder=_get_bm25_encoder(),
         index=get_pinecone_index(),
         top_k=RETRIEVER_TOP_K,
-        metadata_filter=_scope_filter(user_id, doc_ids),
     )
+    return retriever.bind(filter=_scope_filter(user_id, doc_ids))
 
 
 def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
@@ -212,12 +194,11 @@ def hybrid_add_texts(texts: List[str], metadatas: List[dict]) -> None:
     (`get_embeddings` / `_get_bm25_encoder`) are cached, so wiring up the
     retriever here per call is cheap.
     """
-    retriever = _FilteredHybridRetriever(
+    retriever = PineconeHybridSearchRetriever(
         embeddings=get_embeddings(),
         sparse_encoder=_get_bm25_encoder(),
         index=get_pinecone_index(),
         top_k=RETRIEVER_TOP_K,
-        metadata_filter=None,
     )
     retriever.add_texts(texts, metadatas=metadatas)
 

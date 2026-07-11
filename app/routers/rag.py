@@ -25,7 +25,13 @@ from app.core.config import EMBEDDING_MODEL
 from app.core.llm import llm
 from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE, INSUFFICIENT_CONTEXT
 from app.services import storage, cache
-from app.services.ingestion import load_url, SUPPORTED_FILE_TYPES
+from app.services.ingestion import (
+    load_url,
+    load_pdf,
+    load_txt,
+    load_docx,
+    SUPPORTED_FILE,
+)
 from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
 from app.services.retrieval import (
     build_retriever,
@@ -56,7 +62,7 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
-@router.get("/get-files", status_code=200)
+@router.get("/get-ingestions", status_code=200)
 async def get_all_files(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
@@ -68,17 +74,27 @@ async def get_all_files(
         raise HTTPException(status_code=500, detail=f"Failed to fetch files: {e}")
 
 
+FILE_LOADERS = {
+    "application/pdf": ("pdf", load_pdf),
+    "text/plain": ("text", load_txt),
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (
+        "docx",
+        load_docx,
+    ),
+}
+
+
 def _resolve_file_mime(file: UploadFile) -> Optional[str]:
     """
     Map an upload to a supported MIME key. Prefer the declared content_type, but
     fall back to the filename extension — clients often send PDFs as
     `application/octet-stream` or `application/x-pdf`.
     """
-    if file.content_type in SUPPORTED_FILE_TYPES:
+    if file.content_type in FILE_LOADERS:
         return file.content_type
     name = (file.filename or "").lower()
-    for mime, spec in SUPPORTED_FILE_TYPES.items():
-        if name.endswith(spec["suffix"]):
+    for mime in FILE_LOADERS:
+        if name.endswith(SUPPORTED_FILE[mime]):
             return mime
     return None
 
@@ -115,15 +131,17 @@ async def ingest_document(
         mime = _resolve_file_mime(file)
         if not mime:
             raise HTTPException(
-                status_code=400, detail="Only PDF and text files are supported"
+                status_code=400, detail="Only PDF, text, and DOCX files are supported"
             )
 
-        spec = SUPPORTED_FILE_TYPES[mime]
-        file_type, loader_cls = spec["file_type"], spec["loader"]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=spec["suffix"]) as tmp:
+        file_type, loader = FILE_LOADERS[mime]
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=SUPPORTED_FILE[mime]
+        ) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
-        loader_fn = lambda: loader_cls(tmp_path).load()
+
+        loader_fn = lambda: loader(tmp_path)
         display_source = file.filename
 
     queued_at = datetime.now(timezone.utc).isoformat()
@@ -145,23 +163,6 @@ async def ingest_document(
         run_ingestion, job_id, loader_fn, display_source, file_type, tmp_path, user_id
     )
     return {"job_id": job_id, "status": "queued", "source": display_source}
-
-
-@router.get("/ingest/status/{job_id}")
-async def ingest_status(
-    job_id: str,
-    current_user: Annotated[dict, Depends(get_current_user)],
-):
-    # The in-memory job dict is keyed only by job_id, so authorize against the
-    # Supabase log (the source of truth for who owns this ingestion).
-    log = await asyncio.to_thread(storage.get_ingestion_log, job_id)
-    if not log or log.get("user_id") != current_user["uid"]:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job = INGESTION_JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
 
 
 @router.delete("/ingest/{doc_id}", status_code=200)
@@ -254,7 +255,9 @@ async def query_documents_stream(
             t_start = time.perf_counter()
             timings: dict = {}  # stage name -> ms, summarised on the `done` event
 
-            def _stage(name: str, ms: float = 0.0, info: str = "", skipped: bool = False) -> str:
+            def _stage(
+                name: str, ms: float = 0.0, info: str = "", skipped: bool = False
+            ) -> str:
                 """One pipeline-stage SSE frame with a REAL server-side timing."""
                 evt: dict = {"type": "stage", "name": name}
                 if skipped:
@@ -322,9 +325,14 @@ async def query_documents_stream(
 
             # ── Cache miss: retrieve → rerank (timed separately) ────────────
             docs, rt = await asyncio.to_thread(
-                retrieve_and_rerank, user_id, request.ingestions or None, request.question
+                retrieve_and_rerank,
+                user_id,
+                request.ingestions or None,
+                request.question,
             )
-            yield _stage("retrieve", rt["retrieve_ms"], f"{rt['candidates']} candidates")
+            yield _stage(
+                "retrieve", rt["retrieve_ms"], f"{rt['candidates']} candidates"
+            )
             if not docs:
                 yield _stage("rerank", skipped=True)
                 yield _sse(

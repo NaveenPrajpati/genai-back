@@ -53,6 +53,7 @@ pinecone-text==0.11.0
 # --- Document loading ---
 pypdf==6.12.2
 beautifulsoup4==4.14.3
+docx2txt==0.9  # .docx text extraction (Docx2txtLoader)
 
 # --- Scheduling ---
 APScheduler==3.11.2
