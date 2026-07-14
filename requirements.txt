@@ -214,6 +214,11 @@ packaging==24.2
     #   langchain-core
     #   langsmith
     #   pinecone-plugin-assistant
+    #   pytesseract
+pillow==12.3.0
+    # via
+    #   -r requirements.in
+    #   pytesseract
 pinecone==7.3.0
     # via -r requirements.in
 pinecone-plugin-assistant==1.8.0
@@ -277,6 +282,8 @@ pypdf==6.12.2
     # via -r requirements.in
 pyroaring==1.1.0
     # via pyiceberg
+pytesseract==0.3.13
+    # via -r requirements.in
 python-dateutil==2.9.0.post0
     # via
     #   pinecone

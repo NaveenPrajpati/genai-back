@@ -61,6 +61,8 @@ WHAT YOU COULD DO TO IMPROVE INGESTION
 from typing import List
 
 import requests
+import pytesseract
+from PIL import Image
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from langchain_core.documents import Document
@@ -147,15 +149,40 @@ def load_docx(path: str) -> List[Document]:
     return [Document(page_content=text, metadata={"source": ""})]
 
 
+def load_image(path: str) -> List[Document]:
+    """
+    OCR an image into a single text Document using Tesseract (pytesseract + Pillow).
+
+    Requires the Tesseract OCR *engine* on the host (the pip package is only a
+    wrapper): macOS `brew install tesseract`, Debian/Ubuntu
+    `apt-get install tesseract-ocr`. The 5 MB upload cap is enforced by the route
+    before this runs.
+    """
+    try:
+        with Image.open(path) as img:
+            text = pytesseract.image_to_string(img)
+    except pytesseract.TesseractNotFoundError as exc:
+        raise ValueError(
+            "Tesseract OCR engine is not installed on the server "
+            "(install `tesseract-ocr` / `brew install tesseract`)"
+        ) from exc
+
+    text = text.strip()
+    if not text:
+        # No extractable text — surface it instead of ingesting an empty doc.
+        raise ValueError("OCR found no readable text in the image")
+    return [Document(page_content=text, metadata={"source": ""})]
+
+
 SUPPORTED_FILE = {
-    # Images (requires OCR)
-    # "image/jpeg": ".jpg",
-    # "image/png": ".png",
+    # Images (OCR via Tesseract; capped at 5 MB by the ingest route)
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
     # "image/gif": ".gif",
-    # "image/webp": ".webp",
     # "image/svg+xml": ".svg",
-    # "image/bmp": ".bmp",
-    # "image/tiff": ".tiff",
     # "image/x-icon": ".ico",
     # Documents & Applications
     "application/pdf": ".pdf",

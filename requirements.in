@@ -54,6 +54,10 @@ pinecone-text==0.11.0
 pypdf==6.12.2
 beautifulsoup4==4.14.3
 docx2txt==0.9  # .docx text extraction (Docx2txtLoader)
+# Image OCR. pytesseract needs the Tesseract OCR *binary* on the host
+# (macOS: `brew install tesseract`; Debian/Ubuntu: `apt-get install tesseract-ocr`).
+pytesseract==0.3.13
+Pillow==12.3.0
 
 # --- Scheduling ---
 APScheduler==3.11.2

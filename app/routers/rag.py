@@ -30,6 +30,7 @@ from app.services.ingestion import (
     load_pdf,
     load_txt,
     load_docx,
+    load_image,
     SUPPORTED_FILE,
 )
 from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
@@ -74,6 +75,10 @@ async def get_all_files(
         raise HTTPException(status_code=500, detail=f"Failed to fetch files: {e}")
 
 
+# Images are OCR'd (Tesseract), which is slow and memory-hungry, so uploads are
+# capped — see MAX_IMAGE_BYTES and the size check in ingest_document.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+
 FILE_LOADERS = {
     "application/pdf": ("pdf", load_pdf),
     "text/plain": ("text", load_txt),
@@ -81,6 +86,11 @@ FILE_LOADERS = {
         "docx",
         load_docx,
     ),
+    "image/jpeg": ("image", load_image),
+    "image/png": ("image", load_image),
+    "image/webp": ("image", load_image),
+    "image/bmp": ("image", load_image),
+    "image/tiff": ("image", load_image),
 }
 
 
@@ -111,7 +121,8 @@ async def ingest_document(
     Queue a source for ingestion and return immediately with a job_id.
 
     action == "url"  → body `data` is JSON {"url": "..."}
-    otherwise        → multipart file upload (pdf or txt); `data` is not required
+    otherwise        → multipart file upload (pdf, txt, docx, or image);
+                       `data` is not required. Images (≤5 MB) are OCR'd.
     """
     job_id = str(uuid.uuid4())
     tmp_path: Optional[str] = None
@@ -131,7 +142,8 @@ async def ingest_document(
         mime = _resolve_file_mime(file)
         if not mime:
             raise HTTPException(
-                status_code=400, detail="Only PDF, text, and DOCX files are supported"
+                status_code=400,
+                detail="Only PDF, text, DOCX, and image (JPEG/PNG/WEBP/BMP/TIFF) files are supported",
             )
 
         file_type, loader = FILE_LOADERS[mime]
@@ -140,6 +152,13 @@ async def ingest_document(
         ) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
+
+        # Images are OCR'd — cap them at 5 MB to bound OCR latency/memory.
+        if file_type == "image" and os.path.getsize(tmp_path) > MAX_IMAGE_BYTES:
+            os.unlink(tmp_path)
+            raise HTTPException(
+                status_code=413, detail="Image exceeds the 5 MB limit"
+            )
 
         loader_fn = lambda: loader(tmp_path)
         display_source = file.filename
