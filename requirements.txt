@@ -276,6 +276,8 @@ pymongo==4.17.0
     # via
     #   -r requirements.in
     #   motor
+pymupdf==1.28.0
+    # via -r requirements.in
 pyparsing==3.3.2
     # via pyiceberg
 pypdf==6.12.2

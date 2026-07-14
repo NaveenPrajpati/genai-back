@@ -58,6 +58,8 @@ docx2txt==0.9  # .docx text extraction (Docx2txtLoader)
 # (macOS: `brew install tesseract`; Debian/Ubuntu: `apt-get install tesseract-ocr`).
 pytesseract==0.3.13
 Pillow==12.3.0
+# Rasterises scanned-PDF pages to images for OCR (no poppler system dep).
+pymupdf==1.28.0
 
 # --- Scheduling ---
 APScheduler==3.11.2

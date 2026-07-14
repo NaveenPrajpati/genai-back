@@ -77,7 +77,7 @@ async def get_all_files(
 
 # Images are OCR'd (Tesseract), which is slow and memory-hungry, so uploads are
 # capped — see MAX_IMAGE_BYTES and the size check in ingest_document.
-MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_BYTES = 2 * 1024 * 1024  # 2 MB
 
 FILE_LOADERS = {
     "application/pdf": ("pdf", load_pdf),
@@ -156,9 +156,7 @@ async def ingest_document(
         # Images are OCR'd — cap them at 5 MB to bound OCR latency/memory.
         if file_type == "image" and os.path.getsize(tmp_path) > MAX_IMAGE_BYTES:
             os.unlink(tmp_path)
-            raise HTTPException(
-                status_code=413, detail="Image exceeds the 5 MB limit"
-            )
+            raise HTTPException(status_code=413, detail="Image exceeds the 5 MB limit")
 
         loader_fn = lambda: loader(tmp_path)
         display_source = file.filename

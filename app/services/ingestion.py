@@ -58,9 +58,11 @@ WHAT YOU COULD DO TO IMPROVE INGESTION
    ingestion time. You can't filter or cite on metadata you never captured.
 """
 
+import io
 from typing import List
 
 import requests
+import pymupdf
 import pytesseract
 from PIL import Image
 from bs4 import BeautifulSoup
@@ -115,6 +117,25 @@ def is_digital_pdf(path):
     return False  # likely scanned
 
 
+def _ocr_pdf(path: str) -> List[Document]:
+    """
+    OCR a scanned PDF: render each page to an image with PyMuPDF (300 DPI) and
+    run it through Tesseract. PyMuPDF rasterises natively, so no poppler binary
+    is needed — only the Tesseract engine (see `_ocr`).
+    """
+    page_texts: List[str] = []
+    with pymupdf.open(path) as doc:
+        for page in doc:
+            pix = page.get_pixmap(dpi=300)
+            with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
+                page_texts.append(_ocr(img))
+
+    text = "\n".join(page_texts).strip()
+    if not text:
+        raise ValueError("OCR found no readable text in the scanned PDF")
+    return [Document(page_content=text, metadata={"source": ""})]
+
+
 def load_pdf(path: str) -> List[Document]:
 
     isDigital = is_digital_pdf(path)
@@ -125,10 +146,8 @@ def load_pdf(path: str) -> List[Document]:
         text = "\n".join([doc.page_content for doc in docs])
         return [Document(page_content=text, metadata={"source": ""})]
     else:
-        # TODO: OCR fallback for scanned PDFs
-        raise ValueError(
-            "Scanned PDF detected — no extractable text (OCR not supported yet)"
-        )
+        # No embedded text layer → scanned/image PDF; fall back to OCR.
+        return _ocr_pdf(path)
 
 
 def load_txt(path: str) -> List[Document]:
@@ -149,25 +168,29 @@ def load_docx(path: str) -> List[Document]:
     return [Document(page_content=text, metadata={"source": ""})]
 
 
-def load_image(path: str) -> List[Document]:
+def _ocr(img: Image.Image) -> str:
     """
-    OCR an image into a single text Document using Tesseract (pytesseract + Pillow).
-
-    Requires the Tesseract OCR *engine* on the host (the pip package is only a
-    wrapper): macOS `brew install tesseract`, Debian/Ubuntu
-    `apt-get install tesseract-ocr`. The 5 MB upload cap is enforced by the route
-    before this runs.
+    Run Tesseract on one PIL image. Requires the Tesseract OCR *engine* on the
+    host (the pip package is only a wrapper): macOS `brew install tesseract`,
+    Debian/Ubuntu `apt-get install tesseract-ocr`.
     """
     try:
-        with Image.open(path) as img:
-            text = pytesseract.image_to_string(img)
+        return pytesseract.image_to_string(img)
     except pytesseract.TesseractNotFoundError as exc:
         raise ValueError(
             "Tesseract OCR engine is not installed on the server "
             "(install `tesseract-ocr` / `brew install tesseract`)"
         ) from exc
 
-    text = text.strip()
+
+def load_image(path: str) -> List[Document]:
+    """
+    OCR an image into a single text Document. The upload size cap is enforced by
+    the route before this runs.
+    """
+    with Image.open(path) as img:
+        text = _ocr(img).strip()
+
     if not text:
         # No extractable text — surface it instead of ingesting an empty doc.
         raise ValueError("OCR found no readable text in the image")
