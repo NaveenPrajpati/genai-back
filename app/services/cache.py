@@ -50,6 +50,17 @@ def scope_key(user_id: str, doc_ids: List[str]) -> str:
     return f"{user_id}::{sources}"
 
 
+async def scope_size(scope: str) -> int:
+    """How many entries are cached under `scope`. Diagnostic only: 0 means the
+    scope key itself didn't match any earlier request (usually a changed doc
+    selection), which is a different problem from entries that were too
+    dissimilar. Never raises."""
+    try:
+        return await redis_client.scard(f"{CACHE_INDEX_PREFIX}{scope}")
+    except Exception:
+        return -1
+
+
 async def invalidate_user(user_id: str) -> int:
     """Drop every cached answer belonging to `user_id`. Returns scopes cleared.
 
@@ -111,6 +122,15 @@ async def lookup_value(
             if sim > best_sim:
                 best_sim, best_value = sim, entry.get("value")
 
+        # A miss has two very different causes that look identical from outside:
+        # no entries in this scope (the scope string didn't match a previous
+        # request), or entries that were simply too dissimilar. Log both numbers
+        # so "always misses" is diagnosable without a debugger.
+        if best_sim < threshold:
+            logger.info(
+                "cache miss scope=%s candidates=%d best_sim=%.3f threshold=%.2f",
+                scope, len(cache_keys), best_sim, threshold,
+            )
         return best_value if best_sim >= threshold else None
     except Exception:
         # Cache must NEVER break a request — degrade gracefully to a cache miss.

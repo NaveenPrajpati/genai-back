@@ -41,8 +41,9 @@ _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 class _Answerable(BaseModel):
     can_answer: bool = Field(
-        description="True only if the context states the specific facts the "
-        "question asks for; False if missing, partial, or tangential."
+        description="True if the context states the specific facts for at least "
+        "one part of the question; False only if it supports no part of it, or is "
+        "merely tangential."
     )
 
 

@@ -24,13 +24,19 @@ CHANGELOG
                 "which/main/best" questions where no single chunk is dispositive,
                 collapsing retrieval_precision to a false 0.0 even when retrieval
                 and the final answer were correct.
+  2026-07-21.1  rag_answer + rag_answerability: partial answers over all-or-
+                nothing refusal. Both prompts framed sufficiency against the WHOLE
+                question, so a compound ask ("job title AND years of experience")
+                refused outright when only one part was thinly supported — even
+                with correct chunks retrieved at 0.77/0.74. Each part answered
+                fine in isolation. Same failure mode as 2026-07-08.1 above.
 """
 
 from dataclasses import dataclass
 
 from langchain_core.prompts import ChatPromptTemplate
 
-PROMPTS_VERSION = "2026-07-06.1"
+PROMPTS_VERSION = "2026-07-21.1"
 
 # ── Grounding sentinels ──────────────────────────────────────────────────────
 # The exact string the model must emit when the context can't support an answer.
@@ -66,7 +72,7 @@ class Prompt:
 # insufficient rather than inventing a plausible-sounding answer.
 RAG_ANSWER = Prompt(
     name="rag_answer",
-    version="2026-07-06.1",
+    version="2026-07-21.1",
     template=ChatPromptTemplate.from_messages(
         [
             (
@@ -79,10 +85,15 @@ RAG_ANSWER = Prompt(
                 "2. After each sentence, cite the source number(s) it came from "
                 "inline, e.g. 'Revenue grew 12% [2].' Every claim must be traceable "
                 "to a numbered source.\n"
-                "3. If the context does NOT contain enough information to answer the "
-                "question, reply with EXACTLY the following token and nothing else: "
+                "3. A question may ask for several things at once. Answer EVERY "
+                "part the context supports, and for any part it does not, say "
+                "plainly that the documents don't cover it. Never withhold a "
+                "supported answer because a different part of the question is "
+                "unsupported.\n"
+                "4. Only if the context supports NO part of the question, reply "
+                "with EXACTLY the following token and nothing else: "
                 f"{INSUFFICIENT_CONTEXT}\n"
-                "4. When refusing, do not apologise, speculate, or add caveats — "
+                "5. When refusing, do not apologise, speculate, or add caveats — "
                 "output only that token.",
             ),
             ("human", "Context:\n{context}\n\nQuestion: {question}"),
@@ -97,16 +108,19 @@ RAG_ANSWER = Prompt(
 # (see services/grounding.py) so the decision is a hard boolean, not free text.
 ANSWERABILITY = Prompt(
     name="rag_answerability",
-    version="2026-07-06.1",
+    version="2026-07-21.1",
     template=ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "You are a strict gate deciding whether a question can be answered "
-                "using ONLY the provided context. Set can_answer=true ONLY if the "
-                "context states the specific facts the question asks for. If the "
-                "needed information is missing, partial, or only tangentially "
-                "related, set can_answer=false. Never use outside knowledge.",
+                "You are a gate deciding whether a question can be answered using "
+                "ONLY the provided context. Set can_answer=true if the context "
+                "states the specific facts for ANY part of the question — a "
+                "question with several parts is answerable when at least one part "
+                "is supported, since the answering step reports the uncovered "
+                "parts itself. Set can_answer=false only when the context supports "
+                "no part of the question, or relates to it only tangentially. "
+                "Never use outside knowledge.",
             ),
             ("human", "Context:\n{context}\n\nQuestion: {question}"),
         ]

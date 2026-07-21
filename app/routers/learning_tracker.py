@@ -54,7 +54,7 @@ async def ask(
     background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    agent = request.app.state.agent
+    agent = request.app.state.learning_agent
 
     thread_id = body.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
@@ -102,7 +102,7 @@ async def ask_stream(
     """Streaming counterpart of /query. Streams the tutor agent's explanation
     token-by-token over SSE; for other intents (quiz, roadmap, …) no tokens are
     emitted and the final state arrives in the `done` event."""
-    agent = request.app.state.agent
+    agent = request.app.state.learning_agent
 
     thread_id = body.thread_id or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
@@ -191,7 +191,7 @@ async def approve(
     request: Request,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
-    agent = request.app.state.agent
+    agent = request.app.state.learning_agent
     config = {"configurable": {"thread_id": body.thread_id}}
 
     # The thread/approval must belong to the caller (prevents IDOR where a user
@@ -306,6 +306,16 @@ async def getPlans(current_user: Annotated[dict, Depends(get_current_user)]):
 
 @router.get("/memory")
 async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
+    """Let the UI show the learner what the system remembers about them."""
+    try:
+        doc = await get_db()["memories"].find_one({"user_id": current_user["uid"]})
+        return {"status": "done", "result": doc.get("data", {}) if doc else {}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/state")
+async def get_state(current_user: Annotated[dict, Depends(get_current_user)]):
     """Let the UI show the learner what the system remembers about them."""
     try:
         doc = await get_db()["memories"].find_one({"user_id": current_user["uid"]})

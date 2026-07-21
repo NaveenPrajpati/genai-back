@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
         # CRUCIAL: Must await setup() to create necessary tables
         await checkpointer.setup()
 
-        app.state.agent = graph.compile(checkpointer=checkpointer)
+        app.state.learning_agent = graph.compile(checkpointer=checkpointer)
         app.state.pa_agent = pa_graph.compile(checkpointer=checkpointer)
         app.state.meal_agent = meal_graph.compile(checkpointer=checkpointer)
         print("Using PostgresSaver checkpointer")
@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
             await checkpointer_context.__aexit__(None, None, None)
             checkpointer_context = None
 
-        app.state.agent = graph.compile(checkpointer=MemorySaver())
+        app.state.learning_agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
         app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
 
@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         run_triggers,
         CronTrigger(minute=0),
-        args=[app.state.agent],
+        args=[app.state.learning_agent],
     )
     # Personal-assistant task digest: hourly sweep, fires per user at their
     # chosen schedule_hour/timezone (default 08:00 daily).
@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
     # --- SHUTDOWN PHASE ---
     # Clean up Postgres checkpointer if it was successfully running
     if checkpointer_context and not isinstance(
-        app.state.agent.checkpointer, MemorySaver
+        app.state.learning_agent.checkpointer, MemorySaver
     ):
         print("Closing Postgres checkpointer connection...")
         await checkpointer_context.__aexit__(None, None, None)

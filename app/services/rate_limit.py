@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def client_ip(request: Request) -> str:
-    """Best-effort client IP. Behind a proxy (Vercel/AWS ALB), the real client
+    """Best-effort client IP. Behind a proxy (AWS ALB), the real client
     is the first entry in X-Forwarded-For."""
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
@@ -53,11 +53,15 @@ async def enforce(key: str, limit: int, window_seconds: int) -> None:
         )
 
 
-async def limit_ip(request: Request, name: str, limit: int, window_seconds: int) -> None:
+async def limit_ip(
+    request: Request, name: str, limit: int, window_seconds: int
+) -> None:
     """Rate-limit by client IP, namespaced by `name` (the endpoint)."""
     await enforce(f"{name}:ip:{client_ip(request)}", limit, window_seconds)
 
 
-async def limit_key(name: str, identifier: str, limit: int, window_seconds: int) -> None:
+async def limit_key(
+    name: str, identifier: str, limit: int, window_seconds: int
+) -> None:
     """Rate-limit by an arbitrary identifier (e.g. email), namespaced by `name`."""
     await enforce(f"{name}:key:{identifier.lower()}", limit, window_seconds)

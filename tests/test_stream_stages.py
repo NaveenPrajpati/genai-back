@@ -59,6 +59,17 @@ def client(monkeypatch):
     monkeypatch.setattr(rag.cache, "lookup", _cache_miss)
     monkeypatch.setattr(rag.cache, "save", _cache_save)
     monkeypatch.setattr(rag.storage, "save_messages", lambda **_k: None)
+    # The stream opens a chat up front when the request carries no chat_id, so
+    # this must be faked too — unfaked it inserts a real row into Supabase.
+    monkeypatch.setattr(
+        rag.storage,
+        "create_chat",
+        lambda title, user_id=None: {
+            "id": "chat-test-1",
+            "title": title,
+            "user_id": user_id,
+        },
+    )
 
     docs = [
         Document(
@@ -100,7 +111,11 @@ def test_stream_emits_real_stage_timings(client):
     assert stages["retrieve"]["ms"] == 12.0
     assert stages["retrieve"]["info"] == "5 candidates"
     assert stages["rerank"]["ms"] == 8.0
-    assert stages["cache"]["info"] == "miss"
+    # A miss reports the scope it looked in and how many entries that scope held,
+    # so a cache that never hits can be told apart from a scope that never matched.
+    assert stages["cache"]["info"].startswith("miss")
+    assert "scope=user-1::__all__" in stages["cache"]["info"]
+    assert "entries=0" in stages["cache"]["info"]
     assert stages["gate"]["info"] == "answerable"
     assert all("ms" in s for s in stages.values())
 

@@ -18,8 +18,8 @@ class CreateChatRequest(BaseModel):
 async def create_chat_route(body: CreateChatRequest):
     """Create a new chat session. Title defaults to 'New Chat'."""
     try:
-        chat_id = storage.create_chat(body.title or "New Chat")
-        return {"message": "chat created", "data": storage.get_chat(chat_id)}
+        chat = storage.create_chat(body.title or "New Chat")
+        return {"message": "chat created", "data": chat}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

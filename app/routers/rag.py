@@ -256,9 +256,6 @@ async def query_documents(
     return result
 
 
-# ── Query (streaming + semantic cache) ───────────────────────────────────────
-
-
 @router.post("/query/stream")
 async def query_documents_stream(
     request: QueryRequest, current_user: Annotated[dict, Depends(get_current_user)]
@@ -268,9 +265,23 @@ async def query_documents_stream(
     scope = cache.scope_key(user_id, request.ingestions)
 
     async def generate():
+        nonlocal chat_id
         try:
             t_start = time.perf_counter()
             timings: dict = {}  # stage name -> ms, summarised on the `done` event
+
+            # Open the chat BEFORE streaming when the client didn't name one, and
+            # announce the full row as the first frame so the UI can render it
+            # immediately. Persistence is fire-and-forget, so a chat created down
+            # in _persist wouldn't exist yet when `done` is emitted — the client
+            # would get chat_id: null, have nothing to send back, and start a new
+            # chat on every question.
+            if not chat_id:
+                chat = await asyncio.to_thread(
+                    storage.create_chat, request.question, user_id
+                )
+                chat_id = chat["id"]
+                yield _sse({"type": "chat", "chat": chat, "created": True})
 
             def _stage(
                 name: str, ms: float = 0.0, info: str = "", skipped: bool = False
@@ -308,8 +319,14 @@ async def query_documents_stream(
             # ── Semantic cache check ────────────────────────────────────────
             t = time.perf_counter()
             cached = await cache.lookup(query_embedding, scope)
+            # Report the scope on a miss: a cached answer is only replayed within
+            # the same (user, doc set), so a doc selection that changes between
+            # questions misses every time — and looks identical to a broken cache.
+            n_scoped = await cache.scope_size(scope)
             yield _stage(
-                "cache", (time.perf_counter() - t) * 1000, "hit" if cached else "miss"
+                "cache",
+                (time.perf_counter() - t) * 1000,
+                "hit" if cached else f"miss (scope={scope}, entries={n_scoped})",
             )
 
             if cached:
@@ -340,7 +357,6 @@ async def query_documents_stream(
                 yield _done(cached=True)
                 return
 
-            # ── Cache miss: retrieve → rerank (timed separately) ────────────
             docs, rt = await asyncio.to_thread(
                 retrieve_and_rerank,
                 user_id,

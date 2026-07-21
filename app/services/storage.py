@@ -8,7 +8,7 @@ readable and you could swap Supabase for Postgres/Mongo by editing one file.
 """
 
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from app.core.config import supabase
 
@@ -66,15 +66,22 @@ def list_ingestion_logs(user_id) -> list:
     )
 
 
-def create_chat(title: str) -> str:
-    """Insert a new chat and return its id."""
+def create_chat(title: str, user_id: Optional[str] = None) -> dict:
+    """Insert a new chat and return the full inserted row.
+
+    Returns the whole record (not just the id) so callers can hand the client a
+    complete chat object without a follow-up read.
+
+    `user_id` is optional only for backwards compatibility with the bare
+    POST /chat route; without it the row is invisible to `list_chats`, which
+    filters by user_id.
+    """
     now = _now()
-    row = (
-        supabase.table("rag_chats")
-        .insert({"title": title[:200], "created_at": now, "updated_at": now})
-        .execute()
-    )
-    return row.data[0]["id"]
+    record = {"title": title[:200], "created_at": now, "updated_at": now}
+    if user_id:
+        record["user_id"] = user_id
+    row = supabase.table("rag_chats").insert(record).execute()
+    return row.data[0]
 
 
 def list_chats(user_id) -> list:
@@ -125,13 +132,21 @@ def save_messages(
     user_id: str,
     sources: list,
     ingestions: List[str],
-) -> None:
-    """Insert the user + assistant message pair and bump the chat's updated_at."""
+) -> str:
+    """Insert the user + assistant message pair and bump the chat's updated_at.
+
+    Returns the chat id the turn was written to — callers MUST report this back
+    to the client when they passed no chat_id, or the client can never continue
+    the chat it just started and every question opens a new one.
+    """
     now = _now()
     if chat_id:
-        supabase.table("rag_chats").update(
-            {"updated_at": now, "title": question[:50]}
-        ).eq("id", chat_id).execute()
+        # Only bump the timestamp: the title is set from the FIRST question when
+        # the chat is created. Rewriting it here made an existing chat's title
+        # change to whatever was asked last, so it never looked like one thread.
+        supabase.table("rag_chats").update({"updated_at": now}).eq(
+            "id", chat_id
+        ).execute()
     else:
         row = (
             supabase.table("rag_chats")
@@ -166,3 +181,4 @@ def save_messages(
             },
         ]
     ).execute()
+    return chat_id
