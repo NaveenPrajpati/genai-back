@@ -1,5 +1,5 @@
 """
-services/storage.py
+services/rag/storage.py
 ===================
 All Supabase reads/writes in one place: ingestion logs, chats, and messages.
 

@@ -235,3 +235,23 @@ def test_capture_writes_jsonl(tmp_path, monkeypatch):
     assert rec["kind"] == "tool_call"
     assert rec["output"]["tool_calls"][0]["args"] == {"title": "Buy milk"}
     assert rec["messages"][0]["content"] == "buy milk"
+
+
+# ── RAG eval: judge-reply parsing (services/evaluation._to_unit_float) ────────
+# Regression guard for the "scores look unreliable" bug: judges are told to
+# return a bare decimal, but the old strict float() scored 0.0 the instant a
+# reply carried any prose, silently dragging recall/hallucination down.
+def test_to_unit_float_parses_bare_and_chatty_replies():
+    from app.services.rag.step7_evaluation import _to_unit_float
+
+    assert _to_unit_float("1.0") == 1.0
+    assert _to_unit_float("0.0") == 0.0
+    assert _to_unit_float("  0.95 ") == 0.95
+    # prose around the number must not zero the score
+    assert _to_unit_float("0.8 — mostly covered") == 0.8
+    assert _to_unit_float("score: 0.3") == 0.3
+    # clamped to [0, 1]
+    assert _to_unit_float("1.7") == 1.0
+    assert _to_unit_float("-0.5") == 0.0
+    # genuinely no number → 0.0
+    assert _to_unit_float("N/A") == 0.0

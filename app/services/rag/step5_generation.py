@@ -1,12 +1,12 @@
 """
-services/generation.py
+services/rag/step5_generation.py
 ======================
 STEP 6 HELPERS: turning reranked docs into (a) the numbered context string the
 LLM sees and (b) the source citations the user sees.
 
 Context and sources share ONE citation numbering so a `[n]` the model writes in
 its answer maps back to exactly `sources[n]`. That mapping is what makes citation
-enforcement possible (see services/grounding.py): we can check the answer only
+enforcement possible (see step6_grounding.py): we can check the answer only
 cites real, retrieved sources.
 
 These are small, pure functions deliberately separated from the route so they can
@@ -15,7 +15,7 @@ be unit-tested without spinning up FastAPI, Pinecone, or the LLM.
 
 from typing import List, Tuple
 
-from app.services.retrieval import reorder
+from app.services.rag.step4_retrieval import reorder
 
 
 def _dedup(docs: list) -> list:

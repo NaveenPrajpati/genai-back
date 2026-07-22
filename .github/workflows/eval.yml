@@ -1,9 +1,15 @@
 name: RAG eval (report-only)
 
 # Runs the offline RAG answer-quality eval on every PR. Currently REPORT-ONLY:
-# it prints the scorecard but does not block the merge. To turn it into a hard
-# gate once thresholds are calibrated, add `--gate` to the eval command and drop
-# `continue-on-error` from that step (see RAG_EVALUATION_PLAN.md).
+# it prints the scorecard but does not block the merge.
+#
+# Thresholds were calibrated 2026-07-22 (see THRESHOLDS in eval_harness.py), so
+# the hard gate is READY TO ENABLE. To switch it on after a few more report-only
+# runs confirm the scores are stable:
+#   1. comment out the "RAG answer eval (report-only)" step below, and
+#   2. uncomment the "RAG answer eval (HARD GATE)" step right after it.
+# The gate step drops `continue-on-error` and adds `--gate`, so a metric dropping
+# below its threshold fails the check and blocks the merge.
 
 on:
   pull_request:
@@ -29,7 +35,7 @@ jobs:
       # Deterministic, no keys required — guards the harness/scoring logic itself.
       # This step DOES block: if it fails, the eval code is broken.
       - name: Harness self-test (offline)
-        run: .venv/bin/python -m app.evals.rag_eval --self-test
+        run: .venv/bin/python -m app.services.rag.eval_harness --self-test
 
       # Real eval against the golden set. Report-only: never blocks the merge yet.
       # Frozen-context mode needs no Pinecone/Redis — only OpenAI for generation +
@@ -41,8 +47,21 @@ jobs:
           SUPABASE_URL: "https://placeholder.supabase.co"
           SUPABASE_KEY: "placeholder-unused-in-frozen-context-eval"
         run: |
-          .venv/bin/python -m app.evals.rag_eval \
-            --data app/evals/datasets/rag_golden.jsonl | tee eval-report.json
+          .venv/bin/python -m app.services.rag.eval_harness \
+            --data app/services/rag/datasets/rag_golden.jsonl | tee eval-report.json
+
+      # ── HARD GATE (disabled) ─────────────────────────────────────────────────
+      # Enable by commenting out the report-only step above and uncommenting this.
+      # Same run as above but WITHOUT `continue-on-error` and WITH `--gate`, so the
+      # step exits non-zero (failing the PR) when a metric drops below threshold.
+      # - name: RAG answer eval (HARD GATE)
+      #   env:
+      #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      #     SUPABASE_URL: "https://placeholder.supabase.co"
+      #     SUPABASE_KEY: "placeholder-unused-in-frozen-context-eval"
+      #   run: |
+      #     .venv/bin/python -m app.services.rag.eval_harness \
+      #       --data app/services/rag/datasets/rag_golden.jsonl --gate | tee eval-report.json
 
       - name: Upload scorecard
         if: always()

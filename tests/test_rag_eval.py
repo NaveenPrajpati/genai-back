@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app.evals import rag_eval
+from app.services.rag import eval_harness as rag_eval
 
 
 # --------------------------------------------------------------------------- #

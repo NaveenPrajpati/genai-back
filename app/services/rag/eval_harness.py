@@ -6,7 +6,7 @@ hand-verified golden set, and (optionally) FAIL a build when quality regresses.
 
 This complements evals/harness.py — that one grades agent structured-output
 distillation (field_match); THIS one grades RAG *answer quality*: the metrics that
-matter for the grounding work in services/grounding.py.
+matter for the grounding work in step6_grounding.py.
 
 ──────────────────────────────────────────────────────────────────────────────
 MODE — frozen context
@@ -34,16 +34,16 @@ METRICS
 USAGE
 ──────────────────────────────────────────────────────────────────────────────
   # offline sanity-check of scoring/aggregation (NO API keys, NO network):
-  python -m app.evals.rag_eval --self-test
+  python -m app.services.rag.eval_harness --self-test
 
   # real eval against the currently-configured llm:
-  python -m app.evals.rag_eval --data app/evals/datasets/rag_golden.jsonl
+  python -m app.services.rag.eval_harness --data app/services/rag/datasets/rag_golden.jsonl
 
   # same, but exit non-zero when below threshold (flip on in CI when ready):
-  python -m app.evals.rag_eval --data app/evals/datasets/rag_golden.jsonl --gate
+  python -m app.services.rag.eval_harness --data app/services/rag/datasets/rag_golden.jsonl --gate
 
   # use RAGAS for faithfulness instead of the built-in judge (needs `pip install ragas`):
-  python -m app.evals.rag_eval --data ... --scorer ragas
+  python -m app.services.rag.eval_harness --data ... --scorer ragas
 
 IMPORTANT: every `app.*` import in this file is LAZY (inside a function), so the
 pure scorers, the tests, and `--self-test` run with no env vars and no network —
@@ -61,16 +61,26 @@ from typing import Any, Awaitable, Callable, Optional
 
 # ── Pass/fail thresholds (the CI gate's bar) ─────────────────────────────────
 # Set the bar BELOW the score you actually observe, so normal LLM-judge noise
-# never false-blocks a PR — only a real regression does. Tune after a burn-in
-# period of report-only runs (see RAG_EVALUATION_PLAN.md).
+# never false-blocks a PR — only a real regression does.
+#
+# Calibrated 2026-07-22 against the golden set (13 rows: 9 answerable, 4 refusal),
+# after the eval_hallucination judge fix. Observed all four metrics at ceiling:
+# correctness 1.00, faithfulness 1.00, refusal_accuracy 1.00, over_refusal 0.00.
+# The set is small, so one flipped row moves a metric a lot — bars are set to
+# absorb a single noisy row but catch a genuine (≥2-row) regression:
+#   • correctness      9 rows → one miss = 0.889; 0.85 tolerates 1, fails at 2.
+#   • faithfulness     9 rows, LLM judge → 0.90 absorbs judge noise, catches real ungrounding.
+#   • refusal_accuracy 4 rows → one miss = 0.75 < 0.90; every refusal must hold.
+#   • over_refusal     9 rows → one false refusal = 0.111 < 0.15; fails at 2.
+# Re-run report-only and re-tune whenever the golden set or the judges change.
 THRESHOLDS: dict[str, float] = {
-    "correctness": 0.80,       # ≥
-    "faithfulness": 0.85,      # ≥
+    "correctness": 0.85,       # ≥
+    "faithfulness": 0.90,      # ≥
     "refusal_accuracy": 0.90,  # ≥
-    "max_over_refusal": 0.20,  # ≤
+    "max_over_refusal": 0.15,  # ≤
 }
 
-DEFAULT_DATA = "app/evals/datasets/rag_golden.jsonl"
+DEFAULT_DATA = "app/services/rag/datasets/rag_golden.jsonl"
 
 # Types for the injectable strategy fns (real | stub | ragas) — keeps run_eval
 # pure and offline-testable.
@@ -198,7 +208,7 @@ async def real_generate(record: dict) -> tuple[str, bool]:
     gate → generate → sentinel check. Returns (answer, refused)."""
     from app.core.llm import llm
     from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE
-    from app.services.grounding import is_answerable, is_refusal
+    from app.services.rag.step6_grounding import is_answerable, is_refusal
 
     context = format_context(record.get("context") or [])
     question = record["question"]
@@ -215,7 +225,7 @@ async def real_generate(record: dict) -> tuple[str, bool]:
 
 async def own_faithfulness(record: dict, answer: str) -> float:
     """Faithfulness via the built-in judge (services/evaluation): 1 − hallucination."""
-    from app.services.evaluation import _score_hallucination
+    from app.services.rag.step7_evaluation import _score_hallucination
 
     context = format_context(record.get("context") or [])
     return round(1.0 - await _score_hallucination(context, answer), 4)

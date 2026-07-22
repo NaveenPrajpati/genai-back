@@ -30,13 +30,20 @@ CHANGELOG
                 refused outright when only one part was thinly supported — even
                 with correct chunks retrieved at 0.77/0.74. Each part answered
                 fine in isolation. Same failure mode as 2026-07-08.1 above.
+  2026-07-22.1  eval_hallucination: stop penalising honest "not covered"
+                disclaimers. A partial-coverage compound answer ("…pricing is X
+                [1]. The documents don't cover the refund policy.") scored 0.5
+                faithfulness because the judge counted the absence-of-fact
+                disclaimer as an unsupported claim — dragging the metric down for
+                exactly the grounded behaviour rag_answer 2026-07-21.1 introduced.
+                Now only POSITIVE claims are judged for support.
 """
 
 from dataclasses import dataclass
 
 from langchain_core.prompts import ChatPromptTemplate
 
-PROMPTS_VERSION = "2026-07-21.1"
+PROMPTS_VERSION = "2026-07-22.1"
 
 # ── Grounding sentinels ──────────────────────────────────────────────────────
 # The exact string the model must emit when the context can't support an answer.
@@ -169,15 +176,21 @@ EVAL_RECALL = Prompt(
 
 EVAL_HALLUCINATION = Prompt(
     name="eval_hallucination",
-    version="2026-07-06.1",
+    version="2026-07-22.1",
     template=ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 "You are a hallucination detector. Rate what fraction of the answer "
                 "contains claims NOT supported by the provided context. "
-                "0.0 = fully grounded, 1.0 = fully hallucinated. Return only a "
-                "decimal number.",
+                "0.0 = fully grounded, 1.0 = fully hallucinated.\n"
+                "A hallucination is a POSITIVE claim of fact that the context does "
+                "not support. Do NOT count as hallucination a statement that the "
+                "context LACKS some information — e.g. 'the documents don't cover "
+                "the refund policy' or 'the context does not mention X'. Such a "
+                "disclaimer asserts the ABSENCE of a fact, which is the honest, "
+                "grounded thing to do, not an invented fact. Judge only the "
+                "positive claims for support. Return only a decimal number.",
             ),
             ("human", "Context: {context}\n\nAnswer: {answer}"),
         ]

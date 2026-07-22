@@ -163,7 +163,7 @@ async def cached_value(text: str, scope: str, threshold: float, produce) -> dict
     embedding = None
     try:
         # Lazy import avoids a cache→retrieval import cycle at module load.
-        from app.services.retrieval import get_embeddings
+        from app.services.rag.step4_retrieval import get_embeddings
 
         embedding = await get_embeddings().aembed_query(text)
         hit = await lookup_value(embedding, scope, threshold)

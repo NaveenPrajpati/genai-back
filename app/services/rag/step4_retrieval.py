@@ -1,5 +1,5 @@
 """
-services/retrieval.py
+services/rag/step4_retrieval.py
 =====================
 STEPS 3, 4 & 5 OF THE RAG PIPELINE, assembled in one place because they form a
 single chain:  EMBEDDING → RETRIEVAL → RE-RANKING → CONTEXT ORDERING.

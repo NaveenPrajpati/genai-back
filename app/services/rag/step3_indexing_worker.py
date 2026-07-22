@@ -1,5 +1,5 @@
 """
-ingestion_worker
+services/rag/step3_indexing_worker.py
 
 The BACKGROUND TASK that runs the full ingest pipeline for one source:
 
@@ -25,9 +25,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from app.utils.chunking import get_splitter, SplitStrategy
-from app.services.retrieval import hybrid_add_texts
-from app.services import storage, cache
+from app.services.rag.step2_chunking import get_splitter, SplitStrategy
+from app.services.rag.step4_retrieval import hybrid_add_texts
+from app.services import cache
+from app.services.rag import storage
 
 logger = logging.getLogger(__name__)
 

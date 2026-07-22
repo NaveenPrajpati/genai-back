@@ -1,5 +1,5 @@
 """
-utils/chunking.py
+services/rag/step2_chunking.py
 =================
 STEP 2 OF THE RAG PIPELINE: CHUNKING (a.k.a. "splitting")
 

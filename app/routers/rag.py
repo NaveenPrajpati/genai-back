@@ -24,8 +24,9 @@ from app.dependencies import get_current_user
 from app.core.config import EMBEDDING_MODEL
 from app.core.llm import llm
 from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE, INSUFFICIENT_CONTEXT
-from app.services import storage, cache
-from app.services.ingestion import (
+from app.services import cache
+from app.services.rag import storage
+from app.services.rag.step1_ingestion import (
     load_url,
     load_pdf,
     load_txt,
@@ -33,18 +34,33 @@ from app.services.ingestion import (
     load_image,
     SUPPORTED_FILE,
 )
-from app.services.ingestion_worker import run_ingestion, INGESTION_JOBS
-from app.services.retrieval import (
+from app.services.rag.step3_indexing_worker import run_ingestion, INGESTION_JOBS
+from app.services.rag.step4_retrieval import (
     build_retriever,
     get_embeddings,
     delete_doc_vectors,
     retrieve_and_rerank,
 )
-from app.services.generation import prepare_context, cited_sources
-from app.services.grounding import is_answerable, is_refusal, cited_numbers
-from app.services.evaluation import run_evaluation
+from app.services.rag.step5_generation import prepare_context, cited_sources
+from app.services.rag.step6_grounding import is_answerable, is_refusal, cited_numbers
+from app.services.rag.step7_evaluation import run_evaluation
 
 logger = logging.getLogger(__name__)
+
+# Strong references to fire-and-forget background tasks. asyncio.ensure_future
+# returns a task the event loop keeps only a WEAK reference to, so an unreferenced
+# one can be garbage-collected mid-await — which is why backgrounded cache/DB
+# writes were silently lost and repeat questions kept missing the cache. Holding a
+# reference until the task finishes prevents that.
+_background_tasks: set = set()
+
+
+def _spawn(coro) -> None:
+    """Schedule `coro` as a background task and keep it alive until it completes."""
+    task = asyncio.ensure_future(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 router = APIRouter(
     prefix="/rag", tags=["rag"], responses={404: {"description": "Not found"}}
@@ -342,7 +358,7 @@ async def query_documents_stream(
                     await asyncio.sleep(0)
                 yield _stage("stream", (time.perf_counter() - t) * 1000, "cache replay")
                 t = time.perf_counter()
-                asyncio.ensure_future(
+                _spawn(
                     asyncio.to_thread(
                         storage.save_messages,
                         chat_id=chat_id,
@@ -381,7 +397,7 @@ async def query_documents_stream(
 
             def _persist(answer: str, srcs: list) -> None:
                 """Fire-and-forget: save one Q&A turn to chat history."""
-                asyncio.ensure_future(
+                _spawn(
                     asyncio.to_thread(
                         storage.save_messages,
                         chat_id=chat_id,
@@ -463,10 +479,17 @@ async def query_documents_stream(
             used = cited_sources(sources, cited)
             yield _sse({"type": "citations", "cited": sorted(cited)})
 
-            # Fire-and-forget: cache the result + persist the messages. Only real,
-            # grounded answers are cached — never a refusal.
+            # Cache the result, then persist the messages. Only real, grounded
+            # answers are cached — never a refusal.
             t = time.perf_counter()
-            asyncio.ensure_future(cache.save(query_embedding, scope, used, full_answer))
+            # Await the cache write: its entire purpose is to be found by the NEXT
+            # identical question, and those Redis writes on the already-computed
+            # embedding take ~1ms. Backgrounding it (as this once did) meant the
+            # write routinely hadn't landed — or was GC'd — before the repeat came
+            # in, so the same question missed over and over.
+            await cache.save(query_embedding, scope, used, full_answer)
+            # Chat-history persist stays backgrounded (a slower Supabase round-trip
+            # the response doesn't need to wait on), now with a strong task ref.
             _persist(full_answer, used)
             yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
 
