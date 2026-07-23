@@ -41,6 +41,9 @@ ENV/
 .env
 .env.local
 
+# Monitoring secrets (real configs; commit only the *.example templates)
+monitoring/alertmanager/alertmanager.yml
+
 chroma_langchain_db
 
 finetune

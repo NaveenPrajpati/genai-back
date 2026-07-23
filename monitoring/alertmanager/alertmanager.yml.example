@@ -1,0 +1,41 @@
+# Copy to alertmanager.yml and fill in your SMTP details, then `docker compose up -d`.
+# alertmanager.yml is git-ignored so your SMTP password never lands in the repo.
+#
+# Examples of common smarthosts:
+#   Gmail / Google Workspace : smtp.gmail.com:587      (use an App Password)
+#   AWS SES                  : email-smtp.<region>.amazonaws.com:587
+#   SendGrid                 : smtp.sendgrid.net:587    (username literally "apikey")
+
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: "smtp.example.com:587"
+  smtp_from: "aiengineer-alerts@example.com"
+  smtp_auth_username: "REPLACE_ME"
+  smtp_auth_password: "REPLACE_ME"
+  smtp_require_tls: true
+
+route:
+  receiver: ops-email
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Page criticals more aggressively than warnings.
+    - matchers: ['severity="critical"']
+      receiver: ops-email
+      repeat_interval: 1h
+
+receivers:
+  - name: ops-email
+    email_configs:
+      - to: "oncall@example.com"
+        send_resolved: true
+        headers:
+          subject: '{{ .Status | toUpper }} [{{ .CommonLabels.severity }}] {{ .CommonLabels.alertname }}'
+
+# Don't email a warning about the same thing a critical already covers.
+inhibit_rules:
+  - source_matchers: ['severity="critical"']
+    target_matchers: ['severity="warning"']
+    equal: ["alertname"]

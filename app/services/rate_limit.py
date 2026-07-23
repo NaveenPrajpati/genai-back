@@ -65,3 +65,13 @@ async def limit_key(
 ) -> None:
     """Rate-limit by an arbitrary identifier (e.g. email), namespaced by `name`."""
     await enforce(f"{name}:key:{identifier.lower()}", limit, window_seconds)
+
+
+async def limit_user(
+    name: str, user_id: str, limit: int, window_seconds: int
+) -> None:
+    """Rate-limit by authenticated user id, namespaced by `name` (the endpoint).
+    Used on the cost-bearing RAG endpoints — the per-user complement to the
+    global daily spend cap (the cap bounds total $/day; this bounds one user's
+    request rate). Fails open on a Redis outage, like the auth limiters."""
+    await enforce(f"{name}:user:{user_id}", limit, window_seconds)

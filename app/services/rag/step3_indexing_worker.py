@@ -27,8 +27,10 @@ from typing import Callable, Optional
 
 from app.services.rag.step2_chunking import get_splitter, SplitStrategy
 from app.services.rag.step4_retrieval import hybrid_add_texts
+from app.services.rag import content_safety
 from app.services import cache
 from app.services.rag import storage
+from app.core import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +61,28 @@ async def run_ingestion(
         chunks = await asyncio.to_thread(_splitter.split_documents, documents)
 
         ingested_at = datetime.now(timezone.utc).isoformat()
-        texts = [c.page_content for c in chunks]
+        # Sanitise BEFORE embedding/storing: strip zero-width/control chars used
+        # to hide injected instructions, so what we index (and later feed the LLM)
+        # is the canonical, visible text (see content_safety).
+        texts = [content_safety.sanitize_text(c.page_content) for c in chunks]
         total = len(chunks)
+
+        # Heuristic injection scan — flag-and-keep: chunks are still ingested (a
+        # false positive must not drop real content), but a rising metric/log is
+        # the alarm. The prompt layer does the actual refusing at answer time.
+        flagged = 0
+        for text in texts:
+            hits = content_safety.scan_for_injection(text)
+            if hits:
+                flagged += 1
+                metrics.record_injection_flags(hits)
+        if flagged:
+            logger.warning(
+                "ingestion %s: %d/%d chunk(s) flagged as possible prompt-injection "
+                "(source=%s, user=%s) — ingested anyway; prompt-layer defenses apply",
+                job_id, flagged, total, display_source, user_id,
+            )
+
         metadatas = [
             {
                 "doc_id": job_id,

@@ -25,11 +25,28 @@ small human-labelled gold set and measure against it.
 """
 
 import re
+import random
 import asyncio
 from typing import List
 
-from app.core.llm import llm
+from app.core.llm import fast_llm
+from app.core.config import RAG_EVAL_SAMPLE_RATE
 from app.core.prompts import EVAL_RELEVANCE, EVAL_RECALL, EVAL_HALLUCINATION
+
+
+def should_evaluate(requested: bool) -> bool:
+    """Server-side gate on running eval, so a client that always sets
+    evaluate=True can't multiply per-query cost. Even when eval is requested,
+    run it only for a sampled fraction (RAG_EVAL_SAMPLE_RATE): rate>=1 runs
+    every requested eval, rate<=0 disables it, in between is a random draw.
+    The client flag stays a *ceiling* — we never eval what wasn't requested."""
+    if not requested:
+        return False
+    if RAG_EVAL_SAMPLE_RATE >= 1.0:
+        return True
+    if RAG_EVAL_SAMPLE_RATE <= 0.0:
+        return False
+    return random.random() < RAG_EVAL_SAMPLE_RATE
 
 # The judge must see WHAT THE SYSTEM ACTUALLY USED, or its score describes a
 # different input than the reranker/generator saw and can't be trusted. The old
@@ -40,7 +57,7 @@ from app.core.prompts import EVAL_RELEVANCE, EVAL_RECALL, EVAL_HALLUCINATION
 # retrieval_precision read 0.00 next to a grounded answer. These caps are only a
 # runaway-token guard, set well above real chunk/context sizes, not a content
 # window: judging must not silently drop the part that matters.
-_MAX_DOC_CHARS = 6000       # one chunk; comfortably above p95 SemanticChunker size
+_MAX_DOC_CHARS = 6000  # one chunk; comfortably above p95 SemanticChunker size
 _MAX_CONTEXT_CHARS = 24000  # the assembled multi-chunk context
 
 _NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+")
@@ -61,7 +78,7 @@ def _to_unit_float(text: str) -> float:
 
 async def _score_doc_relevance(question: str, content: str) -> float:
     """Binary relevance: 1.0 if this chunk helps answer the question, else 0.0."""
-    msg = await (EVAL_RELEVANCE | llm).ainvoke(
+    msg = await (EVAL_RELEVANCE | fast_llm).ainvoke(
         {"question": question, "content": content[:_MAX_DOC_CHARS]}
     )
     return 1.0 if "YES" in msg.content.upper() else 0.0
@@ -69,7 +86,7 @@ async def _score_doc_relevance(question: str, content: str) -> float:
 
 async def _score_recall(question: str, context: str) -> float:
     """How completely does the context cover the answer? 0 = useless, 1 = complete."""
-    msg = await (EVAL_RECALL | llm).ainvoke(
+    msg = await (EVAL_RECALL | fast_llm).ainvoke(
         {"question": question, "context": context[:_MAX_CONTEXT_CHARS]}
     )
     return _to_unit_float(msg.content)
@@ -77,7 +94,7 @@ async def _score_recall(question: str, context: str) -> float:
 
 async def _score_hallucination(context: str, answer: str) -> float:
     """Fraction of the answer NOT supported by context. 0 = grounded, 1 = made up."""
-    msg = await (EVAL_HALLUCINATION | llm).ainvoke(
+    msg = await (EVAL_HALLUCINATION | fast_llm).ainvoke(
         {"context": context[:_MAX_CONTEXT_CHARS], "answer": answer}
     )
     return _to_unit_float(msg.content)
@@ -94,7 +111,9 @@ async def run_evaluation(question: str, docs: list, context: str, answer: str) -
     relevance_scores: List[float] = list(results[: len(docs)])
     recall_score = results[-2]
     hallucination_rate = results[-1]
-    precision = sum(relevance_scores) / len(relevance_scores) if relevance_scores else 0.0
+    precision = (
+        sum(relevance_scores) / len(relevance_scores) if relevance_scores else 0.0
+    )
     return {
         "retrieval_precision": round(precision, 3),
         "recall_score": recall_score,

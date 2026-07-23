@@ -45,6 +45,50 @@ RERANK_TOP_N = 5  # how many survive the rerank
 # services/grounding.py. Kill switch for debugging / latency-sensitive callers.
 RAG_GROUNDING_GATE = os.getenv("RAG_GROUNDING_GATE", "1") == "1"
 
+# --- Evaluation sampling ---
+# LLM-as-judge eval (step7) fires N+2 model calls per query, so a caller that
+# always sets evaluate=True multiplies per-query cost. This decouples ACTUAL eval
+# execution from the raw client flag: even when eval is requested, run it only for
+# this fraction of queries. 1.0 = run every requested eval (default, no behaviour
+# change); 0.1 = sample 10% (recommended in production); 0.0 = disable. Clamped to
+# [0, 1]; a bad value falls back to 1.0.
+try:
+    RAG_EVAL_SAMPLE_RATE = min(1.0, max(0.0, float(os.getenv("RAG_EVAL_SAMPLE_RATE", "1.0"))))
+except ValueError:
+    RAG_EVAL_SAMPLE_RATE = 1.0
+
+# --- Daily spend cap ---
+# Hard global cap on estimated LLM spend per UTC day. Once today's accumulated
+# cost (see core/metrics.py) reaches this, new LLM-backed queries are refused
+# until UTC midnight rollover; free paths (semantic-cache hits) still serve.
+# 0 = disabled (no cap, default). Accounting is in-process, which is global only
+# while the app runs a single worker (Dockerfile: gunicorn --workers 1); scaling
+# to N workers makes the effective cap N x this value. A bad value disables it.
+try:
+    LLM_DAILY_BUDGET_USD = max(0.0, float(os.getenv("LLM_DAILY_BUDGET_USD", "0")))
+except ValueError:
+    LLM_DAILY_BUDGET_USD = 0.0
+
+# --- RAG per-user rate limits ---
+# Fixed-window request caps per authenticated user on the cost-bearing RAG
+# endpoints (LLM / embeddings / Pinecone / Jina). Complements the global daily
+# spend cap: the cap bounds total $/day, these bound one user's request rate.
+# Enforced in routers/rag.py via services/rate_limit.py, which fails OPEN on a
+# Redis outage. /query and /query/stream share one bucket ("rag_query"). Each
+# limit and its window (seconds) is env-overridable.
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+RAG_QUERY_RATE_LIMIT = _int_env("RAG_QUERY_RATE_LIMIT", 30)
+RAG_QUERY_RATE_WINDOW = _int_env("RAG_QUERY_RATE_WINDOW", 60)
+RAG_INGEST_RATE_LIMIT = _int_env("RAG_INGEST_RATE_LIMIT", 10)
+RAG_INGEST_RATE_WINDOW = _int_env("RAG_INGEST_RATE_WINDOW", 3600)
+RAG_DELETE_RATE_LIMIT = _int_env("RAG_DELETE_RATE_LIMIT", 30)
+RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
+
 # --- Models ---
 # Two-tier routing (see core/llm.py): the top model handles generation-heavy
 # work (roadmap, plan, research, synthesis); the fast model handles the ~40-50%
@@ -112,10 +156,49 @@ supabase: Client = create_client(_require("SUPABASE_URL"), _require("SUPABASE_KE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# External-call timeouts  (resilience: a hung upstream must fail fast, not hang
+# the whole request). Each is overridable via env; balanced defaults.
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis socket read/connect timeout (s): converts a stalled cache connection into
+# a TimeoutError that the cache's try/except degrades to a miss — a true fail-open
+# rather than a hang (try/except alone catches errors, not hangs).
+try:
+    REDIS_SOCKET_TIMEOUT = max(0.1, float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")))
+except ValueError:
+    REDIS_SOCKET_TIMEOUT = 2.0
+
+# Jina reranker HTTP timeout (s): rerank is a quality pass, not correctness — on
+# timeout we fall back to the unreranked candidates (see services/rag/step4).
+try:
+    JINA_RERANK_TIMEOUT = max(0.1, float(os.getenv("JINA_RERANK_TIMEOUT", "8")))
+except ValueError:
+    JINA_RERANK_TIMEOUT = 8.0
+
+# Jina reranker HTTP connection-pool size. retrieve_and_rerank runs in the default
+# asyncio thread pool (~32 workers), so size the pool to match — otherwise
+# concurrent reranks churn the requests default of 10 connections.
+try:
+    JINA_POOL_MAXSIZE = max(1, int(os.getenv("JINA_POOL_MAXSIZE", "32")))
+except ValueError:
+    JINA_POOL_MAXSIZE = 32
+
+# Max seconds to spend warming the retrieval stack at startup (BM25 download +
+# Pinecone handle) before giving up and letting the first query lazy-load —
+# keeps a slow/hung dependency from stalling the boot indefinitely.
+try:
+    RAG_WARMUP_TIMEOUT = max(1.0, float(os.getenv("RAG_WARMUP_TIMEOUT", "60")))
+except ValueError:
+    RAG_WARMUP_TIMEOUT = 60.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Redis  (semantic cache)
 # ─────────────────────────────────────────────────────────────────────────────
 
 redis_client: aioredis.Redis = aioredis.from_url(
     os.getenv("REDIS_URL", "redis://localhost:6379"),
     decode_responses=True,
+    socket_timeout=REDIS_SOCKET_TIMEOUT,
+    socket_connect_timeout=REDIS_SOCKET_TIMEOUT,
+    health_check_interval=30,
 )

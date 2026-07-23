@@ -56,8 +56,12 @@ def client(monkeypatch):
     async def _cache_save(*_a, **_k):
         return None
 
+    async def _scope_size(*_a, **_k):  # avoid the real Redis call (would return -1)
+        return 0
+
     monkeypatch.setattr(rag.cache, "lookup", _cache_miss)
     monkeypatch.setattr(rag.cache, "save", _cache_save)
+    monkeypatch.setattr(rag.cache, "scope_size", _scope_size)
     monkeypatch.setattr(rag.storage, "save_messages", lambda **_k: None)
     # The stream opens a chat up front when the request carries no chat_id, so
     # this must be faked too — unfaked it inserts a real row into Supabase.

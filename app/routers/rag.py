@@ -21,10 +21,19 @@ from fastapi import (
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.dependencies import get_current_user
-from app.core.config import EMBEDDING_MODEL
+from app.core.config import (
+    EMBEDDING_MODEL,
+    RAG_QUERY_RATE_LIMIT,
+    RAG_QUERY_RATE_WINDOW,
+    RAG_INGEST_RATE_LIMIT,
+    RAG_INGEST_RATE_WINDOW,
+    RAG_DELETE_RATE_LIMIT,
+    RAG_DELETE_RATE_WINDOW,
+)
 from app.core.llm import llm
 from app.core.prompts import RAG_ANSWER, REFUSAL_MESSAGE, INSUFFICIENT_CONTEXT
 from app.services import cache
+from app.services import rate_limit
 from app.services.rag import storage
 from app.services.rag.step1_ingestion import (
     load_url,
@@ -36,14 +45,14 @@ from app.services.rag.step1_ingestion import (
 )
 from app.services.rag.step3_indexing_worker import run_ingestion, INGESTION_JOBS
 from app.services.rag.step4_retrieval import (
-    build_retriever,
     get_embeddings,
     delete_doc_vectors,
     retrieve_and_rerank,
 )
 from app.services.rag.step5_generation import prepare_context, cited_sources
 from app.services.rag.step6_grounding import is_answerable, is_refusal, cited_numbers
-from app.services.rag.step7_evaluation import run_evaluation
+from app.services.rag.step7_evaluation import run_evaluation, should_evaluate
+from app.core import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +69,16 @@ def _spawn(coro) -> None:
     task = asyncio.ensure_future(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+# Shown when the daily LLM spend cap (LLM_DAILY_BUDGET_USD) is hit. A graceful
+# 200 with an empty source list, mirroring the no_docs / refusal responses, so the
+# client renders it as a message rather than erroring; `budget_exceeded` lets the
+# UI distinguish it from a content refusal.
+BUDGET_MESSAGE = (
+    "The daily usage limit for AI answers has been reached. Please try again "
+    "tomorrow."
+)
 
 
 router = APIRouter(
@@ -143,6 +162,9 @@ async def ingest_document(
     job_id = str(uuid.uuid4())
     tmp_path: Optional[str] = None
     user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "rag_ingest", user_id, RAG_INGEST_RATE_LIMIT, RAG_INGEST_RATE_WINDOW
+    )
     if action == "url":
         if not data:
             raise HTTPException(
@@ -207,6 +229,9 @@ async def delete_ingestion(
     Delete an ingestion entirely: drop its vectors from Pinecone and remove its
     Supabase log row. `doc_id` is the job_id returned by POST /rag/ingest/{action}.
     """
+    await rate_limit.limit_user(
+        "rag_delete", current_user["uid"], RAG_DELETE_RATE_LIMIT, RAG_DELETE_RATE_WINDOW
+    )
     log = await asyncio.to_thread(storage.get_ingestion_log, doc_id)
     # Return 404 (not 403) when the ingestion isn't the caller's — don't reveal
     # that a doc_id belonging to another user exists.
@@ -230,60 +255,23 @@ async def delete_ingestion(
     }
 
 
-@router.post("/query")
-async def query_documents(
-    request: QueryRequest,
-    current_user: Annotated[dict, Depends(get_current_user)],
-):
-    retriever = build_retriever(current_user["uid"], request.ingestions or None)
-    docs = retriever.invoke(request.question)
-
-    if not docs:
-        return {
-            "answer": "No relevant documents found. Please upload documents first.",
-            "sources": [],
-        }
-
-    context, sources = prepare_context(docs)
-
-    # Grounding gate: refuse up front if the context can't support an answer.
-    if not await is_answerable(request.question, context):
-        return {"answer": REFUSAL_MESSAGE, "sources": [], "grounded": False}
-
-    response = await (RAG_ANSWER | llm).ainvoke(
-        {"context": context, "question": request.question}
-    )
-    answer = response.content
-
-    # Backstop: the model itself judged the context insufficient.
-    if is_refusal(answer):
-        return {"answer": REFUSAL_MESSAGE, "sources": [], "grounded": False}
-
-    cited = cited_numbers(answer)
-    result: dict = {
-        "answer": answer,
-        "sources": cited_sources(sources, cited),
-        "grounded": bool(cited),  # an answer that cited nothing isn't traceable
-    }
-    if request.evaluate:
-        result["evaluation"] = await run_evaluation(
-            request.question, docs, context, answer
-        )
-    return result
-
-
 @router.post("/query/stream")
 async def query_documents_stream(
     request: QueryRequest, current_user: Annotated[dict, Depends(get_current_user)]
 ):
     chat_id = request.chat_id
     user_id = current_user["uid"]
+    # Per-user rate limit — shares the "rag_query" bucket with POST /query, so the
+    # cap is per user across both answer routes. 429 before the stream starts.
+    await rate_limit.limit_user(
+        "rag_query", user_id, RAG_QUERY_RATE_LIMIT, RAG_QUERY_RATE_WINDOW
+    )
     scope = cache.scope_key(user_id, request.ingestions)
 
     async def generate():
         nonlocal chat_id
+        t_start = time.perf_counter()
         try:
-            t_start = time.perf_counter()
             timings: dict = {}  # stage name -> ms, summarised on the `done` event
 
             # Open the chat BEFORE streaming when the client didn't name one, and
@@ -309,6 +297,7 @@ async def query_documents_stream(
                 else:
                     evt["ms"] = round(ms, 1)
                     timings[name] = evt["ms"]
+                    metrics.observe_stage(name, ms / 1000.0)
                 if info:
                     evt["info"] = info
                 return _sse(evt)
@@ -335,6 +324,7 @@ async def query_documents_stream(
             # ── Semantic cache check ────────────────────────────────────────
             t = time.perf_counter()
             cached = await cache.lookup(query_embedding, scope)
+            metrics.record_cache(bool(cached))
             # Report the scope on a miss: a cached answer is only replayed within
             # the same (user, doc set), so a doc selection that changes between
             # questions misses every time — and looks identical to a broken cache.
@@ -370,7 +360,21 @@ async def query_documents_stream(
                     )
                 )
                 yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                metrics.record_request(
+                    "query_stream", "cache_hit", time.perf_counter() - t_start
+                )
                 yield _done(cached=True)
+                return
+
+            # Daily spend cap: a cache hit above already served for free; a miss
+            # means we're about to do paid retrieval + gate + generation, so
+            # enforce the cap here.
+            if metrics.budget_exceeded():
+                metrics.record_request(
+                    "query_stream", "budget_exceeded", time.perf_counter() - t_start
+                )
+                yield _sse({"type": "error", "message": BUDGET_MESSAGE})
+                yield _done(budget_exceeded=True)
                 return
 
             docs, rt = await asyncio.to_thread(
@@ -384,6 +388,9 @@ async def query_documents_stream(
             )
             if not docs:
                 yield _stage("rerank", skipped=True)
+                metrics.record_request(
+                    "query_stream", "no_docs", time.perf_counter() - t_start
+                )
                 yield _sse(
                     {
                         "type": "error",
@@ -424,6 +431,9 @@ async def query_documents_stream(
                 t = time.perf_counter()
                 _persist(REFUSAL_MESSAGE, [])
                 yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                metrics.record_request(
+                    "query_stream", "refused", time.perf_counter() - t_start
+                )
                 yield _done(grounded=False)
                 return
 
@@ -465,6 +475,9 @@ async def query_documents_stream(
                 t = time.perf_counter()
                 _persist(REFUSAL_MESSAGE, [])
                 yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
+                metrics.record_request(
+                    "query_stream", "refused", time.perf_counter() - t_start
+                )
                 yield _done(grounded=False)
                 return
 
@@ -493,7 +506,7 @@ async def query_documents_stream(
             _persist(full_answer, used)
             yield _stage("persist", (time.perf_counter() - t) * 1000, "async")
 
-            if request.evaluate:
+            if should_evaluate(request.evaluate):
                 t = time.perf_counter()
                 evaluation = await run_evaluation(
                     request.question, docs, context, full_answer
@@ -501,10 +514,16 @@ async def query_documents_stream(
                 timings["evaluate"] = round((time.perf_counter() - t) * 1000, 1)
                 yield _sse({"type": "evaluation", "evaluation": evaluation})
 
+            metrics.record_request(
+                "query_stream", "answered", time.perf_counter() - t_start
+            )
             yield _done(grounded=bool(cited))
 
         except Exception as exc:
             logger.exception("Stream generation failed")
+            metrics.record_request(
+                "query_stream", "error", time.perf_counter() - t_start
+            )
             yield _sse({"type": "error", "message": str(exc)})
 
     return StreamingResponse(

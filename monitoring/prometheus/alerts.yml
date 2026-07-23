@@ -1,0 +1,92 @@
+# Alert rules for the five RAG SLOs. Ratios use rate() over a window, so an idle
+# system yields 0/0 = NaN and NaN comparisons are false — alerts stay quiet with
+# no traffic. Where a low value could fire on a trickle of requests (cache/cost/
+# refusal), an explicit volume guard `and (rate(...) > X)` is added.
+#
+# `for:` holds each condition before firing so a single blip doesn't page.
+# Tune the thresholds to your own baselines after a week of real traffic.
+
+groups:
+  - name: aiengineer-rag
+    rules:
+      # ── Availability: scrape target down = API down or /metrics unreachable ──
+      - alert: APIDown
+        expr: up{job="aiengineer-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AIEngineer API is not being scraped"
+          description: "Prometheus cannot scrape {{ $labels.instance }} — the API is down or /metrics is unreachable."
+
+      # ── 1. Error rate > 5% ──────────────────────────────────────────────────
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(rag_requests_total{outcome="error"}[5m]))
+            / sum(rate(rag_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RAG error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of RAG requests are erroring (5m avg)."
+
+      # ── 2. p95 end-to-end latency > 10s ─────────────────────────────────────
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95, sum by (le) (rate(rag_request_latency_seconds_bucket[5m]))
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG p95 latency above 10s"
+          description: "p95 end-to-end latency is {{ $value | humanizeDuration }} (5m window)."
+
+      # ── 3. Refusal rate abnormally high (retrieval/grounding regression) ─────
+      # Some refusals are healthy; alert only when they dominate AND there's real
+      # traffic (>0.05 req/s ≈ 3 req/min).
+      - alert: HighRefusalRate
+        expr: |
+          (
+            sum(rate(rag_requests_total{outcome="refused"}[15m]))
+              / sum(rate(rag_requests_total[15m])) > 0.35
+          )
+          and (sum(rate(rag_requests_total[15m])) > 0.05)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RAG refusal rate above 35%"
+          description: "{{ $value | humanizePercentage }} of answers are refusals (15m) — check retrieval quality or the grounding gate."
+
+      # ── 4. Cache hit rate collapsed (cost/latency regression) ───────────────
+      - alert: LowCacheHitRate
+        expr: |
+          (
+            sum(rate(rag_cache_lookups_total{result="hit"}[30m]))
+              / sum(rate(rag_cache_lookups_total[30m])) < 0.10
+          )
+          and (sum(rate(rag_cache_lookups_total[30m])) > 0.05)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Semantic cache hit rate below 10%"
+          description: "Cache hit rate is {{ $value | humanizePercentage }} (30m) — every miss is a full retrieval + LLM call."
+
+      # ── 5. Cost per query spike ─────────────────────────────────────────────
+      - alert: HighCostPerQuery
+        expr: |
+          (
+            sum(rate(llm_cost_usd_total[15m]))
+              / sum(rate(rag_requests_total{endpoint="query_stream"}[15m])) > 0.02
+          )
+          and (sum(rate(rag_requests_total{endpoint="query_stream"}[15m])) > 0.02)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM cost per query above $0.02"
+          description: "Estimated cost per query is ${{ $value | printf \"%.4f\" }} (15m) — check model routing and cache hit rate."

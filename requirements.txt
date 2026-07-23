@@ -229,6 +229,8 @@ pinecone-text==0.11.0
     # via -r requirements.in
 postgrest==2.30.1
     # via supabase
+prometheus-client==0.23.1
+    # via -r requirements.in
 propcache==0.5.2
     # via
     #   aiohttp

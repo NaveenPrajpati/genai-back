@@ -70,3 +70,6 @@ requests==2.34.2
 
 # --- Numerics ---
 numpy==2.4.6
+
+# --- Observability (Prometheus metrics; scraped at GET /metrics) ---
+prometheus-client==0.23.1

@@ -1,9 +1,11 @@
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 from dotenv import load_dotenv
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +113,22 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(deactivate_expired_guests, "interval", hours=1)
     scheduler.start()
 
+    # Warm the RAG retrieval stack (BM25 params + nltk data download, Pinecone
+    # handle) so the first user query doesn't pay cold-start latency and 50 cold
+    # queries don't each trigger the download. Best-effort + time-bounded: on a
+    # slow/failing dependency we log and continue, and the first query lazy-loads
+    # as it does today — a flaky Pinecone/download must not fail the boot.
+    try:
+        from app.core.config import RAG_WARMUP_TIMEOUT
+        from app.services.rag.step4_retrieval import warmup as _rag_warmup
+
+        await asyncio.wait_for(
+            asyncio.to_thread(_rag_warmup), timeout=RAG_WARMUP_TIMEOUT
+        )
+        print("[Lifespan] RAG retrieval stack warmed")
+    except Exception as e:
+        print(f"[Lifespan] RAG warmup skipped (non-fatal): {e}")
+
     # --- ACTIVE PHASE ---
     yield
 
@@ -154,3 +172,17 @@ app.include_router(prefix="/api", router=meal_planner.router)
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics(request: Request):
+    """Prometheus scrape endpoint (ops metrics — see core/metrics.py).
+
+    Exposed on the app itself (single worker, so one in-process registry). Keep it
+    off the public internet: restrict to the monitoring host via the EC2 security
+    group, and/or set METRICS_TOKEN to require `Authorization: Bearer <token>`
+    (Prometheus sends it via `authorization` in its scrape config)."""
+    token = os.getenv("METRICS_TOKEN")
+    if token and request.headers.get("authorization") != f"Bearer {token}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

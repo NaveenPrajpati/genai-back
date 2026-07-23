@@ -4,9 +4,9 @@ services/rag/step4_retrieval.py
 STEPS 3, 4 & 5 OF THE RAG PIPELINE, assembled in one place because they form a
 single chain:  EMBEDDING → RETRIEVAL → RE-RANKING → CONTEXT ORDERING.
 
-This module builds the retriever once at import time and exposes a single
-`build_retriever(user_id, doc_ids)` helper that the routes call. Every query is
-scoped to the calling user's vectors (multi-tenant isolation).
+This module exposes `retrieve_and_rerank(user_id, doc_ids, question)`, the single
+retrieval entry point the streaming route calls. Every query is scoped to the
+calling user's vectors (multi-tenant isolation).
 
 ══════════════════════════════════════════════════════════════════════════════
 STEP 3 — EMBEDDING
@@ -102,17 +102,21 @@ into the LLM prompt is its own discipline:
 """
 
 import time
+import logging
 from functools import cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import requests
+from requests.adapters import HTTPAdapter
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.retrievers import PineconeHybridSearchRetriever
 from langchain_community.document_compressors import JinaRerank
 from langchain_community.document_transformers import LongContextReorder
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_core.documents import Document
+from langchain_core.callbacks import Callbacks
+from langchain_core.documents import Document, BaseDocumentCompressor
 from langchain_core.runnables import Runnable
 from pinecone_text.sparse import BM25Encoder
+from pydantic import ConfigDict
 
 from app.core.config import (
     get_pinecone_index,
@@ -121,7 +125,11 @@ from app.core.config import (
     RERANK_TOP_N,
     RERANKER_MODEL,
     EMBEDDING_MODEL,
+    JINA_RERANK_TIMEOUT,
+    JINA_POOL_MAXSIZE,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ── Step 3: embedders (lazy — @cache builds once on first use) ───────────────
@@ -137,11 +145,63 @@ def _get_bm25_encoder() -> BM25Encoder:
 
 
 # ── Step 5: reranker + reorderer ─────────────────────────────────────────────
-# Hosted Jina reranker (free tier). The API call happens per-query; we only
-# cache the lightweight client. Set JINA_API_KEY in the environment.
+class _TimeoutSession(requests.Session):
+    """A requests.Session that stamps a default timeout on every call AND sizes its
+    connection pool for concurrency. JinaRerank builds its own session with
+    neither: no timeout (a stalled Jina hangs the request forever) and the requests
+    default pool of 10 (concurrent reranks churn connections under load)."""
+
+    def __init__(self, timeout: float, pool_maxsize: int = JINA_POOL_MAXSIZE):
+        super().__init__()
+        self._timeout = timeout
+        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+        self.mount("https://", adapter)
+        self.mount("http://", adapter)
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self._timeout)
+        return super().request(*args, **kwargs)
+
+
+class _ResilientReranker(BaseDocumentCompressor):
+    """Wraps JinaRerank so a rerank failure/timeout DEGRADES instead of failing
+    the whole query: reranking is a quality pass, not correctness. On any error
+    we return the retriever's own top-N candidates (hybrid order) — the answer is
+    still grounded, just without the cross-encoder's refinement. Covers both call
+    paths (direct compress + ContextualCompressionRetriever) since both use it."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    reranker: JinaRerank
+    top_n: int
+
+    def compress_documents(
+        self,
+        documents: Sequence[Document],
+        query: str,
+        callbacks: Optional[Callbacks] = None,
+    ) -> Sequence[Document]:
+        try:
+            return self.reranker.compress_documents(documents, query, callbacks)
+        except Exception:
+            logger.warning(
+                "Jina rerank failed/timed out — falling back to unreranked top-%d",
+                self.top_n,
+            )
+            return list(documents)[: self.top_n]
+
+
+# Hosted Jina reranker (free tier). The API call happens per-query; we only cache
+# the lightweight client. Set JINA_API_KEY in the environment.
 @cache
-def _get_reranker() -> JinaRerank:
-    return JinaRerank(model=RERANKER_MODEL, top_n=RERANK_TOP_N)
+def _get_reranker() -> _ResilientReranker:
+    reranker = JinaRerank(model=RERANKER_MODEL, top_n=RERANK_TOP_N)
+    # Swap in a timeout-enforcing session, carrying over the auth headers the
+    # JinaRerank validator set (Authorization, Content-type, …).
+    timed = _TimeoutSession(JINA_RERANK_TIMEOUT)
+    timed.headers.update(reranker.session.headers)
+    reranker.session = timed
+    return _ResilientReranker(reranker=reranker, top_n=RERANK_TOP_N)
 
 
 reorder = LongContextReorder()
@@ -227,37 +287,13 @@ def delete_doc_vectors(doc_id: str) -> int:
     return len(ids)
 
 
-def build_retriever(
-    user_id: str,
-    doc_ids: Optional[List[str]] = None,
-) -> ContextualCompressionRetriever:
-    """
-    Assemble the full retrieval chain:  hybrid retrieve → cross-encoder rerank.
-
-    `reorder` (LongContextReorder) is applied AFTER retrieval, when building the
-    context string (see generation.build_context) — it's a transform on the final
-    doc list, not part of the retriever.
-
-
-    Args:
-        user_id: REQUIRED. Results are always restricted to this user's vectors.
-        doc_ids: restrict search to these ingestion ids. None = all of the user's
-                 documents (never other users').
-    """
-    base = _base_hybrid_retriever(user_id, doc_ids)
-    return ContextualCompressionRetriever(
-        base_compressor=_get_reranker(), base_retriever=base
-    )
-
-
 def retrieve_and_rerank(
     user_id: str, doc_ids: Optional[List[str]], question: str
 ) -> Tuple[List[Document], Dict[str, Any]]:
     """
-    The same two steps `build_retriever` chains together, run separately so each
-    can be timed — the stream route emits these timings as pipeline telemetry.
-    Behaviour is identical to ContextualCompressionRetriever.invoke (hybrid
-    retrieve, then rerank the candidates).
+    Hybrid retrieve → cross-encoder rerank, run as two separately-timed steps so
+    the streaming route can emit each as pipeline telemetry. This is the single
+    retrieval entry point (the reranker fails open — see _ResilientReranker).
 
     Returns (reranked_docs, timings) where timings holds `retrieve_ms`,
     `rerank_ms`, and the raw `candidates` count. Blocking — call via
@@ -277,3 +313,19 @@ def retrieve_and_rerank(
     docs = list(_get_reranker().compress_documents(candidates, question))
     timings["rerank_ms"] = (time.perf_counter() - t1) * 1000.0
     return docs, timings
+
+
+def warmup() -> None:
+    """Eagerly build the @cache'd retrieval singletons so the FIRST user query
+    doesn't pay cold-start latency (and 50 cold queries don't each trigger the
+    download). The cost is mostly `_get_bm25_encoder()`, which downloads the MS
+    MARCO params + nltk data on first build, and `get_pinecone_index()`'s
+    has_index round-trip. Idempotent (each builder is cached); blocking — call via
+    asyncio.to_thread. Called once at startup from the app lifespan."""
+    get_embeddings()
+    _get_bm25_encoder()
+    get_pinecone_index()
+    try:
+        _get_reranker()  # cheap, but needs JINA_API_KEY — don't fail warmup if unset
+    except Exception:
+        logger.warning("reranker warmup skipped (JINA_API_KEY?) — lazy-loads on first query")

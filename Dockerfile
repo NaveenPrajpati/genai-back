@@ -33,6 +33,13 @@ RUN useradd --create-home --uid 1000 appuser
 
 COPY --from=builder /opt/venv /opt/venv
 
+# Pre-download the NLTK data the BM25 tokenizer needs (punkt_tab + stopwords) into
+# a fixed, world-readable path, so the first query doesn't fetch it at runtime and
+# it works even if the NLTK servers are unreachable at boot. NLTK_DATA points the
+# runtime lookup here (otherwise it writes corpora/ + tokenizers/ under $HOME).
+ENV NLTK_DATA=/opt/nltk_data
+RUN python -m nltk.downloader -d /opt/nltk_data punkt_tab stopwords
+
 WORKDIR /app
 COPY --chown=appuser:appuser . .
 

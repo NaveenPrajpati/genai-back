@@ -1,0 +1,67 @@
+# Observability stack for the AIEngineer API — Prometheus + Alertmanager + Grafana.
+#
+# DECOUPLED FROM THE APP ON PURPOSE. The API runs in its own compose (../),
+# possibly on its own release cadence; this stack just scrapes it over the host
+# network at host.docker.internal:8000/metrics. So it works whether the API is
+# run via docker compose, bare gunicorn, or systemd — as long as it listens on
+# :8000 on this host.
+#
+# Bring up:   cd monitoring && cp .env.example .env  # then fill SMTP + admin pw
+#             cp alertmanager/alertmanager.yml.example alertmanager/alertmanager.yml
+#             docker compose up -d
+# Grafana:    http://<host>:3000  (dashboard "RAG Observability" auto-provisioned)
+#
+# Prometheus + Alertmanager are bound to 127.0.0.1 — reach them via SSH tunnel,
+# never the public internet. Grafana (:3000) is your one exposed UI; put it
+# behind the security group / a reverse proxy with TLS.
+
+name: aiengineer-monitoring
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    extra_hosts:
+      # Lets the container resolve the EC2 host to reach the API's /metrics.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    ports:
+      - "127.0.0.1:9093:9093"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    depends_on: [prometheus]
+    env_file:
+      - .env
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
