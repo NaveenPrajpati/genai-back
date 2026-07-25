@@ -1,15 +1,16 @@
-name: RAG eval (report-only)
+name: RAG eval (smoke gate)
 
-# Runs the offline RAG answer-quality eval on every PR. Currently REPORT-ONLY:
-# it prints the scorecard but does not block the merge.
+# Runs the offline RAG answer-quality eval on every PR.
 #
-# Thresholds were calibrated 2026-07-22 (see THRESHOLDS in eval_harness.py), so
-# the hard gate is READY TO ENABLE. To switch it on after a few more report-only
-# runs confirm the scores are stable:
-#   1. comment out the "RAG answer eval (report-only)" step below, and
-#   2. uncomment the "RAG answer eval (HARD GATE)" step right after it.
-# The gate step drops `continue-on-error` and adds `--gate`, so a metric dropping
-# below its threshold fails the check and blocks the merge.
+# POSTURE: a LOOSE "smoke gate" — it BLOCKS the merge only on a catastrophic
+# regression (broken prompt, inverted grounding gate, ungrounded generator). The
+# bars (SMOKE_THRESHOLDS in eval_harness.py) sit far below the run-to-run wobble of
+# a small, LLM-judged eval, so a normal PR is never false-blocked.
+#
+# TO PROMOTE TO A STRICT QUALITY GATE (do this once the golden set is ~40+ rows and
+# a few runs have confirmed the variance): change `--gate-mode smoke` to
+# `--gate-mode strict` in the eval step below. Strict uses the tight THRESHOLDS,
+# which should be re-tuned to sit just under the observed minimum score.
 
 on:
   pull_request:
@@ -33,35 +34,25 @@ jobs:
           .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
       # Deterministic, no keys required — guards the harness/scoring logic itself.
-      # This step DOES block: if it fails, the eval code is broken.
+      # Blocks: if it fails, the eval code is broken.
       - name: Harness self-test (offline)
         run: .venv/bin/python -m app.services.rag.eval_harness --self-test
 
-      # Real eval against the golden set. Report-only: never blocks the merge yet.
-      # Frozen-context mode needs no Pinecone/Redis — only OpenAI for generation +
-      # the faithfulness judge. Supabase vars are placeholders so config imports.
-      - name: RAG answer eval (report-only)
-        continue-on-error: true
+      # Real eval against the golden set. SMOKE GATE: `--gate --gate-mode smoke`
+      # exits non-zero (failing the PR) only on a catastrophic regression. Bash
+      # runs with pipefail by default, so the python exit code propagates through
+      # `tee`. Frozen-context mode needs no Pinecone/Redis — only OpenAI for
+      # generation + the faithfulness judge. Supabase vars are placeholders so
+      # config imports.
+      - name: RAG answer eval (smoke gate)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPABASE_URL: "https://placeholder.supabase.co"
           SUPABASE_KEY: "placeholder-unused-in-frozen-context-eval"
         run: |
           .venv/bin/python -m app.services.rag.eval_harness \
-            --data app/services/rag/datasets/rag_golden.jsonl | tee eval-report.json
-
-      # ── HARD GATE (disabled) ─────────────────────────────────────────────────
-      # Enable by commenting out the report-only step above and uncommenting this.
-      # Same run as above but WITHOUT `continue-on-error` and WITH `--gate`, so the
-      # step exits non-zero (failing the PR) when a metric drops below threshold.
-      # - name: RAG answer eval (HARD GATE)
-      #   env:
-      #     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      #     SUPABASE_URL: "https://placeholder.supabase.co"
-      #     SUPABASE_KEY: "placeholder-unused-in-frozen-context-eval"
-      #   run: |
-      #     .venv/bin/python -m app.services.rag.eval_harness \
-      #       --data app/services/rag/datasets/rag_golden.jsonl --gate | tee eval-report.json
+            --data app/services/rag/datasets/rag_golden.jsonl \
+            --gate --gate-mode smoke | tee eval-report.json
 
       - name: Upload scorecard
         if: always()

@@ -80,6 +80,19 @@ THRESHOLDS: dict[str, float] = {
     "max_over_refusal": 0.15,  # ≤
 }
 
+# A LOOSE "smoke gate" set: bars set FAR below the run-to-run wobble of a small,
+# LLM-judged eval, so `--gate-mode smoke` blocks only a CATASTROPHIC regression
+# (broken prompt, inverted grounding gate, ungrounded generator) and never
+# false-blocks a normal PR on judge noise. Use this until the golden set is large
+# enough (~40+ rows) and its variance is measured, then promote to the strict
+# THRESHOLDS above (which should sit just under the observed minimum).
+SMOKE_THRESHOLDS: dict[str, float] = {
+    "correctness": 0.70,       # ≥
+    "faithfulness": 0.75,      # ≥
+    "refusal_accuracy": 0.75,  # ≥
+    "max_over_refusal": 0.35,  # ≤
+}
+
 DEFAULT_DATA = "app/services/rag/datasets/rag_golden.jsonl"
 
 # Types for the injectable strategy fns (real | stub | ragas) — keeps run_eval
@@ -134,18 +147,19 @@ def key_fact_recall(answer: str, key_facts: list) -> float:
     return round(hits / len(key_facts), 4)
 
 
-def gate_pass(metrics: dict) -> bool:
-    """True if every populated metric clears its threshold. A metric of None
-    (its group had no rows) is skipped, not failed."""
+def gate_pass(metrics: dict, thresholds: dict = THRESHOLDS) -> bool:
+    """True if every populated metric clears `thresholds`. A metric of None (its
+    group had no rows) is skipped, not failed. `thresholds` defaults to the strict
+    set; the smoke gate passes SMOKE_THRESHOLDS."""
     checks: list[bool] = []
     if metrics.get("correctness") is not None:
-        checks.append(metrics["correctness"] >= THRESHOLDS["correctness"])
+        checks.append(metrics["correctness"] >= thresholds["correctness"])
     if metrics.get("faithfulness") is not None:
-        checks.append(metrics["faithfulness"] >= THRESHOLDS["faithfulness"])
+        checks.append(metrics["faithfulness"] >= thresholds["faithfulness"])
     if metrics.get("refusal_accuracy") is not None:
-        checks.append(metrics["refusal_accuracy"] >= THRESHOLDS["refusal_accuracy"])
+        checks.append(metrics["refusal_accuracy"] >= thresholds["refusal_accuracy"])
     if metrics.get("over_refusal") is not None:
-        checks.append(metrics["over_refusal"] <= THRESHOLDS["max_over_refusal"])
+        checks.append(metrics["over_refusal"] <= thresholds["max_over_refusal"])
     return all(checks)
 
 
@@ -161,10 +175,12 @@ async def run_eval(
     *,
     generate_fn: GenerateFn,
     faithfulness_fn: FaithfulnessFn,
+    thresholds: dict = THRESHOLDS,
 ) -> dict:
     """Grade every record and aggregate. `generate_fn` produces (answer, refused);
     `faithfulness_fn` scores grounding. Both are injected so this stays offline-
-    testable (the CLI wires the real ones; tests/self-test wire stubs)."""
+    testable (the CLI wires the real ones; tests/self-test wire stubs). `thresholds`
+    selects the pass bar (strict by default; SMOKE_THRESHOLDS for the smoke gate)."""
     answerable: list[dict] = []
     refusal: list[dict] = []
 
@@ -195,8 +211,8 @@ async def run_eval(
         "answerable": {"n": len(answerable), "rows": answerable},
         "refusal": {"n": len(refusal), "rows": refusal},
         "metrics": metrics,
-        "thresholds": THRESHOLDS,
-        "pass": gate_pass(metrics),
+        "thresholds": thresholds,
+        "pass": gate_pass(metrics, thresholds),
     }
 
 
@@ -279,8 +295,10 @@ def _summary_line(report: dict) -> str:
     def pct(v):
         return "  n/a" if v is None else f"{v * 100:5.1f}%"
     verdict = "PASS" if report["pass"] else "FAIL"
+    mode = report.get("gate_mode")
+    tag = f" [{mode} gate]" if mode else ""
     return (
-        f"[{verdict}] n={report['n']}  "
+        f"[{verdict}]{tag} n={report['n']}  "
         f"correctness={pct(m['correctness'])}  "
         f"faithfulness={pct(m['faithfulness'])}  "
         f"refusal_acc={pct(m['refusal_accuracy'])}  "
@@ -296,9 +314,14 @@ def main() -> None:
                     help="faithfulness backend (default: built-in judge)")
     ap.add_argument("--gate", action="store_true",
                     help="exit non-zero if any metric is below threshold")
+    ap.add_argument("--gate-mode", choices=["smoke", "strict"], default="strict",
+                    help="which bar the gate uses: 'smoke' (loose — blocks only "
+                         "catastrophic regressions) or 'strict' (tight quality bar)")
     ap.add_argument("--self-test", action="store_true",
                     help="score a perfect stub system offline (no API calls)")
     args = ap.parse_args()
+
+    thresholds = SMOKE_THRESHOLDS if args.gate_mode == "smoke" else THRESHOLDS
 
     records = load_golden(args.data)
     if args.limit:
@@ -316,16 +339,22 @@ def main() -> None:
         faithfulness_fn = ragas_faithfulness if args.scorer == "ragas" else own_faithfulness
 
     report = asyncio.run(
-        run_eval(records, generate_fn=generate_fn, faithfulness_fn=faithfulness_fn)
+        run_eval(
+            records,
+            generate_fn=generate_fn,
+            faithfulness_fn=faithfulness_fn,
+            thresholds=thresholds,
+        )
     )
+    report["gate_mode"] = args.gate_mode
 
     print(json.dumps(report, indent=2))
     print(_summary_line(report), file=sys.stderr)
 
     if args.gate and not report["pass"]:
         print(
-            "\nRAG eval gate FAILED — a metric dropped below threshold "
-            f"({THRESHOLDS}).",
+            f"\nRAG eval gate FAILED [{args.gate_mode}] — a metric dropped below "
+            f"threshold ({thresholds}).",
             file=sys.stderr,
         )
         sys.exit(1)

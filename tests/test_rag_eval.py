@@ -44,6 +44,38 @@ def test_gate_pass_skips_none_metrics():
     assert rag_eval.gate_pass(only_refusals) is True
 
 
+def test_smoke_gate_is_looser_than_strict():
+    # normal run-to-run wobble: strict blocks, smoke tolerates it
+    borderline = {"correctness": 0.72, "faithfulness": 0.78, "refusal_accuracy": 0.8, "over_refusal": 0.3}
+    assert rag_eval.gate_pass(borderline) is False  # strict (default)
+    assert rag_eval.gate_pass(borderline, rag_eval.SMOKE_THRESHOLDS) is True
+
+
+def test_smoke_gate_still_catches_catastrophic_regression():
+    # broken prompt / inverted gate — even the loose bar must fail
+    broken = {"correctness": 0.4, "faithfulness": 0.3, "refusal_accuracy": 0.2, "over_refusal": 0.9}
+    assert rag_eval.gate_pass(broken, rag_eval.SMOKE_THRESHOLDS) is False
+
+
+async def test_run_eval_honors_given_thresholds():
+    async def full_correct(rec):
+        if rec.get("should_refuse"):
+            return "REFUSED", True
+        return f"{' '.join(rec.get('key_facts') or [])} [1]", False
+
+    async def faith_08(rec, ans):
+        return 0.8  # between smoke (0.75) and strict (0.90)
+
+    rows = [{"id": "a", "question": "q", "key_facts": ["x", "y"], "context": ["x y"], "should_refuse": False}]
+    strict = await rag_eval.run_eval(rows, generate_fn=full_correct, faithfulness_fn=faith_08)
+    smoke = await rag_eval.run_eval(
+        rows, generate_fn=full_correct, faithfulness_fn=faith_08, thresholds=rag_eval.SMOKE_THRESHOLDS
+    )
+    assert strict["pass"] is False  # faithfulness 0.8 < strict 0.90
+    assert smoke["pass"] is True    # 0.8 ≥ smoke 0.75, correctness 1.0 ≥ 0.70
+    assert smoke["thresholds"] == rag_eval.SMOKE_THRESHOLDS
+
+
 # --------------------------------------------------------------------------- #
 # run_eval with injected stubs
 # --------------------------------------------------------------------------- #
