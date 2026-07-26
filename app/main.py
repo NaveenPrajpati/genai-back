@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -17,23 +17,23 @@ from app.routers import (
     users,
     personal_assistant,
     meal_planner,
+    supervisor,
+    rag,
+    chat,
 )
 from app.database import connect_db, close_db
 from app.core.observability import init_tracing
-from app.routers import rag
-from app.routers import chat
 from app.agents.learning_tracker import graph, run_triggers
 from app.agents.personal_assistant import graph as pa_graph, run_pa_triggers
 from app.agents.meal_planner import (
     graph as meal_graph,
     run_triggers as run_meal_triggers,
 )
+from app.agents.supervisor import graph as supervisor_graph
+from app.mcp.mount import guarded_app as mcp_asgi_app, session_lifespan as mcp_session
 from app.services.user_service import deactivate_expired_guests
-from app.database import get_db
-from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
-import redis.asyncio as redis
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -76,6 +76,11 @@ async def lifespan(app: FastAPI):
         app.state.learning_agent = graph.compile(checkpointer=checkpointer)
         app.state.pa_agent = pa_graph.compile(checkpointer=checkpointer)
         app.state.meal_agent = meal_graph.compile(checkpointer=checkpointer)
+        # The supervisor embeds the learning and PA graphs as subgraphs. They are
+        # compiled inside it WITHOUT a checkpointer and inherit this one, which is
+        # what lets an approval raised deep in a subgraph pause the supervisor
+        # thread and resume from a single Command on the parent.
+        app.state.supervisor_agent = supervisor_graph.compile(checkpointer=checkpointer)
         print("Using PostgresSaver checkpointer")
 
     except Exception as e:
@@ -87,6 +92,7 @@ async def lifespan(app: FastAPI):
         app.state.learning_agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
         app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
+        app.state.supervisor_agent = supervisor_graph.compile(checkpointer=MemorySaver())
 
     # Learning digest: hourly sweep. run_triggers fires per user only when the
     # current hour matches their chosen schedule_hour in their own timezone.
@@ -129,10 +135,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Lifespan] RAG warmup skipped (non-fatal): {e}")
 
+    # The meal planner is mounted at /mcp as a Model Context Protocol server.
+    # FastAPI does not run a mounted sub-app's lifespan, so its streamable-HTTP
+    # session manager has to be started here or every MCP request fails.
+    mcp_stack = AsyncExitStack()
+    try:
+        await mcp_stack.enter_async_context(mcp_session())
+        print("[Lifespan] Meal MCP server ready at /mcp")
+    except Exception as e:
+        print(f"[Lifespan] MCP server failed to start (meal skill degraded): {e}")
+
     # --- ACTIVE PHASE ---
     yield
 
     # --- SHUTDOWN PHASE ---
+    await mcp_stack.aclose()
+
     # Clean up Postgres checkpointer if it was successfully running
     if checkpointer_context and not isinstance(
         app.state.learning_agent.checkpointer, MemorySaver
@@ -167,6 +185,12 @@ app.include_router(prefix="/api", router=chat.router)
 app.include_router(prefix="/api", router=learning_tracker.router)
 app.include_router(prefix="/api", router=personal_assistant.router)
 app.include_router(prefix="/api", router=meal_planner.router)
+app.include_router(prefix="/api", router=supervisor.router)
+
+# The meal planner as a Model Context Protocol server. The supervisor consumes
+# it over this endpoint like any other MCP client would; point an external
+# client (Claude Desktop, the MCP Inspector) here too. See app/mcp/mount.py.
+app.mount("/mcp", mcp_asgi_app())
 
 
 @app.get("/")

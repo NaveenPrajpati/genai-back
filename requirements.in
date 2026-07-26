@@ -46,6 +46,14 @@ langgraph==1.2.4
 langgraph-checkpoint-postgres==3.1.0
 psycopg[binary]==3.3.4
 
+# --- MCP (Model Context Protocol) ---
+# `mcp` is the official SDK — we SERVE the meal planner as an MCP server
+# (app/mcp/meal_server.py, stdio + streamable-HTTP). `langchain-mcp-adapters`
+# is the client side: the supervisor graph consumes those MCP tools as
+# LangChain tools.
+mcp==1.28.1
+langchain-mcp-adapters==0.3.0
+
 # --- Vector store + sparse encoding ---
 pinecone==7.3.0
 pinecone-text==0.11.0

@@ -3,32 +3,26 @@
 import logging
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import START, StateGraph, END
 from langgraph.types import interrupt
 
-from app.core.config import supabase
-from app.core.llm import llm, fast_llm
+from app.core.llm import fast_llm
 from app.services.cache import cached_value
 from app.core.config import CACHE_CLASSIFY_THRESHOLD
 from app.agents.approval_store import get_pending, create_pending, resolve
-from app.agents.react import run_tool_loop
 from app.agents.memory_store import get_profile
+from .service import build_plan, save_plan, suggest_meals
 from .state import (
     PlannerState,
     IntentOutput,
     LogOutput,
     QueryOutput,
-    ResearchOutput,
-    PlanOutput,
 )
 from .repository import (
     get_monday,
     findMealSlotsInDb,
     log_recipe_to_slot,
-    remember,
 )
-from .tools import research_tool_node, research_llm
 
 logger = logging.getLogger(__name__)
 
@@ -146,41 +140,13 @@ async def query_agent(state: PlannerState):
 
 
 async def research_agent(state: PlannerState):
-    current_user = state.get("current_user") or {}
-    memory = state.get("memory") or {}
-
-    messages = [
-        SystemMessage(
-            content=(
-                "You are a nutrition expert. Suggest meals matching the user's request.\n"
-                "For EVERY meal you suggest, call get_nutrition with its ingredient list "
-                "(with quantities e.g. '200g chicken breast') to get accurate nutrition data.\n"
-                f"User diet: {current_user.get('diet', 'vegetarian')}. "
-                f"Disliked: {memory.get('disliked_dishes', [])}."
-            )
-        ),
-        HumanMessage(content=state["query"]),
-    ]
-
-    # ReAct loop: LLM calls get_nutrition for each meal it suggests, reads the
-    # nutrition data, and may suggest/look up more before finishing.
-    messages = await run_tool_loop(research_llm, research_tool_node, messages)
-
-    # Final pass: extract structured output from the enriched conversation
-    structured: ResearchOutput = await llm.with_structured_output(
-        ResearchOutput
-    ).ainvoke(
-        messages
-        + [
-            HumanMessage(
-                content="Return all meal suggestions with their nutrition data in structured format."
-            )
-        ]
+    suggestions = await suggest_meals(
+        state["query"], state.get("current_user"), state.get("memory")
     )
-    logger.info("research data %s", structured)
+    logger.info("research data %s", suggestions)
     return {
         "intent": "research",
-        "suggestions": [m.model_dump() for m in structured.suggestions],
+        "suggestions": suggestions,
     }
 
 
@@ -197,38 +163,10 @@ async def plan_agent(state: PlannerState):
 
     if not approval_id:
         # First run: generate plan via LLM and insert approval.
-        suggestionPrompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You are an expert at planning diet plan , so plan diet for week my week start from monday means monday is day of week 0 ,recipes for dinner, lunch, breakfast for all days of week along with protien in grams in each meal "
-                    "User diet: {diet}. Disliked: {disliked}.\n"
-                    "Learned preferences (honor these strictly) — diet restrictions: "
-                    "{diet_restrictions}; allergies: {allergies}; preferred cuisines: "
-                    "{preferred_cuisines}; household size: {household_size}; cooking "
-                    "skill: {cooking_skill}; nutrition goals: {nutrition_goals}.\n",
-                ),
-                ("human", "{text}"),
-            ]
+        proposed = await build_plan(
+            state["query"], state.get("current_user"), state.get("memory")
         )
-        current_user = state.get("current_user") or {}
-        memory = state.get("memory") or {}
-        chain = suggestionPrompt | llm.with_structured_output(PlanOutput)
-        result: PlanOutput = await chain.ainvoke(
-            {
-                "text": state["query"],
-                "diet": current_user.get("diet", "vegetarian"),
-                "disliked": memory.get("disliked_dishes", []),
-                "diet_restrictions": memory.get("diet_restrictions") or "none",
-                "allergies": memory.get("allergies") or "none",
-                "preferred_cuisines": memory.get("preferred_cuisines") or "none",
-                "household_size": memory.get("household_size") or "unknown",
-                "cooking_skill": memory.get("cooking_skill") or "unknown",
-                "nutrition_goals": memory.get("nutrition_goals") or "none",
-            }
-        )
-        logger.info("plan data %s", result)
-        proposed = [slot.model_dump(mode="json") for slot in result.plan]
+        logger.info("plan data %s", proposed)
 
         approval_id = await create_pending(
             state["user_id"],
@@ -254,50 +192,13 @@ async def plan_agent(state: PlannerState):
         return {"intent": state.get("intent", "plan"), "plan_status": "rejected"}
 
     # Approved: for update reuse the existing plan row; for new plan create one.
-    plan_id = state.get("plan_id") if is_update else None
-    if not plan_id:
-        try:
-            plan_row = (
-                supabase.table("meal_plans")
-                .insert(
-                    {
-                        "user": state["user_id"],
-                        "week_start": week_start,
-                        "status": "approved",
-                    }
-                )
-                .execute()
-            )
-            plan_id = plan_row.data[0]["id"] if plan_row.data else None
-        except Exception as e:
-            logger.error("meal_plan insert error: %s", e)
-    else:
-        # Clear existing slots so we start fresh with the new proposal.
-        try:
-            supabase.table("meal_slots").delete().eq("plan_id", plan_id).execute()
-        except Exception as e:
-            logger.error("meal_slots clear error: %s", e)
-
-    existing = (state.get("memory") or {}).get("liked_dishes", [])
-    merged = list(
-        dict.fromkeys(existing + [s["recipe_name"] for s in (proposed or [])])
+    plan_id = await save_plan(
+        state["user_id"],
+        week_start,
+        proposed or [],
+        plan_id=state.get("plan_id") if is_update else None,
+        existing_liked=(state.get("memory") or {}).get("liked_dishes", []),
     )
-    await remember(state["user_id"], "liked_dishes", merged)
-
-    for slot in proposed or []:
-        try:
-            supabase.table("meal_slots").upsert(
-                {
-                    "plan_id": plan_id,
-                    "day_of_week": slot["day_of_week"],
-                    "meal_type": slot["meal_type"].lower(),
-                    "recipe_name": slot["recipe_name"],
-                    "protein_g": slot["protein_g"],
-                },
-                on_conflict="plan_id,day_of_week,meal_type",
-            ).execute()
-        except Exception as e:
-            logger.error("slot insert error: %s", e)
 
     await resolve(approval_id, "approved")
 

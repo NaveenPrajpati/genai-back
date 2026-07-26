@@ -89,6 +89,19 @@ RAG_INGEST_RATE_WINDOW = _int_env("RAG_INGEST_RATE_WINDOW", 3600)
 RAG_DELETE_RATE_LIMIT = _int_env("RAG_DELETE_RATE_LIMIT", 30)
 RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 
+# --- MCP (meal planner published over Model Context Protocol) ---
+# app.main mounts the server at /mcp of this same process, so the default URL
+# points back at ourselves. Both sides are async, so the supervisor awaiting its
+# own MCP endpoint just yields to the event loop — no deadlock on one worker.
+# Point MEAL_MCP_URL elsewhere to run the meal planner as its own service.
+# The trailing slash matters: the server is mounted at /mcp and serves at its
+# own root, so /mcp/ is the endpoint and /mcp would only redirect to it.
+MEAL_MCP_URL = os.getenv("MEAL_MCP_URL", "http://127.0.0.1:8000/mcp/")
+MEAL_MCP_TIMEOUT = max(1.0, float(os.getenv("MEAL_MCP_TIMEOUT", "60")))
+# Shared secret for the mounted /mcp endpoint. Unset = no check, which is only
+# acceptable when /mcp is unreachable from outside the host (EC2 security group).
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")
+
 # --- Models ---
 # Two-tier routing (see core/llm.py): the top model handles generation-heavy
 # work (roadmap, plan, research, synthesis); the fast model handles the ~40-50%
