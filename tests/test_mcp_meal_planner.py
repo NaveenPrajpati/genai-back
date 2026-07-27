@@ -11,8 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-import app.mcp.meal_server as server
-from app.mcp.client import AUTONOMOUS_TOOLS, SAVE_PLAN_TOOL, autonomous_tools, find_tool
+import app.mcp.meal_planner.server as server
+from app.mcp.meal_planner.client import (
+    AUTONOMOUS_TOOLS,
+    SAVE_PLAN_TOOL,
+    autonomous_tools,
+    find_tool,
+)
 
 
 def _ctx(headers=None):

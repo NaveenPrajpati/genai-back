@@ -30,7 +30,8 @@ from app.agents.meal_planner import (
     run_triggers as run_meal_triggers,
 )
 from app.agents.supervisor import graph as supervisor_graph
-from app.mcp.mount import guarded_app as mcp_asgi_app, session_lifespan as mcp_session
+from app.mcp.meal_planner import mcp as meal_mcp
+from app.mcp.mount import guarded_app, session_lifespan
 from app.services.user_service import deactivate_expired_guests
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -140,7 +141,7 @@ async def lifespan(app: FastAPI):
     # session manager has to be started here or every MCP request fails.
     mcp_stack = AsyncExitStack()
     try:
-        await mcp_stack.enter_async_context(mcp_session())
+        await mcp_stack.enter_async_context(session_lifespan(meal_mcp))
         print("[Lifespan] Meal MCP server ready at /mcp")
     except Exception as e:
         print(f"[Lifespan] MCP server failed to start (meal skill degraded): {e}")
@@ -189,8 +190,9 @@ app.include_router(prefix="/api", router=supervisor.router)
 
 # The meal planner as a Model Context Protocol server. The supervisor consumes
 # it over this endpoint like any other MCP client would; point an external
-# client (Claude Desktop, the MCP Inspector) here too. See app/mcp/mount.py.
-app.mount("/mcp", mcp_asgi_app())
+# client (Claude Desktop, the MCP Inspector) here too. Additional servers mount
+# alongside this one and join the session_lifespan(...) call. See app/mcp/mount.py.
+app.mount("/mcp", guarded_app(meal_mcp))
 
 
 @app.get("/")

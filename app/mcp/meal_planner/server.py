@@ -33,8 +33,8 @@ RUNNING IT
 Mounted at /mcp by app.main for the supervisor. Standalone, for an MCP client
 such as Claude Desktop or `npx @modelcontextprotocol/inspector`:
 
-    MCP_USER_ID=<uid> python -m app.mcp.meal_server           # stdio
-    python -m app.mcp.meal_server --http                      # :8100/mcp
+    MCP_USER_ID=<uid> python -m app.mcp.meal_planner          # stdio
+    python -m app.mcp.meal_planner --http                     # :8100/mcp
 """
 
 import logging
@@ -253,7 +253,7 @@ async def add_food_dislike(
 
 
 def main() -> None:
-    """Standalone entry point — see RUNNING IT in the module docstring."""
+    """Standalone entry point. Invoked by __main__.py — see RUNNING IT above."""
     import sys
 
     logging.basicConfig(level=logging.INFO)
@@ -265,7 +265,3 @@ def main() -> None:
         # stdio speaks the protocol over the pipe — nothing may be printed to
         # stdout, so logging goes to stderr (basicConfig's default).
         mcp.run(transport="stdio")
-
-
-if __name__ == "__main__":
-    main()

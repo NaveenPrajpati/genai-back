@@ -2,7 +2,7 @@
 
 Mirrors personal_assistant.service and learning_tracker.service: a thin,
 intent-free domain API. This one has a second consumer beyond other agents —
-app/mcp/meal_server.py publishes these functions as MCP tools, so the meal
+app/mcp/meal_planner/server.py publishes these functions as MCP tools, so the meal
 planner is reachable by any MCP client (the supervisor graph, Claude Desktop,
 the MCP Inspector).
 

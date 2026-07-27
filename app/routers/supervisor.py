@@ -31,7 +31,7 @@ from app.agents.personal_assistant.state import (
     PAMemoryExtract,
 )
 from app.dependencies import get_current_user
-from app.mcp.client import MEAL_SERVER, load_meal_tools
+from app.mcp.meal_planner.client import MEAL_SERVER, load_meal_tools
 
 logger = logging.getLogger(__name__)
 

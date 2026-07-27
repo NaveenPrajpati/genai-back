@@ -5,8 +5,20 @@ as **LangGraph subgraphs** and the third over the **Model Context Protocol**.
 
 - **Companion doc:** [RAG_SYSTEM.md](RAG_SYSTEM.md) (the retrieval subsystem).
 - **Code root:** [`app/agents/supervisor/`](app/agents/supervisor/) (orchestration),
-  [`app/mcp/`](app/mcp/) (MCP server + client),
+  [`app/mcp/`](app/mcp/) (MCP servers + client),
   [`app/routers/supervisor.py`](app/routers/supervisor.py) (HTTP).
+
+```
+app/mcp/
+├── mount.py              shared: bearer guard + session lifespan, any server
+├── client.py             shared: per-user client, tool loading
+└── meal_planner/
+    ├── server.py         the MCP server itself
+    └── client.py         its URL + which tools a model may drive alone
+```
+
+One package per server. Adding another means a new package plus two lines in
+`app.main` — mount `guarded_app(<pkg>.mcp)` and add it to `session_lifespan(...)`.
 
 ---
 
@@ -85,7 +97,7 @@ meal planner splits plan creation in two:
 
 - `propose_meal_plan` — generates, persists **nothing**. Safe for the model to call.
 - `save_meal_plan` — persists an already-approved plan. **Withheld** from the tool loop
-  (`AUTONOMOUS_TOOLS` in [`app/mcp/client.py`](app/mcp/client.py)).
+  (`AUTONOMOUS_TOOLS` in [`app/mcp/meal_planner/client.py`](app/mcp/meal_planner/client.py)).
 
 The node runs the tool loop, extracts any proposal from the transcript, raises
 `interrupt()`, and calls `save_meal_plan` itself once the approval resolves.
@@ -108,7 +120,7 @@ or be talked into a different one. Identity travels out-of-band like a bearer to
 
 Tools that take a `plan_id` still verify ownership, so a guessed id from any client is
 rejected rather than trusted. Both properties are pinned by tests in
-[`tests/test_mcp_meal_server.py`](tests/test_mcp_meal_server.py).
+[`tests/test_mcp_meal_planner.py`](tests/test_mcp_meal_planner.py).
 
 ---
 
@@ -148,8 +160,8 @@ the supervisor thread rather than of the skill that raised it.
 Mounted at `/mcp` of the main app. Standalone:
 
 ```bash
-MCP_USER_ID=<uid> python -m app.mcp.meal_server     # stdio (Claude Desktop, Inspector)
-python -m app.mcp.meal_server --http                # streamable HTTP on :8100
+MCP_USER_ID=<uid> python -m app.mcp.meal_planner     # stdio (Claude Desktop, Inspector)
+python -m app.mcp.meal_planner --http                # streamable HTTP on :8100
 ```
 
 Nine tools: `list_meal_plans`, `get_meal_plan`, `get_grocery_list`,

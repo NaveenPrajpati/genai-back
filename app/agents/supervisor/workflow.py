@@ -12,7 +12,7 @@ WHY THE SKILLS ARE REACHED THREE DIFFERENT WAYS
     inherits the parent's, which is what makes an `interrupt()` deep inside the
     learning tracker's roadmap approval pause the whole supervisor run and
     resume from a single `Command(resume=...)` on the parent thread.
-  • meal — reached over MCP (app/mcp/client.py). No import of the meal agent
+  • meal — reached over MCP (app/mcp/meal_planner/). No import of the meal agent
     here at all; it is a network dependency that happens to live in-process.
 
 ONE SKILL PER NODE, NOT A LOOP INSIDE ONE NODE
@@ -41,7 +41,7 @@ from app.agents.personal_assistant import graph as pa_graph
 from app.agents.react import run_tool_loop
 from app.core.config import CACHE_CLASSIFY_THRESHOLD
 from app.core.llm import fast_llm, llm
-from app.mcp.client import (
+from app.mcp.meal_planner.client import (
     SAVE_PLAN_TOOL,
     autonomous_tools,
     find_tool,
