@@ -16,10 +16,11 @@ from typing import Optional, List
 
 from langchain_core.prompts import ChatPromptTemplate
 
+from app.core.config import CHECKPOINT_QUESTIONS
 from app.core.llm import llm
 from app.agents.personal_assistant.service import TaskSpec, create_tasks as create_pa_tasks
-from .state import RoadmapDraft, RoadmapOutput
-from .repository import insertRoadmapToDb, materialize_roadmap
+from .state import QuizOutput, RoadmapDraft, RoadmapOutput
+from .repository import insertRoadmapToDb, materialize_roadmap, profile_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,59 @@ async def revise_roadmap(
     )
 
 
+_CHECKPOINT_SYSTEM = (
+    "You are writing a short active-recall checkpoint for ONE topic in a learning "
+    "roadmap. The learner must pass it to mark the topic complete, so:\n"
+    "- Test understanding and application, not trivia or wording recall.\n"
+    "- Stay strictly within this topic. Do not ask about later topics.\n"
+    "- Every question must be answerable from the topic's description and "
+    "learning outcomes.\n"
+    "- Exactly one option is correct, and `answer` is its 0-based index.\n"
+    "- Make the wrong options plausible; an obviously silly distractor tests nothing.\n"
+    "Write exactly {count} questions.\n"
+    "Topic: {title}\n"
+    "Description: {description}\n"
+    "Learning outcomes:\n{outcomes}\n"
+    "Roadmap context: {roadmap_title}\n"
+    "Pitch the difficulty to the learner's profile:\n{memory}"
+)
+
+_REVIEW_NOTE = (
+    "\nThis is a spaced-repetition REVIEW of a topic the learner completed "
+    "earlier. Ask about it from a different angle than a first-pass quiz would — "
+    "the goal is durable recall, not recognising a question they've already seen."
+)
+
+
+async def build_checkpoint(
+    topic: dict,
+    roadmap_title: str,
+    memory: Optional[dict] = None,
+    is_review: bool = False,
+) -> QuizOutput:
+    """Generate a topic-scoped checkpoint quiz.
+
+    Grounded in the topic's own description and learning outcomes so the
+    questions can't wander into material the learner hasn't reached yet — the
+    failure mode that would make a completion gate feel arbitrary.
+    """
+    outcomes = "\n".join(f"- {o}" for o in topic.get("learning_outcomes") or [])
+    system = _CHECKPOINT_SYSTEM + (_REVIEW_NOTE if is_review else "")
+    chain = ChatPromptTemplate.from_messages(
+        [("system", system), ("human", "Write the checkpoint.")]
+    ) | llm.with_structured_output(QuizOutput)
+    return await chain.ainvoke(
+        {
+            "count": CHECKPOINT_QUESTIONS,
+            "title": topic.get("title", ""),
+            "description": topic.get("description", ""),
+            "outcomes": outcomes or "- (none given)",
+            "roadmap_title": roadmap_title or "general",
+            "memory": memory or "none",
+        }
+    )
+
+
 def roadmap_task_specs(roadmap: RoadmapOutput, roadmap_id: str) -> List[TaskSpec]:
     """Map a roadmap's topics to PA to-do specs. `source_ref` keys each task to
     its topic so re-runs (modify, resume-after-interrupt) don't duplicate — which
@@ -114,7 +168,9 @@ async def generate_roadmap(
     """Full cross-agent entry point: build a roadmap, persist it, and sync its
     topics to the PA's to-do list. Skips the interactive HITL approval (the
     caller is another agent, not the LT chat flow). Returns a compact summary."""
-    roadmap = materialize_roadmap(await build_roadmap(topic, memory))
+    roadmap = materialize_roadmap(
+        await build_roadmap(topic, memory), personalization=profile_snapshot(memory)
+    )
     roadmap_id = await insertRoadmapToDb(roadmap, user_id)
     tasks_created = await sync_roadmap_to_pa(user_id, roadmap, roadmap_id)
     logger.info(

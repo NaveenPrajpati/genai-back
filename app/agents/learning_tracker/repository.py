@@ -17,10 +17,12 @@ existed (a bare `covered: bool`) are not supported and are not read.
 import logging
 import uuid
 from datetime import date, timedelta, datetime, timezone
+from math import ceil
 from typing import Optional
 
 from bson import ObjectId
 
+from app.core.config import CHECKPOINT_PASS_SCORE
 from app.database import get_db
 from app.agents.memory_store import extract_and_save
 from .state import (
@@ -75,8 +77,97 @@ def roadmap_progress(roadmap: Optional[dict]) -> dict:
     }
 
 
+# ── personalization ──────────────────────────────────────────────────────────
+# The profile fields that actually reach the roadmap prompt. Anything outside
+# this list can change without making an existing roadmap out of date — which is
+# the point of keeping the list explicit rather than snapshotting the whole
+# profile and crying "stale" every time a quiz preference changes.
+PERSONALIZATION_FIELDS = (
+    "skill_level",
+    "goals",
+    "preferred_resource_types",
+    "availability",
+    "known_topics",
+)
+
+
+def profile_snapshot(memory: Optional[dict]) -> dict:
+    """The personalization inputs, with blanks dropped so an unset field and a
+    field set to [] don't read as different."""
+    memory = memory or {}
+    return {
+        k: memory[k]
+        for k in PERSONALIZATION_FIELDS
+        if memory.get(k) not in (None, [], "", {})
+    }
+
+
+def profile_drift(snapshot: Optional[dict], memory: Optional[dict]) -> list[str]:
+    """Which personalization inputs have changed since the roadmap was built.
+
+    Empty for a roadmap generated before we recorded a snapshot: we don't know
+    what it was built from, so claiming it's out of date would be a guess.
+    """
+    if snapshot is None:
+        return []
+    current = profile_snapshot(memory)
+    return sorted(
+        k for k in set(current) | set(snapshot) if current.get(k) != snapshot.get(k)
+    )
+
+
+def completion_forecast(
+    roadmap: Optional[dict], memory: Optional[dict]
+) -> Optional[dict]:
+    """Turn the remaining study time into a date, at the learner's stated pace.
+
+    None when there's nothing left to do or no pace on file — a forecast built on
+    a default nobody chose is worse than no forecast.
+    """
+    availability = (memory or {}).get("availability") or {}
+    per_day = availability.get("minutes_per_day") or 0
+    if per_day <= 0:
+        return None
+
+    remaining = sum(
+        t.get("estimated_minutes") or 0
+        for t in (roadmap or {}).get("topics") or []
+        if t.get("progress_status") not in DONE_STATUSES
+    )
+    if remaining <= 0:
+        return None
+
+    days_per_week = min(max(availability.get("days_per_week") or 7, 1), 7)
+    study_days = ceil(remaining / per_day)
+    # Studying 3 days a week stretches 6 study days across two calendar weeks.
+    calendar_days = ceil(study_days * 7 / days_per_week)
+    target = date.today() + timedelta(days=calendar_days)
+
+    forecast = {
+        "remaining_minutes": remaining,
+        "study_days": study_days,
+        "calendar_days": calendar_days,
+        "target_date": target.isoformat(),
+        "minutes_per_day": per_day,
+        "days_per_week": days_per_week,
+        "deadline": availability.get("deadline"),
+        "on_track": None,
+    }
+    deadline = availability.get("deadline")
+    if deadline:
+        try:
+            forecast["on_track"] = target <= date.fromisoformat(deadline[:10])
+        except ValueError:
+            pass
+    return forecast
+
+
 # ── draft → persisted roadmap ────────────────────────────────────────────────
-def materialize_roadmap(draft: RoadmapDraft, status: str = "active") -> RoadmapOutput:
+def materialize_roadmap(
+    draft: RoadmapDraft,
+    status: str = "active",
+    personalization: Optional[dict] = None,
+) -> RoadmapOutput:
     """Turn an LLM draft into a persistable roadmap. Ids, status, timestamps and
     progress are assigned here, so a generated roadmap can't arrive pre-archived
     or with progress already set."""
@@ -118,12 +209,15 @@ def materialize_roadmap(draft: RoadmapDraft, status: str = "active") -> RoadmapO
         total_estimated_hours=draft.total_estimated_hours,
         stages=stages,
         topics=topics,
+        personalization=personalization,
         created_at=now,
         updated_at=now,
     )
 
 
-def merge_roadmap(existing: dict, draft: RoadmapDraft) -> RoadmapOutput:
+def merge_roadmap(
+    existing: dict, draft: RoadmapDraft, memory: Optional[dict] = None
+) -> RoadmapOutput:
     """Apply an edited draft on top of a stored roadmap without losing progress.
 
     A topic keeps its id — and so its progress and its PA to-do `source_ref` —
@@ -139,7 +233,15 @@ def merge_roadmap(existing: dict, draft: RoadmapDraft) -> RoadmapOutput:
     for t in stored.values():
         by_title.setdefault(t.get("title", "").strip().lower(), t)
 
-    merged = materialize_roadmap(draft, status=existing.get("status") or "active")
+    merged = materialize_roadmap(
+        draft,
+        status=existing.get("status") or "active",
+        # An edit re-personalizes against the profile as it stands now; without
+        # a profile to hand, keep whatever the roadmap was built from.
+        personalization=(
+            profile_snapshot(memory) if memory is not None else existing.get("personalization")
+        ),
+    )
 
     claimed = set()
     # Same sort as materialize_roadmap, so each materialized topic lines up with
@@ -262,6 +364,7 @@ async def learning_stats(user_id: str) -> dict:
                 "status": 1,
                 "topics.progress_status": 1,
                 "topics.completed_at": 1,
+                "topics.next_review_at": 1,
             },
         )
         roadmaps = await cursor.to_list(None)
@@ -270,7 +373,9 @@ async def learning_stats(user_id: str) -> dict:
 
     counts = {"total": len(roadmaps), "active": 0, "completed": 0}
     total_topics = 0
+    reviews_due = 0
     completed_days: list[str] = []  # ISO date per completed topic
+    stamp = datetime.now(timezone.utc).isoformat()
     for r in roadmaps:
         if r.get("status") == "active":
             counts["active"] += 1
@@ -282,6 +387,9 @@ async def learning_stats(user_id: str) -> dict:
                 # "" for a topic completed without a timestamp: it still counts
                 # towards the total, it just can't contribute to a streak.
                 completed_days.append((t.get("completed_at") or "")[:10])
+                due = t.get("next_review_at")
+                if due and due <= stamp:
+                    reviews_due += 1
 
     completed_topics = len(completed_days)
     dated = {d for d in completed_days if d}
@@ -322,6 +430,7 @@ async def learning_stats(user_id: str) -> dict:
         },
         "completed_this_week": this_week,
         "streak_days": streak,
+        "reviews_due": reviews_due,
         "quizzes": {"attempts": attempts, "average_score": average},
     }
 
@@ -375,8 +484,16 @@ async def set_topic_progress(
         logger.error("set_topic_progress error: %s", e)
         return False
 
-    # Roll the roadmap's lifecycle forward. Best-effort — the topic write already
-    # succeeded and must not be reported as failed if this part doesn't land.
+    await _rollup_roadmap_status(roadmapId, user_id)
+    return True
+
+
+async def _rollup_roadmap_status(roadmapId: str, user_id: str) -> None:
+    """Move the roadmap itself to `completed` once every topic is done, and back
+    to `active` if one is reopened. Best-effort — the topic write that triggered
+    this has already succeeded and must not be reported as failed if the rollup
+    doesn't land."""
+    col = get_db()["roadmaps"]
     try:
         doc = await col.find_one(
             {"_id": ObjectId(roadmapId), "user_id": user_id},
@@ -393,12 +510,129 @@ async def set_topic_progress(
         if topics and doc.get("status") in ("active", "completed") and doc["status"] != rolled:
             await col.update_one(
                 {"_id": ObjectId(roadmapId), "user_id": user_id},
-                {"$set": {"status": rolled, "updated_at": now}},
+                {
+                    "$set": {
+                        "status": rolled,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                },
             )
     except Exception as e:
         logger.error("roadmap status rollup error id=%s: %s", roadmapId, e)
 
-    return True
+
+# ── checkpoints & spaced repetition ──────────────────────────────────────────
+# Days until a topic resurfaces, indexed by how many checkpoints it has passed
+# in a row. Expanding intervals: the better you know it, the less often it comes
+# back. A failed check resets to the front of the ladder.
+REVIEW_LADDER_DAYS = (1, 3, 7, 16, 35)
+
+
+def next_review_at(review_count: int) -> str:
+    """When a topic with `review_count` consecutive passes should resurface."""
+    idx = min(max(review_count - 1, 0), len(REVIEW_LADDER_DAYS) - 1)
+    due = datetime.now(timezone.utc) + timedelta(days=REVIEW_LADDER_DAYS[idx])
+    return due.isoformat()
+
+
+def find_topic(roadmap: Optional[dict], topicId: str) -> Optional[dict]:
+    return next(
+        (t for t in (roadmap or {}).get("topics") or [] if t.get("id") == topicId), None
+    )
+
+
+async def apply_checkpoint(
+    roadmapId: str, topicId: str, user_id: str, score: int
+) -> Optional[dict]:
+    """Fold a graded checkpoint into the topic: mastery, completion, next review.
+
+    Passing is what completes a topic — the point of gating completion on active
+    recall rather than on a checkbox.
+
+    Failing is deliberately asymmetric. A failed *first* attempt leaves the topic
+    `in_progress` and simply doesn't complete it. A failed *review* does NOT
+    un-complete a topic the learner already finished; it drags the next review
+    back to the front of the ladder instead. Clawing back progress for an honest
+    attempt would punish the exact behaviour this feature exists to encourage.
+    """
+    roadmap = await fetch_roadmap(roadmapId, user_id)
+    topic = find_topic(roadmap, topicId)
+    if topic is None:
+        return None
+
+    passed = score >= CHECKPOINT_PASS_SCORE
+    was_completed = topic.get("progress_status") == "completed"
+    review_count = (int(topic.get("review_count") or 0) + 1) if passed else 0
+    status = "completed" if (passed or was_completed) else "in_progress"
+
+    now = datetime.now(timezone.utc).isoformat()
+    updates = {
+        "topics.$.progress_status": status,
+        "topics.$.mastery_score": score,
+        "topics.$.review_count": review_count,
+        "topics.$.next_review_at": next_review_at(review_count),
+        "updated_at": now,
+    }
+    if status == "completed" and not topic.get("completed_at"):
+        updates["topics.$.completed_at"] = now
+
+    try:
+        res = await get_db()["roadmaps"].update_one(
+            {"_id": ObjectId(roadmapId), "user_id": user_id, "topics.id": topicId},
+            {"$set": updates},
+        )
+        if res.matched_count == 0:
+            return None
+    except Exception as e:
+        logger.error("apply_checkpoint error: %s", e)
+        return None
+
+    await _rollup_roadmap_status(roadmapId, user_id)
+
+    return {
+        "passed": passed,
+        "progress_status": status,
+        "review_count": review_count,
+        "next_review_at": updates["topics.$.next_review_at"],
+        "was_review": was_completed,
+    }
+
+
+async def due_reviews(user_id: str, limit: int = 20) -> list[dict]:
+    """Completed topics whose next review has come due, soonest first — what
+    keeps earlier material coming back instead of being ticked off once."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cursor = get_db()["roadmaps"].find(
+            {"user_id": user_id, "topics.next_review_at": {"$lte": now}},
+            projection={"title": 1, "topics": 1},
+        )
+        roadmaps = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("due_reviews error user=%s: %s", user_id, e)
+        return []
+
+    due = []
+    for r in roadmaps:
+        for t in r.get("topics") or []:
+            when = t.get("next_review_at")
+            # The document matched because *a* topic is due; re-check each one.
+            if not when or when > now or t.get("progress_status") != "completed":
+                continue
+            due.append(
+                {
+                    "roadmapId": str(r["_id"]),
+                    "roadmapTitle": r.get("title"),
+                    "topicId": t.get("id"),
+                    "title": t.get("title"),
+                    "due_at": when,
+                    "mastery_score": t.get("mastery_score"),
+                    "review_count": t.get("review_count") or 0,
+                }
+            )
+
+    due.sort(key=lambda d: d["due_at"])
+    return due[:limit]
 
 
 async def set_topic_resources(
@@ -496,6 +730,155 @@ async def record_quiz_attempt(
         )
     except Exception as e:
         logger.error("record_quiz_attempt error user=%s: %s", user_id, e)
+
+
+# ── notes ────────────────────────────────────────────────────────────────────
+# Notes live in their own collection rather than inside the roadmap document.
+# Two reasons, and the first is the important one:
+#   1. A roadmap edit regenerates its topics from an LLM draft. Anything embedded
+#      in a topic has to be carefully carried across that (see merge_roadmap) —
+#      and the learner's own writing is the last thing that should ever depend on
+#      getting that right. Out here, a regeneration cannot touch them.
+#   2. "My notes" is a cross-roadmap query. One indexed read beats scanning every
+#      roadmap and flattening.
+NOTES = "learning_notes"
+
+
+async def create_note(
+    user_id: str,
+    roadmapId: str,
+    topicId: str,
+    kind: str,
+    body: str,
+    url: Optional[str] = None,
+) -> Optional[dict]:
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "user_id": user_id,
+        "roadmapId": roadmapId,
+        "topicId": topicId,
+        "kind": kind,
+        "body": body,
+        "url": url,
+        "resolved": False,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    try:
+        res = await get_db()[NOTES].insert_one(doc)
+        return {**doc, "_id": str(res.inserted_id)}
+    except Exception as e:
+        logger.error("create_note error user=%s: %s", user_id, e)
+        return None
+
+
+async def _label_map(user_id: str) -> dict:
+    """{roadmapId: {"title": …, "topics": {topicId: title}}} for decorating notes.
+
+    Resolved at read time rather than denormalised onto each note: a roadmap edit
+    can rename a topic, and a note pointing at a stale label is worse than one
+    extra query.
+    """
+    try:
+        cursor = get_db()["roadmaps"].find(
+            {"user_id": user_id}, projection={"title": 1, "topics.id": 1, "topics.title": 1}
+        )
+        return {
+            str(r["_id"]): {
+                "title": r.get("title"),
+                "topics": {t.get("id"): t.get("title") for t in r.get("topics") or []},
+            }
+            for r in await cursor.to_list(None)
+        }
+    except Exception as e:
+        logger.error("_label_map error user=%s: %s", user_id, e)
+        return {}
+
+
+async def list_notes(
+    user_id: str,
+    roadmapId: Optional[str] = None,
+    topicId: Optional[str] = None,
+    kind: Optional[str] = None,
+    limit: int = 100,
+    skip: int = 0,
+) -> list[dict]:
+    """A learner's notes, newest first, decorated with the roadmap and topic they
+    belong to. A note whose topic was removed by a later edit still comes back —
+    it just carries no topic title. Losing the note would be worse."""
+    query: dict = {"user_id": user_id}
+    if roadmapId:
+        query["roadmapId"] = roadmapId
+    if topicId:
+        query["topicId"] = topicId
+    if kind:
+        query["kind"] = kind
+
+    try:
+        cursor = (
+            get_db()[NOTES]
+            .find(query)
+            .sort([("createdAt", -1), ("_id", -1)])
+            .skip(max(skip, 0))
+            .limit(max(limit, 1))
+        )
+        docs = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("list_notes error user=%s: %s", user_id, e)
+        return []
+
+    labels = await _label_map(user_id)
+    for d in docs:
+        d["_id"] = str(d["_id"])
+        entry = labels.get(d.get("roadmapId")) or {}
+        d["roadmapTitle"] = entry.get("title")
+        d["topicTitle"] = (entry.get("topics") or {}).get(d.get("topicId"))
+    return docs
+
+
+async def update_note(note_id: str, user_id: str, updates: dict) -> bool:
+    if not updates:
+        return False
+    try:
+        res = await get_db()[NOTES].update_one(
+            {"_id": ObjectId(note_id), "user_id": user_id},
+            {"$set": {**updates, "updatedAt": datetime.now(timezone.utc).isoformat()}},
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("update_note error id=%s: %s", note_id, e)
+        return False
+
+
+async def delete_note(note_id: str, user_id: str) -> bool:
+    try:
+        res = await get_db()[NOTES].delete_one(
+            {"_id": ObjectId(note_id), "user_id": user_id}
+        )
+        return res.deleted_count > 0
+    except Exception as e:
+        logger.error("delete_note error id=%s: %s", note_id, e)
+        return False
+
+
+async def note_counts(user_id: str, roadmapId: str) -> dict:
+    """{topicId: count} so the roadmap screen can show which topics have notes
+    without pulling the notes themselves."""
+    try:
+        rows = await (
+            get_db()[NOTES]
+            .aggregate(
+                [
+                    {"$match": {"user_id": user_id, "roadmapId": roadmapId}},
+                    {"$group": {"_id": "$topicId", "n": {"$sum": 1}}},
+                ]
+            )
+            .to_list(None)
+        )
+        return {r["_id"]: r["n"] for r in rows if r.get("_id")}
+    except Exception as e:
+        logger.error("note_counts error user=%s: %s", user_id, e)
+        return {}
 
 
 # ── learner profile ──────────────────────────────────────────────────────────

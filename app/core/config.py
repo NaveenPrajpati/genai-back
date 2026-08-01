@@ -89,6 +89,13 @@ RAG_INGEST_RATE_WINDOW = _int_env("RAG_INGEST_RATE_WINDOW", 3600)
 RAG_DELETE_RATE_LIMIT = _int_env("RAG_DELETE_RATE_LIMIT", 30)
 RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 
+# --- Learning checkpoints (active recall) ---
+# Percentage a learner must score on a topic's checkpoint before it counts as
+# completed. Also the bar a spaced-repetition review has to clear to push the
+# next review further out.
+CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 70)
+CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 4)
+
 # --- MCP (meal planner published over Model Context Protocol) ---
 # app.main mounts the server at /mcp of this same process, so the default URL
 # points back at ourselves. Both sides are async, so the supervisor awaiting its

@@ -392,6 +392,522 @@ async def test_modifying_a_roadmap_you_dont_own_creates_nothing(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# progress write/read contract
+#
+# A tracker stuck at 0% is the symptom of the writer and the readers disagreeing
+# about which field holds progress. These assert they agree, field for field.
+# --------------------------------------------------------------------------- #
+async def test_completing_a_topic_writes_the_field_the_readers_count(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    # The rollup re-reads the roadmap; hand it back the topic we just wrote.
+    col.find_one = AsyncMock(
+        return_value={"status": "active", "topics": [{"progress_status": "completed"}]}
+    )
+
+    assert await repo.set_topic_progress(_OID, "t1", "completed", "userA") is True
+
+    written = col.update_one.await_args_list[0].args[1]["$set"]
+    assert written["topics.$.progress_status"] == "completed"
+    assert written["topics.$.completed_at"]  # a streak needs this stamp
+
+    # The exact document the writer produces, as one stored topic.
+    stored = {
+        "id": "t1",
+        "order": 1,
+        "title": "A",
+        "progress_status": written["topics.$.progress_status"],
+        "completed_at": written["topics.$.completed_at"],
+    }
+    assert repo.roadmap_progress({"topics": [stored]})["completed_count"] == 1
+    assert repo.active_topic({"topics": [stored]}) is None  # no longer "next"
+
+
+async def test_stats_count_the_same_written_topic(monkeypatch):
+    """learning_stats reads through a projection, so it can drift from
+    roadmap_progress independently."""
+    col = _patch_db(monkeypatch, _collection())
+    col.find_one = AsyncMock(
+        return_value={"status": "active", "topics": [{"progress_status": "completed"}]}
+    )
+    await repo.set_topic_progress(_OID, "t1", "completed", "userA")
+    written = col.update_one.await_args_list[0].args[1]["$set"]
+
+    _stats_db(
+        monkeypatch,
+        [
+            {
+                "status": "active",
+                "topics": [
+                    {
+                        "progress_status": written["topics.$.progress_status"],
+                        "completed_at": written["topics.$.completed_at"],
+                    }
+                ],
+            }
+        ],
+    )
+    stats = await repo.learning_stats("userA")
+    assert stats["topics"]["completed"] == 1
+    assert stats["topics"]["percent"] == 100
+    # Completing something today must move the streak off zero, or the counter
+    # reads as broken however correct the totals are.
+    assert stats["streak_days"] == 1
+    assert stats["completed_this_week"] == 1
+
+
+async def test_reopening_a_topic_clears_its_completion_stamp(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    col.find_one = AsyncMock(
+        return_value={"status": "completed", "topics": [{"progress_status": "not_started"}]}
+    )
+    await repo.set_topic_progress(_OID, "t1", "not_started", "userA")
+
+    written = col.update_one.await_args_list[0].args[1]["$set"]
+    assert written["topics.$.completed_at"] is None
+    # …and the roadmap comes back out of "completed".
+    rolled = col.update_one.await_args_list[1].args[1]["$set"]
+    assert rolled["status"] == "active"
+
+
+async def test_a_freshly_generated_roadmap_starts_at_zero_not_complete():
+    """materialize_roadmap is what every new roadmap goes through; if it emitted
+    anything other than not_started the tracker would be wrong from birth."""
+    roadmap = repo.materialize_roadmap(_draft(_topic(1, "A"), _topic(2, "B")))
+    stored = {"topics": [t.model_dump() for t in roadmap.topics]}
+    progress = repo.roadmap_progress(stored)
+    assert progress == {
+        "next_topic": "A",
+        "next_topic_id": roadmap.topics[0].id,
+        "completed_count": 0,
+        "remaining": 2,
+        "total": 2,
+        "percent": 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# notes
+# --------------------------------------------------------------------------- #
+def _notes_db(monkeypatch, notes=(), roadmaps=()):
+    notes_col, roadmap_col = _collection(), _collection()
+    notes_col.find = MagicMock(
+        return_value=MagicMock(
+            sort=lambda *_: MagicMock(
+                skip=lambda *_: MagicMock(
+                    limit=lambda *_: MagicMock(to_list=AsyncMock(return_value=list(notes)))
+                )
+            )
+        )
+    )
+    notes_col.delete_one = AsyncMock(return_value=MagicMock(deleted_count=1))
+    roadmap_col.find = MagicMock(
+        return_value=MagicMock(to_list=AsyncMock(return_value=list(roadmaps)))
+    )
+    monkeypatch.setattr(
+        repo, "get_db", lambda: {repo.NOTES: notes_col, "roadmaps": roadmap_col}
+    )
+    return notes_col
+
+
+async def test_a_note_records_who_and_what_it_belongs_to(monkeypatch):
+    col = _notes_db(monkeypatch)
+    note = await repo.create_note("userA", "r1", "t1", "snippet", "let x = 5;")
+
+    doc = col.insert_one.await_args.args[0]
+    assert doc["user_id"] == "userA"
+    assert (doc["kind"], doc["body"]) == ("snippet", "let x = 5;")
+    assert doc["resolved"] is False
+    assert note["_id"]
+
+
+async def test_notes_are_decorated_with_where_they_came_from(monkeypatch):
+    """The consolidated view needs to say which topic a note is about, and titles
+    are resolved at read time so a renamed topic doesn't leave a stale label."""
+    _notes_db(
+        monkeypatch,
+        notes=[{"_id": _OID, "roadmapId": "r1", "topicId": "t1", "body": "n"}],
+        roadmaps=[{"_id": "r1", "title": "Rust", "topics": [{"id": "t1", "title": "Ownership"}]}],
+    )
+    note = (await repo.list_notes("userA"))[0]
+    assert note["roadmapTitle"] == "Rust"
+    assert note["topicTitle"] == "Ownership"
+
+
+async def test_a_note_survives_the_topic_it_was_written_against(monkeypatch):
+    """A roadmap edit can drop a topic. Losing the learner's writing with it
+    would be far worse than showing it without a topic label."""
+    _notes_db(
+        monkeypatch,
+        notes=[{"_id": _OID, "roadmapId": "r1", "topicId": "gone", "body": "still here"}],
+        roadmaps=[{"_id": "r1", "title": "Rust", "topics": []}],
+    )
+    notes = await repo.list_notes("userA")
+    assert len(notes) == 1
+    assert notes[0]["body"] == "still here"
+    assert notes[0]["topicTitle"] is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({}, {"user_id": "userA"}),
+        ({"roadmapId": "r1"}, {"user_id": "userA", "roadmapId": "r1"}),
+        ({"topicId": "t1"}, {"user_id": "userA", "topicId": "t1"}),
+        ({"kind": "question"}, {"user_id": "userA", "kind": "question"}),
+    ],
+)
+async def test_note_queries_are_always_scoped_to_the_caller(monkeypatch, kwargs, expected):
+    col = _notes_db(monkeypatch)
+    await repo.list_notes("userA", **kwargs)
+    assert col.find.call_args.args[0] == expected
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: repo.update_note(_OID, "userA", {"resolved": True}),
+        lambda: repo.delete_note(_OID, "userA"),
+    ],
+)
+async def test_editing_and_deleting_a_note_is_user_scoped(monkeypatch, call):
+    col = _notes_db(monkeypatch)
+    await call()
+    filt = (col.update_one.await_args or col.delete_one.await_args).args[0]
+    assert filt["user_id"] == "userA"
+
+
+async def test_update_note_with_nothing_to_change_is_a_no_op(monkeypatch):
+    col = _notes_db(monkeypatch)
+    assert await repo.update_note(_OID, "userA", {}) is False
+    col.update_one.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# personalization made visible
+# --------------------------------------------------------------------------- #
+_PACED = {"availability": {"minutes_per_day": 60, "days_per_week": 7}}
+
+
+def _paced_roadmap(*minutes: int, done: int = 0) -> dict:
+    return {
+        "topics": [
+            {
+                "id": f"t{i}",
+                "estimated_minutes": m,
+                "progress_status": "completed" if i < done else "not_started",
+            }
+            for i, m in enumerate(minutes)
+        ]
+    }
+
+
+def test_forecast_turns_remaining_minutes_into_a_date():
+    f = repo.completion_forecast(_paced_roadmap(60, 60, 60), _PACED)
+    assert f["remaining_minutes"] == 180
+    assert f["study_days"] == 3
+    assert f["calendar_days"] == 3  # 7 days a week, so calendar == study days
+
+
+def test_forecast_stretches_over_the_weeks_a_part_time_pace_implies():
+    """Six study days at three days a week is a fortnight, not six days."""
+    f = repo.completion_forecast(
+        _paced_roadmap(*[60] * 6),
+        {"availability": {"minutes_per_day": 60, "days_per_week": 3}},
+    )
+    assert f["study_days"] == 6
+    assert f["calendar_days"] == 14
+
+
+def test_forecast_only_counts_what_is_left():
+    f = repo.completion_forecast(_paced_roadmap(60, 60, 60, done=2), _PACED)
+    assert f["remaining_minutes"] == 60
+
+
+def test_no_pace_on_file_means_no_forecast_rather_than_a_made_up_one():
+    assert repo.completion_forecast(_paced_roadmap(60), {}) is None
+    assert repo.completion_forecast(_paced_roadmap(60), {"availability": {}}) is None
+    # Nothing left to do is also not a forecast.
+    assert repo.completion_forecast(_paced_roadmap(60, done=1), _PACED) is None
+
+
+def test_forecast_says_whether_a_stated_deadline_is_reachable():
+    soon = {"availability": {"minutes_per_day": 60, "days_per_week": 7, "deadline": "2020-01-01"}}
+    assert repo.completion_forecast(_paced_roadmap(60, 60), soon)["on_track"] is False
+
+    far = {"availability": {"minutes_per_day": 60, "days_per_week": 7, "deadline": "2099-01-01"}}
+    assert repo.completion_forecast(_paced_roadmap(60, 60), far)["on_track"] is True
+
+
+def test_snapshot_keeps_only_what_shapes_a_roadmap():
+    snap = repo.profile_snapshot(
+        {
+            "skill_level": "beginner",
+            "goals": ["ship a service"],
+            "preferred_quiz_difficulty": "hard",  # not a roadmap input
+            "known_topics": [],  # blank, so not recorded
+            "onboarded": True,
+        }
+    )
+    assert snap == {"skill_level": "beginner", "goals": ["ship a service"]}
+
+
+def test_drift_reports_the_inputs_that_changed():
+    snapshot = {"skill_level": "beginner", "goals": ["a"]}
+    assert repo.profile_drift(snapshot, {"skill_level": "beginner", "goals": ["a"]}) == []
+    assert repo.profile_drift(snapshot, {"skill_level": "advanced", "goals": ["a"]}) == [
+        "skill_level"
+    ]
+    # A field filled in after the fact is drift too — that's new information the
+    # roadmap was never built with.
+    assert repo.profile_drift(snapshot, {**snapshot, "availability": {"minutes_per_day": 30}}) == [
+        "availability"
+    ]
+    # Changing something outside the personalization set is not drift.
+    assert repo.profile_drift(snapshot, {**snapshot, "preferred_quiz_difficulty": "easy"}) == []
+
+
+def test_a_roadmap_with_no_snapshot_is_never_called_stale():
+    """Pre-existing roadmaps have no record of what built them, so claiming the
+    profile has moved on would be a guess."""
+    assert repo.profile_drift(None, {"skill_level": "advanced"}) == []
+
+
+def test_generated_roadmaps_record_what_personalized_them():
+    memory = {"skill_level": "beginner", "preferred_quiz_difficulty": "hard"}
+    roadmap = repo.materialize_roadmap(
+        _draft(_topic(1, "A")), personalization=repo.profile_snapshot(memory)
+    )
+    assert roadmap.personalization == {"skill_level": "beginner"}
+
+
+def test_editing_a_roadmap_re_personalizes_it():
+    existing = {"status": "active", "topics": [], "personalization": {"skill_level": "beginner"}}
+    merged = repo.merge_roadmap(existing, _draft(_topic(1, "A")), {"skill_level": "advanced"})
+    assert merged.personalization == {"skill_level": "advanced"}
+
+    # …but an edit made without a profile to hand keeps the original record
+    # rather than blanking it.
+    kept = repo.merge_roadmap(existing, _draft(_topic(1, "A")))
+    assert kept.personalization == {"skill_level": "beginner"}
+
+
+# --------------------------------------------------------------------------- #
+# checkpoints & spaced repetition
+# --------------------------------------------------------------------------- #
+def _roadmap_with(topic: dict) -> dict:
+    return {"_id": _OID, "status": "active", "title": "Rust", "topics": [topic]}
+
+
+def _checkpoint_db(monkeypatch, topic: dict):
+    """Wire fetch_roadmap + the positional update for apply_checkpoint."""
+    col = _collection()
+    col.find_one = AsyncMock(return_value=_roadmap_with(topic))
+    _patch_db(monkeypatch, col)
+    return col
+
+
+def _written(col) -> dict:
+    return col.update_one.await_args_list[0].args[1]["$set"]
+
+
+def test_review_ladder_expands_with_each_consecutive_pass():
+    from datetime import datetime, timezone
+
+    def days_out(count: int) -> int:
+        due = datetime.fromisoformat(repo.next_review_at(count))
+        return round((due - datetime.now(timezone.utc)).total_seconds() / 86400)
+
+    assert [days_out(n) for n in (1, 2, 3, 4, 5)] == list(repo.REVIEW_LADDER_DAYS)
+    # A failure (count reset to 0) comes back tomorrow, not in five weeks.
+    assert days_out(0) == repo.REVIEW_LADDER_DAYS[0]
+    # The ladder tops out rather than running off the end.
+    assert days_out(99) == repo.REVIEW_LADDER_DAYS[-1]
+
+
+async def test_passing_a_checkpoint_is_what_completes_a_topic(monkeypatch):
+    col = _checkpoint_db(monkeypatch, {"id": "t1", "progress_status": "not_started"})
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+
+    assert out["passed"] is True
+    assert out["progress_status"] == "completed"
+    assert out["review_count"] == 1
+    assert out["was_review"] is False
+    written = _written(col)
+    assert written["topics.$.mastery_score"] == 100
+    assert written["topics.$.completed_at"]
+    assert written["topics.$.next_review_at"]
+
+
+async def test_failing_a_first_attempt_does_not_complete_the_topic(monkeypatch):
+    col = _checkpoint_db(monkeypatch, {"id": "t1", "progress_status": "not_started"})
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 25)
+
+    assert out["passed"] is False
+    assert out["progress_status"] == "in_progress"
+    assert _written(col).get("topics.$.completed_at") is None
+    # Still scheduled — a topic you struggled with should come back soonest.
+    assert out["review_count"] == 0
+
+
+async def test_failing_a_review_does_not_take_completion_away(monkeypatch):
+    """Clawing back progress for an honest attempt would punish the exact
+    behaviour spaced repetition exists to encourage."""
+    col = _checkpoint_db(
+        monkeypatch,
+        {
+            "id": "t1",
+            "progress_status": "completed",
+            "completed_at": "2026-01-01T00:00:00+00:00",
+            "review_count": 3,
+        },
+    )
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 30)
+
+    assert out["passed"] is False
+    assert out["progress_status"] == "completed"  # still done
+    assert out["was_review"] is True
+    assert out["review_count"] == 0  # but back to the front of the ladder
+    # The original completion date is not overwritten by the failed review.
+    assert "topics.$.completed_at" not in _written(col)
+
+
+async def test_passing_a_review_pushes_the_next_one_further_out(monkeypatch):
+    _checkpoint_db(
+        monkeypatch,
+        {"id": "t1", "progress_status": "completed", "completed_at": "x", "review_count": 2},
+    )
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 90)
+    assert out["review_count"] == 3
+    assert out["was_review"] is True
+
+
+async def test_a_checkpoint_for_an_unknown_topic_changes_nothing(monkeypatch):
+    col = _checkpoint_db(monkeypatch, {"id": "t1", "progress_status": "not_started"})
+    assert await repo.apply_checkpoint(_OID, "nope", "userA", 100) is None
+    col.update_one.assert_not_awaited()
+
+
+async def test_due_reviews_only_surfaces_completed_topics_past_their_date(monkeypatch):
+    past, future = "2020-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00"
+    col = _collection()
+    col.find = MagicMock(
+        return_value=MagicMock(
+            to_list=AsyncMock(
+                return_value=[
+                    {
+                        "_id": _OID,
+                        "title": "Rust",
+                        "topics": [
+                            {"id": "due", "title": "Ownership", "progress_status": "completed", "next_review_at": past},
+                            {"id": "later", "title": "Traits", "progress_status": "completed", "next_review_at": future},
+                            # Never completed, so it isn't a review candidate even
+                            # if something stamped a date on it.
+                            {"id": "unstarted", "title": "Macros", "progress_status": "not_started", "next_review_at": past},
+                        ],
+                    }
+                ]
+            )
+        )
+    )
+    _patch_db(monkeypatch, col)
+
+    due = await repo.due_reviews("userA")
+    assert [d["topicId"] for d in due] == ["due"]
+    assert due[0]["roadmapTitle"] == "Rust"
+
+
+async def test_stats_report_how_many_reviews_are_due(monkeypatch):
+    past, future = "2020-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00"
+    _stats_db(
+        monkeypatch,
+        [
+            {
+                "status": "active",
+                "topics": [
+                    {"progress_status": "completed", "completed_at": f"{_day(0)}T09:00:00+00:00", "next_review_at": past},
+                    {"progress_status": "completed", "completed_at": f"{_day(1)}T09:00:00+00:00", "next_review_at": future},
+                ],
+            }
+        ],
+    )
+    assert (await repo.learning_stats("userA"))["reviews_due"] == 1
+
+
+async def test_progress_route_refuses_to_complete_without_a_checkpoint(monkeypatch):
+    """The gate is the feature: completion has to be earned, not asserted."""
+    from fastapi import HTTPException
+
+    wrote = AsyncMock()
+    monkeypatch.setattr(lt_router, "set_topic_progress", wrote)
+
+    body = lt_router.ProgressUpdate(roadmapId=_OID, topicId="t1", status="completed")
+    with pytest.raises(HTTPException) as err:
+        await lt_router.update_progress(body, {"uid": "userA"})
+
+    assert err.value.status_code == 409
+    wrote.assert_not_awaited()
+
+    # The legacy boolean shape defaulted to completing, so it has to be caught too.
+    with pytest.raises(HTTPException):
+        await lt_router.update_progress(
+            lt_router.ProgressUpdate(roadmapId=_OID, topicId="t1", covered=True),
+            {"uid": "userA"},
+        )
+
+
+async def test_chat_cannot_complete_a_topic_either(monkeypatch):
+    """The HTTP gate is worthless if 'I finished pointers' in chat walks around
+    it — the agent path writes to the repository directly."""
+    roadmap = {
+        "_id": _OID,
+        "topics": [{"id": "t1", "title": "Pointers", "progress_status": "not_started"}],
+    }
+    monkeypatch.setattr(lt, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    wrote = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt, "set_topic_progress", wrote)
+
+    # The node pipes a prompt into the model, so the stand-in has to be a real
+    # Runnable rather than a bare mock.
+    from langchain_core.runnables import RunnableLambda
+
+    fake_llm = MagicMock()
+    fake_llm.with_structured_output.return_value = RunnableLambda(
+        lambda _: MagicMock(topicId="t1")
+    )
+    monkeypatch.setattr(lt, "fast_llm", fake_llm)
+
+    out = await lt.progress_agent(
+        {
+            "user_id": "userA",
+            "intent": "update_progress",
+            "roadmapId": _OID,
+            "query": "I finished pointers",
+        }
+    )
+
+    assert out["log_status"] == "checkpoint_required"
+    assert wrote.await_args.args[2] == "in_progress"  # never "completed"
+
+
+@pytest.mark.parametrize("status", ["in_progress", "skipped", "not_started"])
+async def test_progress_route_still_owns_every_other_transition(monkeypatch, status):
+    """Only completion is gated. Starting, skipping, and reopening stay direct —
+    the gate is on claiming knowledge, not on retracting it."""
+    wrote = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt_router, "set_topic_progress", wrote)
+
+    out = await lt_router.update_progress(
+        lt_router.ProgressUpdate(roadmapId=_OID, topicId="t1", status=status),
+        {"uid": "userA"},
+    )
+    assert out["progress_status"] == status
+    assert wrote.await_args.args[2] == status
+
+
+# --------------------------------------------------------------------------- #
 # landing-screen stats
 # --------------------------------------------------------------------------- #
 def _stats_db(monkeypatch, roadmaps, attempts=()):

@@ -119,6 +119,10 @@ class TopicNode(BaseModel):
     progress_status: ProgressStatus = "not_started"
     mastery_score: Optional[int] = Field(default=None, ge=0, le=100)
     completed_at: Optional[str] = None
+    # Spaced repetition: consecutive checkpoint passes, and when this topic
+    # should resurface. A failed review resets the count, pulling the next
+    # review back to the start of the ladder.
+    review_count: int = 0
     next_review_at: Optional[str] = None
 
 
@@ -135,6 +139,12 @@ class RoadmapOutput(BaseModel):
     stages: list[Stage] = Field(default_factory=list)
     topics: list[TopicNode] = Field(default_factory=list)
 
+    # Snapshot of the learner-profile fields that shaped this roadmap, taken at
+    # generation time. Kept so the UI can show *what* was personalized instead of
+    # asserting that something was, and so we can tell when the profile has moved
+    # on. None means "generated before we recorded this" — unknown, not empty.
+    personalization: Optional[dict] = None
+
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -147,6 +157,24 @@ class Question(BaseModel):
 
 class QuizOutput(BaseModel):
     quiz: list[Question]
+
+
+class CheckpointOutcome(BaseModel):
+    """What a graded checkpoint did to the topic. Returned to the client so the
+    UI can explain the result rather than silently ticking (or not ticking) a box."""
+
+    passed: bool
+    score: int
+    pass_score: int
+    total: int
+    correct: int
+    review: list[dict] = Field(default_factory=list)
+    progress_status: ProgressStatus
+    next_review_at: Optional[str] = None
+    review_count: int = 0
+    # True when this checkpoint was a scheduled review of an already-completed
+    # topic, rather than the first attempt that completes it.
+    was_review: bool = False
 
 
 class SubmittedAnswer(BaseModel):

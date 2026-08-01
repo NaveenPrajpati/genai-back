@@ -36,6 +36,7 @@ from .repository import (
     insertRoadmapToDb,
     materialize_roadmap,
     merge_roadmap,
+    profile_snapshot,
     record_quiz_attempt,
     replace_roadmap,
     resolve_roadmap_id,
@@ -135,14 +136,15 @@ async def roadmap_agent(state: LearningState):
         await resolve(approval_id, "rejected")
         return {"intent": state.get("intent"), "roadmap_status": "rejected"}
 
+    memory = state.get("memory")
     if is_modify:
         # Merge onto the stored document so the learner keeps the progress they
         # already made on topics that survived the edit.
-        roadmap = merge_roadmap(existing_roadmap, draft)
+        roadmap = merge_roadmap(existing_roadmap, draft, memory)
         saved = await replace_roadmap(state["roadmapId"], user_id, roadmap)
         saved_roadmapId = state["roadmapId"] if saved else None
     else:
-        roadmap = materialize_roadmap(draft)
+        roadmap = materialize_roadmap(draft, personalization=profile_snapshot(memory))
         saved_roadmapId = await insertRoadmapToDb(roadmap, user_id)
 
     if not saved_roadmapId:
@@ -340,19 +342,25 @@ async def progress_agent(state: LearningState):
     )
     logger.info("update_progress matched id=%s", result.topicId)
 
-    if result.topicId not in {t.get("id") for t in topics}:
+    matched = next((t for t in topics if t.get("id") == result.topicId), None)
+    if matched is None:
         return {"roadmap": existing_roadmap, "log_status": "not_found"}
 
-    updated = await set_topic_progress(roadmapId, result.topicId, "completed", user_id)
+    if matched.get("progress_status") == "completed":
+        return {"roadmap": existing_roadmap, "log_status": "already_complete"}
+
+    # Saying "I finished pointers" moves the topic along but does NOT complete
+    # it: completion is earned by passing the checkpoint. Letting chat mark
+    # things done would be a trivial way around the gate, which would make the
+    # gate — and the mastery scores behind it — meaningless.
+    updated = await set_topic_progress(roadmapId, result.topicId, "in_progress", user_id)
     if updated:
-        for t in topics:
-            if t.get("id") == result.topicId:
-                t["progress_status"] = "completed"
-                break
+        matched["progress_status"] = "in_progress"
 
     return {
         "roadmap": existing_roadmap,
-        "log_status": "updated" if updated else "not_found",
+        "next_topic": matched.get("title", ""),
+        "log_status": "checkpoint_required" if updated else "not_found",
     }
 
 

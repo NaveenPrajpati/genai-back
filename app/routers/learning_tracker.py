@@ -9,28 +9,45 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langgraph.types import Command
 
 from app.dependencies import get_current_user
 from app.database import get_db
 from app.agents.approval_store import get_pending
 from app.agents.memory_store import MEMORIES, get_profile, save_profile
+from app.core.config import CHECKPOINT_PASS_SCORE
+from app.agents.learning_tracker.service import build_checkpoint
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
+    apply_checkpoint,
+    completion_forecast,
+    create_note,
+    delete_note,
+    due_reviews,
     fetch_quiz,
     fetch_roadmap,
+    find_topic,
     grade_quiz,
     learning_stats,
+    list_notes,
     list_roadmaps,
+    note_counts,
+    profile_drift,
+    profile_snapshot,
     record_quiz_attempt,
+    update_note,
     resolve_roadmap_id,
     roadmap_progress,
     set_roadmap_status,
     set_topic_progress,
     write_memory,
 )
-from app.agents.learning_tracker.state import ProgressStatus, RoadmapStatus
+from app.agents.learning_tracker.state import (
+    CheckpointOutcome,
+    ProgressStatus,
+    RoadmapStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -338,10 +355,38 @@ async def submit_quiz(
     return {"status": "done", "result": result}
 
 
+async def _roadmap_view(roadmap: dict, user_id: str) -> dict:
+    """A roadmap with everything derived from the learner's profile attached.
+
+    The profile already shapes generation, but silently — this is what lets the
+    UI show the pace it implies, what was personalized, and whether the profile
+    has moved on since. One assembler so the detail and home screens can't
+    disagree about any of it.
+    """
+    memory = await get_profile(user_id, LEARNING_NS)
+    snapshot = roadmap.get("personalization")
+    return {
+        "roadmap": roadmap,
+        "progress": roadmap_progress(roadmap),
+        "forecast": completion_forecast(roadmap, memory),
+        "personalization": snapshot,
+        # Which inputs have changed since this roadmap was built. Empty for
+        # roadmaps generated before snapshots existed — see profile_drift.
+        "profile_changes": profile_drift(snapshot, memory),
+        # The profile as it stands, so an "update this roadmap" prompt can name
+        # the new values instead of vaguely saying something changed.
+        "current_personalization": profile_snapshot(memory),
+        # {topicId: n} — lets the roadmap mark which topics have been written
+        # about without shipping the notes themselves.
+        "note_counts": await note_counts(user_id, str(roadmap["_id"])),
+    }
+
+
 @router.get("/current-state")
 async def getCurrentState(current_user: Annotated[dict, Depends(get_current_user)]):
-    """What the learner is working on right now: their active roadmap and how far
-    along it is. The home screen's one call — no roadmapId needed."""
+    """What the learner is working on right now: their active roadmap, how far
+    along it is, and when their stated pace gets them to the end. The home
+    screen's one call — no roadmapId needed."""
     user_id = current_user["uid"]
     roadmapId = await resolve_roadmap_id(user_id)
     roadmap = await fetch_roadmap(roadmapId, user_id)
@@ -355,7 +400,7 @@ async def getCurrentState(current_user: Annotated[dict, Depends(get_current_user
     return {
         "status": "done",
         "message": "roadmap fetched",
-        "result": {"roadmap": roadmap, "progress": roadmap_progress(roadmap)},
+        "result": await _roadmap_view(roadmap, user_id),
     }
 
 
@@ -392,10 +437,7 @@ async def getPlan(
     roadmap = await fetch_roadmap(roadmapId, current_user["uid"])
     if not roadmap:
         raise HTTPException(status_code=404, detail="Roadmap not found.")
-    return {
-        "status": "done",
-        "result": {"roadmap": roadmap, "progress": roadmap_progress(roadmap)},
-    }
+    return {"status": "done", "result": await _roadmap_view(roadmap, current_user["uid"])}
 
 
 class RoadmapStatusUpdate(BaseModel):
@@ -482,6 +524,212 @@ async def get_digests(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+NoteKind = Literal["note", "snippet", "link", "question"]
+
+
+class NoteCreate(BaseModel):
+    roadmapId: str
+    topicId: str
+    # One field rather than four features: a jotting, a code snippet, a saved
+    # link, and a question to come back to differ in how they render and filter,
+    # not in what they are.
+    kind: NoteKind = "note"
+    body: str = Field(min_length=1, max_length=10_000)
+    url: Optional[str] = None
+
+
+@router.post("/notes")
+async def add_note(
+    body: NoteCreate, current_user: Annotated[dict, Depends(get_current_user)]
+):
+    note = await create_note(
+        current_user["uid"],
+        body.roadmapId,
+        body.topicId,
+        body.kind,
+        body.body.strip(),
+        body.url,
+    )
+    if not note:
+        raise HTTPException(status_code=500, detail="Could not save that note.")
+    return {"status": "done", "result": note}
+
+
+@router.get("/notes")
+async def get_notes(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    roadmapId: Optional[str] = None,
+    topicId: Optional[str] = None,
+    kind: Optional[NoteKind] = None,
+    limit: int = 100,
+    skip: int = 0,
+):
+    """Everything the learner has written down, newest first. Unfiltered this is
+    the consolidated "my notes" view; scoped to a topic it backs the notes
+    section on the roadmap screen."""
+    return {
+        "status": "done",
+        "result": await list_notes(
+            current_user["uid"],
+            roadmapId=roadmapId,
+            topicId=topicId,
+            kind=kind,
+            limit=limit,
+            skip=skip,
+        ),
+    }
+
+
+class NoteUpdate(BaseModel):
+    body: Optional[str] = Field(default=None, min_length=1, max_length=10_000)
+    url: Optional[str] = None
+    # Questions get ticked off once answered.
+    resolved: Optional[bool] = None
+
+
+@router.patch("/notes/{noteId}")
+async def edit_note(
+    noteId: str,
+    body: NoteUpdate,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    updates = body.model_dump(exclude_none=True)
+    if "body" in updates:
+        updates["body"] = updates["body"].strip()
+    if not updates:
+        raise HTTPException(status_code=422, detail="Nothing to update.")
+    if not await update_note(noteId, current_user["uid"], updates):
+        raise HTTPException(status_code=404, detail="Note not found.")
+    return {"status": "done", **updates}
+
+
+@router.delete("/notes/{noteId}")
+async def remove_note(
+    noteId: str, current_user: Annotated[dict, Depends(get_current_user)]
+):
+    if not await delete_note(noteId, current_user["uid"]):
+        raise HTTPException(status_code=404, detail="Note not found.")
+    return {"status": "done"}
+
+
+class CheckpointRequest(BaseModel):
+    roadmapId: str
+    # Force a new question set instead of resuming the one already issued.
+    regenerate: bool = False
+
+
+@router.post("/topics/{topicId}/checkpoint")
+async def start_checkpoint(
+    topicId: str,
+    body: CheckpointRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Issue the active-recall checkpoint for a topic.
+
+    Reuses the outstanding question set on a retry so a learner who failed sees
+    the same material again rather than a fresh roll of the dice; a scheduled
+    review always gets new questions, since recognising an old question isn't
+    recall. Answers are stripped — grading happens server-side.
+    """
+    user_id = current_user["uid"]
+    roadmap = await fetch_roadmap(body.roadmapId, user_id)
+    topic = find_topic(roadmap, topicId)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found.")
+
+    is_review = topic.get("progress_status") == "completed"
+    existing = None
+    if not body.regenerate and not is_review:
+        existing = await get_db()["quizzes"].find_one(
+            {"user_id": user_id, "roadmapId": body.roadmapId, "topicId": topicId},
+            sort=[("_id", -1)],
+        )
+
+    if existing:
+        quizId, questions = str(existing["_id"]), existing.get("questions", [])
+    else:
+        memory = await get_profile(user_id, LEARNING_NS)
+        generated = await build_checkpoint(
+            topic, (roadmap or {}).get("title", ""), memory, is_review
+        )
+        questions = [q.model_dump() for q in generated.quiz]
+        res = await get_db()["quizzes"].insert_one(
+            {
+                "user_id": user_id,
+                "roadmapId": body.roadmapId,
+                "topicId": topicId,
+                "kind": "review" if is_review else "checkpoint",
+                "questions": questions,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        quizId = str(res.inserted_id)
+
+    return {
+        "status": "done",
+        "result": {
+            "quizId": quizId,
+            "topicId": topicId,
+            "title": topic.get("title"),
+            "is_review": is_review,
+            "pass_score": CHECKPOINT_PASS_SCORE,
+            "questions": [
+                {"question": q.get("question"), "options": q.get("options")}
+                for q in questions
+            ],
+        },
+    }
+
+
+class CheckpointSubmission(BaseModel):
+    quizId: str
+    answers: list[Answer]
+
+
+@router.post("/checkpoint/submit")
+async def submit_checkpoint(
+    body: CheckpointSubmission,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Grade a checkpoint and let the result drive the topic's state: passing is
+    what completes it, and either way the next review gets scheduled."""
+    user_id = current_user["uid"]
+    quiz = await fetch_quiz(user_id, body.quizId)
+    # A quiz raised in chat without a roadmap has nothing to attach a result to.
+    if not quiz or not quiz.get("topicId") or not quiz.get("roadmapId"):
+        raise HTTPException(status_code=404, detail="Checkpoint not found.")
+
+    graded = grade_quiz(quiz.get("questions", []), {a.question: a.answer for a in body.answers})
+    await record_quiz_attempt(
+        user_id, body.quizId, quiz.get("roadmapId"), quiz.get("topicId"), graded
+    )
+
+    outcome = await apply_checkpoint(
+        quiz["roadmapId"], quiz["topicId"], user_id, graded["score"]
+    )
+    if outcome is None:
+        raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
+
+    return {
+        "status": "done",
+        "result": CheckpointOutcome(
+            **graded, **outcome, pass_score=CHECKPOINT_PASS_SCORE
+        ).model_dump(),
+    }
+
+
+@router.get("/reviews")
+async def get_reviews(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    limit: int = 20,
+):
+    """Topics whose spaced-repetition review has come due, soonest first."""
+    return {
+        "status": "done",
+        "result": await due_reviews(current_user["uid"], limit=limit),
+    }
+
+
 class ProgressUpdate(BaseModel):
     roadmapId: str
     topicId: str
@@ -497,9 +745,20 @@ class ProgressUpdate(BaseModel):
 async def update_progress(
     body: ProgressUpdate, current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    """Directly set a topic's progress — the primary path (e.g. a checkbox in the
-    UI, which already knows the topic id). No LLM involved."""
+    """Set a topic's progress directly — used for every transition the learner
+    controls outright: starting, skipping, or reopening a topic.
+
+    Completion is the exception. A topic is completed by passing its checkpoint
+    (POST /checkpoint/submit), not by asserting it, so that a finished roadmap
+    means something was recalled rather than something was tapped. Reopening a
+    topic stays free: the gate is on claiming knowledge, not on retracting it.
+    """
     status = body.status or ("completed" if body.covered else "not_started")
+    if status == "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="Pass this topic's checkpoint to complete it.",
+        )
     updated = await set_topic_progress(
         body.roadmapId,
         body.topicId,
