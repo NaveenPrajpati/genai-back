@@ -93,7 +93,9 @@ async def lifespan(app: FastAPI):
         app.state.learning_agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
         app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
-        app.state.supervisor_agent = supervisor_graph.compile(checkpointer=MemorySaver())
+        app.state.supervisor_agent = supervisor_graph.compile(
+            checkpointer=MemorySaver()
+        )
 
     # Learning digest: hourly sweep. run_triggers fires per user only when the
     # current hour matches their chosen schedule_hour in their own timezone.

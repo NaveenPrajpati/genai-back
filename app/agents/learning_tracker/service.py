@@ -6,6 +6,9 @@ Mirrors personal_assistant.service: a thin, intent-free domain API other agents
 on a human-approval `interrupt()`. That interrupt would propagate into the PA's
 run. So roadmap *generation* lives here as a direct, interrupt-free operation;
 the graph still wraps it with the approval step for the interactive path.
+
+Both roadmap prompts live here as the single source of truth — the graph imports
+them rather than keeping the second copy that used to drift.
 """
 
 import logging
@@ -15,8 +18,8 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.llm import llm
 from app.agents.personal_assistant.service import TaskSpec, create_tasks as create_pa_tasks
-from .state import RoadmapOutput
-from .repository import insertRoadmapToDb
+from .state import RoadmapDraft, RoadmapOutput
+from .repository import insertRoadmapToDb, materialize_roadmap
 
 logger = logging.getLogger(__name__)
 
@@ -24,26 +27,64 @@ _NEW_ROADMAP_SYSTEM = (
     "You are an expert curriculum designer and learning path architect.\n"
     "Given a topic the user wants to learn, produce a complete, sequenced roadmap:\n"
     "1. Break the subject into ordered topics (order field starts at 1).\n"
-    "2. For each topic list its prerequisites by title — only topics that appear earlier in the list.\n"
-    "3. Group topics into broad stages (e.g. Foundations, Intermediate, Advanced).\n"
-    "4. Estimate realistic study hours per topic and a total.\n"
-    "5. Suggest 1-2 free learning resources (course names, docs, book titles) per topic.\n"
+    "2. Group topics into broad stages (e.g. Foundations, Intermediate, Advanced), "
+    "each with its own order starting at 1. Set every topic's stage_order to the "
+    "order of the stage it belongs to.\n"
+    "3. For each topic list its prerequisites by title — only topics that appear "
+    "earlier in the list.\n"
+    "4. Estimate realistic study minutes per topic, and total hours for the roadmap.\n"
+    "5. Suggest 1-2 free learning resources per topic, each with a title, a URL if "
+    "you know one, and its resource_type.\n"
     "Personalize based on the exact subject in the user query. Be specific and practical.\n"
     "Learner profile (use to tailor depth, pacing, and resources):\n{memory}"
 )
 
+_MODIFY_ROADMAP_SYSTEM = (
+    "You are an expert curriculum designer. The user wants to modify an existing "
+    "learning roadmap.\n"
+    "Apply the requested change (add topic, remove topic, reorder, adjust hours, "
+    "update resources, etc.).\n"
+    "Return the FULL updated roadmap — keep all unchanged topics intact.\n"
+    "For every topic that already exists, copy its id into existing_id verbatim. "
+    "That is how the learner's progress on that topic survives the edit: a topic "
+    "returned without an existing_id is treated as brand new and starts from zero. "
+    "Leave existing_id null only for topics you are genuinely adding.\n"
+    "Maintain correct order values, stage_order links, and prerequisites after any "
+    "structural change.\n"
+    "Existing roadmap:\n{existing_roadmap}\n"
+    "Learner profile (use to tailor depth, pacing, and resources):\n{memory}"
+)
 
-async def build_roadmap(topic: str, memory: Optional[dict] = None) -> RoadmapOutput:
-    """Generate a fresh roadmap for `topic` (no persistence, no approval)."""
+
+async def build_roadmap(topic: str, memory: Optional[dict] = None) -> RoadmapDraft:
+    """Generate a fresh roadmap draft for `topic` (no ids, persistence, or approval)."""
     chain = ChatPromptTemplate.from_messages(
         [("system", _NEW_ROADMAP_SYSTEM), ("human", "{text}")]
-    ) | llm.with_structured_output(RoadmapOutput)
+    ) | llm.with_structured_output(RoadmapDraft)
     return await chain.ainvoke({"text": topic, "memory": memory or "none"})
+
+
+async def revise_roadmap(
+    request: str, existing_roadmap: dict, memory: Optional[dict] = None
+) -> RoadmapDraft:
+    """Apply the user's requested change to an existing roadmap, as a draft. The
+    caller merges it onto the stored document — see repository.merge_roadmap."""
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _MODIFY_ROADMAP_SYSTEM), ("human", "{text}")]
+    ) | llm.with_structured_output(RoadmapDraft)
+    return await chain.ainvoke(
+        {
+            "text": request,
+            "existing_roadmap": existing_roadmap,
+            "memory": memory or "none",
+        }
+    )
 
 
 def roadmap_task_specs(roadmap: RoadmapOutput, roadmap_id: str) -> List[TaskSpec]:
     """Map a roadmap's topics to PA to-do specs. `source_ref` keys each task to
-    its topic so re-runs (modify, resume-after-interrupt) don't duplicate."""
+    its topic so re-runs (modify, resume-after-interrupt) don't duplicate — which
+    only holds because topic ids are server-minted and survive a modify."""
     return [
         TaskSpec(
             title=f"Learn: {topic.title}",
@@ -73,7 +114,7 @@ async def generate_roadmap(
     """Full cross-agent entry point: build a roadmap, persist it, and sync its
     topics to the PA's to-do list. Skips the interactive HITL approval (the
     caller is another agent, not the LT chat flow). Returns a compact summary."""
-    roadmap = await build_roadmap(topic, memory)
+    roadmap = materialize_roadmap(await build_roadmap(topic, memory))
     roadmap_id = await insertRoadmapToDb(roadmap, user_id)
     tasks_created = await sync_roadmap_to_pa(user_id, roadmap, roadmap_id)
     logger.info(

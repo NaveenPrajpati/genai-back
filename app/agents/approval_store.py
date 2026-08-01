@@ -71,9 +71,19 @@ async def resolve(approval_id: str | None, status: str) -> None:
         logger.error("approval resolve error id=%s: %s", approval_id, e)
 
 
-async def get_pending(thread_id: str) -> dict | None:
-    """The pending approval for a thread (for router ownership checks/resume)."""
-    return await _col().find_one({"threadId": thread_id, "status": "pending"})
+async def get_pending(
+    thread_id: str, action_types: list[str] | None = None
+) -> dict | None:
+    """The pending approval for a thread (for router ownership checks/resume).
+
+    Pass `action_types` from an agent node: a supervisor thread carries approvals
+    from every skill, so a node that reuses whatever is pending can otherwise
+    pick up another agent's proposal and fail parsing it as its own.
+    """
+    query: dict = {"threadId": thread_id, "status": "pending"}
+    if action_types:
+        query["action_type"] = {"$in": action_types}
+    return await _col().find_one(query)
 
 
 async def list_pending(

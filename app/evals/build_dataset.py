@@ -57,13 +57,13 @@ TIERS: dict[str, str] = {
     "QuizOutput": "A",
     "BreakdownOutput": "A",
     "ResearchOutput": "A",  # ambiguous; meal-planner's nested variant is hard
-    "get_nutrition": "A",   # tool-calling traces
+    "get_nutrition": "A",  # tool-calling traces
     # ---- Tier B: extraction with subtle reasoning / routing / NL quality ----
-    "IntentOutput": "B",    # ambiguous router; keep generously
+    "IntentOutput": "B",  # ambiguous router; keep generously
     "LogOutput": "B",
     "RecipeOutput": "B",
     "TutorOutput": "B",
-    "MemoryExtract": "B",
+    "LearnerMemory": "B",
     "TopicTipsOutput": "B",
     "TaskInput": "B",
     "TaskUpdateInput": "B",
@@ -160,7 +160,10 @@ def to_sft_example(record: dict) -> Optional[dict]:
         return None
 
     messages = [
-        {"role": _PROMPT_ROLE.get(m.get("role"), "user"), "content": m.get("content", "")}
+        {
+            "role": _PROMPT_ROLE.get(m.get("role"), "user"),
+            "content": m.get("content", ""),
+        }
         for m in (record.get("messages") or [])
     ]
     if not messages:
@@ -198,7 +201,9 @@ def main() -> None:
     _write_jsonl(os.path.join(args.out_dir, "train.jsonl"), sft_train)
     _write_jsonl(os.path.join(args.out_dir, "eval.jsonl"), eval_)
 
-    print(f"{'call_site':24} {'tier':4} {'total':>6} {'kept':>6} {'train':>6} {'eval':>6}")
+    print(
+        f"{'call_site':24} {'tier':4} {'total':>6} {'kept':>6} {'train':>6} {'eval':>6}"
+    )
     for site, s in sorted(summary.items(), key=lambda kv: (kv[1]["tier"], kv[0])):
         print(
             f"{site:24} {s['tier']:4} {s['total']:6} {s['kept']:6} "

@@ -193,6 +193,7 @@ async def learning_agent(state: SupervisorState):
         "explanation": out.get("topic_explaination"),
         "quiz_questions": len(out.get("quiz") or []) or None,
         "quizId": out.get("quizId"),
+        "quiz_result": out.get("quiz_result"),
         "next_topic": out.get("next_topic"),
         "progress": out.get("progress"),
         "resources": out.get("suggestions"),
@@ -215,7 +216,11 @@ async def assistant_agent(state: SupervisorState):
         # the skill's own account of what it did rather than re-deriving it.
         "summary": out.get("response"),
         "tasks": [
-            {"title": t.get("title"), "priority": t.get("priority"), "due": t.get("due_at")}
+            {
+                "title": t.get("title"),
+                "priority": t.get("priority"),
+                "due": t.get("due_at"),
+            }
             for t in (out.get("todos") or [])[:20]
         ]
         or None,
@@ -424,7 +429,9 @@ async def finalize(state: SupervisorState):
             ),
         ]
     )
-    text = response.content if isinstance(response.content, str) else str(response.content)
+    text = (
+        response.content if isinstance(response.content, str) else str(response.content)
+    )
     return {"response": text, "messages": [AIMessage(content=text)]}
 
 

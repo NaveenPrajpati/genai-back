@@ -1,0 +1,20 @@
+flowchart TD
+    A["User opens Learning Assistant"] --> B["Input box: 'What would you like to learn or work on?'"]
+    B --> C{"Detect user intent"}
+    C --> D["Learn a topic"]
+    C --> E["Ask a question"]
+    C --> F["Solve / understand homework"]
+    C --> G["Upload notes, PDF, link, video"]
+    C --> H["Make a study plan"]
+    C --> I["Practice / test me"]
+    C --> J["Track progress or revise"]
+    C --> K["Unsupported / risky request"]
+
+    D --> L["Assess level, goal, time available"]
+    E --> M["Explain, then check understanding"]
+    F --> N["Give hints first; guide step-by-step"]
+    G --> O["Extract concepts, summarize, create practice"]
+    H --> P["Create adaptive schedule"]
+    I --> Q["Generate tailored questions and feedback"]
+    J --> R["Review weak topics with spaced repetition"]
+    K --> S["Set boundary, redirect, or request human review"]

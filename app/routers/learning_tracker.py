@@ -10,13 +10,27 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from bson import ObjectId
 from langgraph.types import Command
 
 from app.dependencies import get_current_user
 from app.database import get_db
 from app.agents.approval_store import get_pending
-from app.agents.learning_tracker.repository import set_topic_covered, write_memory
+from app.agents.memory_store import MEMORIES, get_profile, save_profile
+from app.agents.learning_tracker.repository import (
+    LEARNING_NS,
+    fetch_quiz,
+    fetch_roadmap,
+    grade_quiz,
+    learning_stats,
+    list_roadmaps,
+    record_quiz_attempt,
+    resolve_roadmap_id,
+    roadmap_progress,
+    set_roadmap_status,
+    set_topic_progress,
+    write_memory,
+)
+from app.agents.learning_tracker.state import ProgressStatus, RoadmapStatus
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +61,59 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
+def _pause_status(payload: dict) -> str:
+    """Which kind of pause the graph hit. Onboarding asks the learner a question
+    and resumes via /onboarding; everything else is a proposal awaiting approval
+    and resumes via /approvals."""
+    return "needs_input" if payload.get("type") == "onboarding" else "needs_approval"
+
+
+# Graph-state keys the client is allowed to see. A whitelist, not a blacklist:
+# the state also carries `current_user` (uid, token_version,
+# email_verify_code_hash) and the learner's whole memory profile, none of which
+# belongs in a chat response. Returning the raw state leaked all of it.
+_CLIENT_FIELDS = (
+    "intent",
+    "topic_explaination",
+    "quiz",
+    "quizId",
+    "quiz_result",
+    "suggestions",
+    "next_topic",
+    "progress",
+    "log_status",
+    "roadmap",
+    "roadmapId",
+    "roadmap_status",
+    "pa_tasks_created",
+)
+
+
+def _result(values: dict) -> dict:
+    """The turn's outcome, projected to what the client actually needs."""
+    return {k: values.get(k) for k in _CLIENT_FIELDS}
+
+
+def _turn(result: dict, thread_id: str) -> dict:
+    """One response shape for every route that advances a turn — /query,
+    /approvals, /onboarding.
+
+    The pause check comes first because resuming can pause again immediately:
+    answering onboarding runs straight on into the roadmap approval, and that
+    second interrupt has to surface as a pause rather than be buried in the
+    state dump the client would otherwise try to render.
+    """
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        payload = interrupts[0].value
+        return {
+            "status": _pause_status(payload),
+            "thread_id": thread_id,
+            "proposal": payload,
+        }
+    return {"status": "done", "thread_id": thread_id, "result": _result(result)}
+
+
 @router.post("/query")
 async def ask(
     body: QueryRequest,
@@ -70,7 +137,7 @@ async def ask(
         },
         config=config,
     )
-    logger.info("final -- %s", result)
+    logger.info("final intent=%s", result.get("intent"))
 
     # Fire-and-forget memory extraction after the response is sent — no added latency.
     if result.get("intent") in MEMORY_INTENTS:
@@ -81,15 +148,7 @@ async def ask(
             result.get("memory", {}),
         )
 
-    if "__interrupt__" in result:
-        payload = result["__interrupt__"][0].value
-        return {
-            "status": "needs_approval",
-            "thread_id": thread_id,  # app sends this back to /approve
-            "proposal": payload,
-        }
-
-    return {"status": "done", "result": result}
+    return _turn(result, thread_id)
 
 
 @router.post("/query/stream")
@@ -133,15 +192,16 @@ async def ask_stream(
             snapshot = await agent.aget_state(config)
             values = snapshot.values if snapshot else {}
 
-            # A node hit an interrupt (e.g. roadmap approval) — surface it instead
-            # of a normal result, mirroring /query.
+            # A node hit an interrupt (roadmap approval, onboarding) — surface it
+            # instead of a normal result, mirroring /query.
             interrupts = snapshot.interrupts if snapshot else None
             if snapshot and snapshot.next and interrupts:
+                payload = interrupts[0].value
                 yield _sse(
                     {
-                        "type": "needs_approval",
+                        "type": _pause_status(payload),
                         "thread_id": thread_id,
-                        "proposal": interrupts[0].value,
+                        "proposal": payload,
                     }
                 )
                 return
@@ -155,20 +215,7 @@ async def ask_stream(
                     values.get("memory", {}),
                 )
 
-            yield _sse(
-                {
-                    "type": "done",
-                    "result": {
-                        "intent": intent,
-                        "topic_explaination": values.get("topic_explaination"),
-                        "quiz": values.get("quiz"),
-                        "quizId": values.get("quizId"),
-                        "suggestions": values.get("suggestions"),
-                        "next_topic": values.get("next_topic"),
-                        "progress": values.get("progress"),
-                    },
-                }
-            )
+            yield _sse({"type": "done", "result": _result(values)})
         except Exception as exc:
             logger.exception("learning stream failed")
             yield _sse({"type": "error", "message": str(exc)})
@@ -220,7 +267,46 @@ async def approve(
         )
 
     result = await agent.ainvoke(Command(resume=body.decision), config=config)
-    return {"status": "done", "result": result}
+    return _turn(result, body.thread_id)
+
+
+class OnboardingAnswers(BaseModel):
+    thread_id: str
+    # Null / empty means the learner skipped. Either way onboarding is marked
+    # done so the questions don't come back on their next message.
+    answers: Optional[dict] = None
+
+
+@router.post("/onboarding")
+async def submit_onboarding(
+    body: OnboardingAnswers,
+    request: Request,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Resume a run paused on the onboarding questions.
+
+    Ownership is checked against the thread's own state rather than an approvals
+    row — onboarding creates no approval, and the checkpointed `user_id` is the
+    identity the graph actually ran under.
+    """
+    agent = request.app.state.learning_agent
+    config = {"configurable": {"thread_id": body.thread_id}}
+
+    snapshot = await agent.aget_state(config)
+    if not snapshot or not snapshot.next:
+        raise HTTPException(
+            status_code=404, detail="Nothing is waiting for input on this thread."
+        )
+    if (snapshot.values or {}).get("user_id") != current_user["uid"]:
+        raise HTTPException(
+            status_code=403, detail="You do not have access to this thread."
+        )
+
+    # Resuming finishes the turn the learner originally sent, which on a first
+    # run means going straight into roadmap generation — so this very often
+    # comes back as another pause rather than a finished result.
+    result = await agent.ainvoke(Command(resume=body.answers or {}), config=config)
+    return _turn(result, body.thread_id)
 
 
 class Answer(BaseModel):
@@ -237,91 +323,114 @@ class SubmitQuiz(BaseModel):
 async def submit_quiz(
     body: SubmitQuiz, current_user: Annotated[dict, Depends(get_current_user)]
 ):
+    """Grade a quiz submitted from the UI. Shares `grade_quiz` with the chat path
+    (quiz_grader_agent), so the same answers can't score differently."""
     user_id = current_user["uid"]
-    logger.info("--- %s", user_id)
-    try:
-        quiz = await get_db()["quizzes"].find_one(
-            {"_id": ObjectId(body.quizId), "user_id": user_id}
-        )
-        if not quiz:
-            raise HTTPException(status_code=404, detail="Quiz not found.")
+    quiz = await fetch_quiz(user_id, body.quizId)
+    if not quiz:
+        raise HTTPException(status_code=404, detail="Quiz not found.")
 
-        questions = quiz.get("questions", [])
-        selected = {a.question: a.answer for a in body.answers}
+    questions = quiz.get("questions", [])
+    result = grade_quiz(questions, {a.question: a.answer for a in body.answers})
+    await record_quiz_attempt(
+        user_id, body.quizId, quiz.get("roadmapId"), quiz.get("topicId"), result
+    )
+    return {"status": "done", "result": result}
 
-        correct = 0
-        review = []  # only the questions the user got wrong
-        for idx, q in enumerate(questions):
-            chosen = selected.get(idx)
-            if chosen == q.get("answer"):
-                correct += 1
-            else:
-                review.append(
-                    {
-                        "question": idx,
-                        "selected": chosen,
-                        "correctAnswer": q.get("answer"),
-                        "correctOption": (
-                            q.get("options", [])[q.get("answer")]
-                            if q.get("answer") is not None
-                            else None
-                        ),
-                    }
-                )
 
+@router.get("/current-state")
+async def getCurrentState(current_user: Annotated[dict, Depends(get_current_user)]):
+    """What the learner is working on right now: their active roadmap and how far
+    along it is. The home screen's one call — no roadmapId needed."""
+    user_id = current_user["uid"]
+    roadmapId = await resolve_roadmap_id(user_id)
+    roadmap = await fetch_roadmap(roadmapId, user_id)
+    if not roadmap:
         return {
             "status": "done",
-            "result": {
-                "total": len(questions),
-                "correct": correct,
-                "review": review,
-            },
+            "message": "What do you want to learn today?",
+            "result": None,
         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "status": "done",
+        "message": "roadmap fetched",
+        "result": {"roadmap": roadmap, "progress": roadmap_progress(roadmap)},
+    }
 
 
 @router.get("/roadmaps")
-async def getPlans(current_user: Annotated[dict, Depends(get_current_user)]):
-    user_id = current_user["uid"]
-    logger.info("--- %s", user_id)
-    try:
-        cursor = get_db()["roadmaps"].find({"user_id": user_id})
-        docs = await cursor.to_list(None)
-        for doc in docs:
-            doc["_id"] = str(doc["_id"])
-        logger.info("approvals found: %s", len(docs))
+async def getPlans(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    status: Optional[RoadmapStatus] = None,
+    limit: int = 20,
+    skip: int = 0,
+):
+    """The learner's roadmaps, newest first. Paginated and status-filterable so a
+    long-running account doesn't ship every roadmap in full on every load."""
+    docs = await list_roadmaps(
+        current_user["uid"], status=status, limit=limit, skip=skip
+    )
+    return {
+        "status": "done",
+        "message": "roadmaps fetched" if docs else "roadmaps not found",
+        "result": docs,
+    }
 
-        if not docs:
-            return {"status": "done", "message": "roadmaps not found", "result": []}
 
-        return {"status": "done", "message": "roadmaps fetched", "result": docs}
+@router.get("/stats")
+async def get_stats(current_user: Annotated[dict, Depends(get_current_user)]):
+    """Progress across all of the learner's roadmaps — the landing screen's
+    summary strip. Fetched in parallel with GET /roadmaps."""
+    return {"status": "done", "result": await learning_stats(current_user["uid"])}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/roadmaps/{roadmapId}")
+async def getPlan(
+    roadmapId: str, current_user: Annotated[dict, Depends(get_current_user)]
+):
+    roadmap = await fetch_roadmap(roadmapId, current_user["uid"])
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="Roadmap not found.")
+    return {
+        "status": "done",
+        "result": {"roadmap": roadmap, "progress": roadmap_progress(roadmap)},
+    }
+
+
+class RoadmapStatusUpdate(BaseModel):
+    status: RoadmapStatus
+
+
+@router.patch("/roadmaps/{roadmapId}")
+async def updateRoadmapStatus(
+    roadmapId: str,
+    body: RoadmapStatusUpdate,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Park, resume, or archive a roadmap. Which one is `active` decides what a
+    bare "what should I study next?" resolves to."""
+    updated = await set_roadmap_status(roadmapId, current_user["uid"], body.status)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Roadmap not found.")
+    return {"status": "done", "roadmapId": roadmapId, "roadmap_status": body.status}
 
 
 @router.get("/memory")
 async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
-    """Let the UI show the learner what the system remembers about them."""
-    try:
-        doc = await get_db()["memories"].find_one({"user_id": current_user["uid"]})
-        return {"status": "done", "result": doc.get("data", {}) if doc else {}}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Let the UI show the learner what the system remembers about them. Reads the
+    same `learning` namespace the agent reads, so the screen can't disagree with
+    what actually personalizes the roadmaps."""
+    return {
+        "status": "done",
+        "result": await get_profile(current_user["uid"], LEARNING_NS),
+    }
 
 
-@router.get("/state")
+@router.get("/state", deprecated=True)
 async def get_state(current_user: Annotated[dict, Depends(get_current_user)]):
-    """Let the UI show the learner what the system remembers about them."""
-    try:
-        doc = await get_db()["memories"].find_one({"user_id": current_user["uid"]})
-        return {"status": "done", "result": doc.get("data", {}) if doc else {}}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Deprecated alias of GET /memory — kept for shipped clients. Use /memory."""
+    return await get_memory(current_user)
 
 
 class MemoryUpdate(BaseModel):
@@ -334,30 +443,22 @@ async def put_memory(
 ):
     """Explicit user-managed edits (e.g. a settings screen). Merges the given keys
     into the stored profile; keys not sent are left untouched."""
-    try:
-        set_doc = {f"data.{k}": v for k, v in body.data.items()}
-        set_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        await get_db()["memories"].update_one(
-            {"user_id": current_user["uid"]},
-            {
-                "$set": set_doc,
-                "$setOnInsert": {"createdAt": datetime.now(timezone.utc).isoformat()},
-            },
-            upsert=True,
-        )
-        return {"status": "done"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    await save_profile(current_user["uid"], body.data, LEARNING_NS)
+    return {"status": "done"}
 
 
 @router.delete("/memory")
 async def delete_memory(current_user: Annotated[dict, Depends(get_current_user)]):
-    """Clear everything we remember about the learner (privacy / reset)."""
+    """Clear what we remember about the learner (privacy / reset). Drops only the
+    learning profile — the PA's and meal planner's namespaces are untouched."""
     try:
-        await get_db()["memories"].delete_one({"user_id": current_user["uid"]})
+        await get_db()[MEMORIES].update_one(
+            {"user_id": current_user["uid"]}, {"$unset": {LEARNING_NS: ""}}
+        )
         return {"status": "done"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("delete_memory error: %s", e)
+        raise HTTPException(status_code=500, detail="Could not clear memory.")
 
 
 @router.get("/digests")
@@ -384,30 +485,36 @@ async def get_digests(
 class ProgressUpdate(BaseModel):
     roadmapId: str
     topicId: str
+    # `status` is the full vocabulary (in_progress, needs_review, skipped, …);
+    # `covered` is the original boolean the shipped client sends. When both are
+    # absent this marks the topic completed, as it always did.
+    status: Optional[ProgressStatus] = None
     covered: bool = True
+    mastery_score: Optional[int] = None
 
 
 @router.post("/progress")
 async def update_progress(
     body: ProgressUpdate, current_user: Annotated[dict, Depends(get_current_user)]
 ):
-    """Directly set a topic's covered flag — the primary progress path (e.g. a
-    checkbox in the UI, which already knows the topic id). No LLM involved."""
-    try:
-        updated = await set_topic_covered(
-            body.roadmapId, body.topicId, body.covered, user_id=current_user["uid"]
-        )
-        if not updated:
-            raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
-        return {
-            "status": "done",
-            "topicId": body.topicId,
-            "covered": body.covered,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Directly set a topic's progress — the primary path (e.g. a checkbox in the
+    UI, which already knows the topic id). No LLM involved."""
+    status = body.status or ("completed" if body.covered else "not_started")
+    updated = await set_topic_progress(
+        body.roadmapId,
+        body.topicId,
+        status,
+        current_user["uid"],
+        mastery_score=body.mastery_score,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
+    return {
+        "status": "done",
+        "topicId": body.topicId,
+        "progress_status": status,
+        "covered": status == "completed",
+    }
 
 
 class Trigger(BaseModel):

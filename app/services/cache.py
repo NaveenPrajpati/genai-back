@@ -108,6 +108,7 @@ async def lookup_value(
     """Return the stored `value` of the most semantically-similar query in
     `scope` if it clears `threshold`, else None."""
     try:
+        # Get all cache keys for this scope
         cache_keys = await redis_client.smembers(f"{CACHE_INDEX_PREFIX}{scope}")
         if not cache_keys:
             return None
@@ -129,7 +130,10 @@ async def lookup_value(
         if best_sim < threshold:
             logger.info(
                 "cache miss scope=%s candidates=%d best_sim=%.3f threshold=%.2f",
-                scope, len(cache_keys), best_sim, threshold,
+                scope,
+                len(cache_keys),
+                best_sim,
+                threshold,
             )
         return best_value if best_sim >= threshold else None
     except Exception:
@@ -188,6 +192,8 @@ async def lookup(query_embedding: List[float], scope: str) -> Optional[dict]:
     return await lookup_value(query_embedding, scope, CACHE_SIMILARITY_THRESHOLD)
 
 
-async def save(query_embedding: List[float], scope: str, sources: list, answer: str) -> None:
+async def save(
+    query_embedding: List[float], scope: str, sources: list, answer: str
+) -> None:
     """Persist a Q&A pair to the semantic cache under the given scope."""
     await save_value(query_embedding, scope, {"sources": sources, "answer": answer})
