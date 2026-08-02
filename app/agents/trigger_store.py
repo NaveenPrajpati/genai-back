@@ -11,7 +11,7 @@ should go through here instead of touching the collection (or Supabase) directly
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.database import get_db
@@ -30,6 +30,17 @@ def _zone(trig: dict) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
+def _ran_on(trig: dict, tz: ZoneInfo, day) -> bool:
+    """Whether this trigger already fired on `day` in its own timezone."""
+    last = trig.get("last_run_at")
+    if not last:
+        return False
+    try:
+        return datetime.fromisoformat(last).astimezone(tz).date() == day
+    except ValueError:
+        return False
+
+
 def is_due(trig: dict, now: datetime) -> bool:
     """True when `now` matches the trigger's local schedule_hour (and schedule_dow,
     if set) in its timezone, and it hasn't already fired during the user's current
@@ -42,14 +53,38 @@ def is_due(trig: dict, now: datetime) -> bool:
     dow = trig.get("schedule_dow")
     if dow is not None and local.weekday() != dow:
         return False
-    last = trig.get("last_run_at")
-    if last:
-        try:
-            if datetime.fromisoformat(last).astimezone(tz).date() == local.date():
-                return False
-        except ValueError:
-            pass
-    return True
+    return not _ran_on(trig, tz, local.date())
+
+
+def next_run_at(trig: dict, now: datetime | None = None) -> str | None:
+    """When this trigger will next fire, as a UTC ISO timestamp.
+
+    The mirror image of `is_due`: same schedule_hour, timezone, schedule_dow and
+    already-ran-today rules, read forwards instead of tested against now. None
+    when the trigger is switched off — there is no next run to count down to.
+    """
+    if not trig.get("enabled", True):
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    tz = _zone(trig)
+    local = now.astimezone(tz)
+    hour = trig.get("schedule_hour", 9)
+
+    candidate = local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    # Today's slot is gone if the hour has passed or it already fired today.
+    if candidate <= local or _ran_on(trig, tz, candidate.date()):
+        candidate += timedelta(days=1)
+
+    dow = trig.get("schedule_dow")
+    if dow is not None:
+        # At most a week out; the loop can't run away.
+        for _ in range(7):
+            if candidate.weekday() == dow:
+                break
+            candidate += timedelta(days=1)
+
+    return candidate.astimezone(timezone.utc).isoformat()
 
 
 async def due_triggers(action_type: str, now: datetime | None = None) -> list[dict]:

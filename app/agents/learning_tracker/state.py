@@ -159,6 +159,20 @@ class QuizOutput(BaseModel):
     quiz: list[Question]
 
 
+class CoverageOutput(BaseModel):
+    """Whether the digests sent so far have actually taught the whole topic.
+
+    Checked after each digest: once the material is covered there's nothing left
+    to drip-feed, and the learner should be sitting the topic checkpoint instead
+    of receiving more tips.
+    """
+
+    covered: bool
+    # Learning outcomes the digests haven't reached yet — what the next digest
+    # should be about.
+    missing: list[str] = Field(default_factory=list)
+
+
 class CheckpointOutcome(BaseModel):
     """What a graded checkpoint did to the topic. Returned to the client so the
     UI can explain the result rather than silently ticking (or not ticking) a box."""

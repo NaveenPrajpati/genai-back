@@ -22,9 +22,10 @@ from typing import Optional
 
 from bson import ObjectId
 
-from app.core.config import CHECKPOINT_PASS_SCORE
+from app.core.config import CHECKPOINT_PASS_SCORE, DIGEST_MAX_UNREAD
 from app.database import get_db
 from app.agents.memory_store import extract_and_save
+from app.agents.trigger_store import next_run_at
 from .state import (
     DONE_STATUSES,
     LearnerMemory,
@@ -199,6 +200,9 @@ def materialize_roadmap(
         )
         for t in sorted(draft.topics, key=lambda t: t.order)
     ]
+    # A new roadmap opens with its first topic underway, so the learner has
+    # something in flight — and digests arriving — without a separate step.
+    enforce_single_in_progress(topics)
 
     return RoadmapOutput(
         title=draft.title,
@@ -260,6 +264,9 @@ def merge_roadmap(
         topic.completed_at = prior.get("completed_at")
         topic.next_review_at = prior.get("next_review_at")
 
+    # An edit can drop the topic that was underway, or carry two across; either
+    # way the roadmap comes out with exactly one.
+    enforce_single_in_progress(merged.topics)
     merged.created_at = existing.get("created_at") or merged.created_at
     return merged
 
@@ -462,6 +469,14 @@ async def set_topic_progress(
     """Move one topic to `status` via a targeted positional update — no LLM, no
     full-document rewrite. Rolls the roadmap itself to `completed` once every
     topic is done (and back to `active` if one is reopened)."""
+    # Starting a topic is a swap, not a set: whichever topic held the slot has
+    # to give it up in the same write.
+    if status == "in_progress":
+        started = await start_topic(roadmapId, topicId, user_id)
+        if started:
+            await _rollup_roadmap_status(roadmapId, user_id)
+        return started
+
     now = datetime.now(timezone.utc).isoformat()
     done = status == "completed"
     updates = {
@@ -587,6 +602,26 @@ async def apply_checkpoint(
         logger.error("apply_checkpoint error: %s", e)
         return None
 
+    # Passing the checkpoint on a topic for the first time hands the slot to the
+    # next one, so the learner always has exactly one topic in flight and its
+    # digests start straight away.
+    advanced = None
+    if passed and not was_completed:
+        ordered = sorted(
+            roadmap.get("topics") or [], key=lambda t: t.get("order", 0)
+        )
+        nxt = next(
+            (
+                t
+                for t in ordered
+                if t.get("id") != topicId
+                and t.get("progress_status") not in DONE_STATUSES
+            ),
+            None,
+        )
+        if nxt and await start_topic(roadmapId, nxt["id"], user_id):
+            advanced = {"topicId": nxt["id"], "title": nxt.get("title")}
+
     await _rollup_roadmap_status(roadmapId, user_id)
 
     return {
@@ -595,6 +630,8 @@ async def apply_checkpoint(
         "review_count": review_count,
         "next_review_at": updates["topics.$.next_review_at"],
         "was_review": was_completed,
+        # The topic that just picked up the baton, if any.
+        "advanced_to": advanced,
     }
 
 
@@ -730,6 +767,300 @@ async def record_quiz_attempt(
         )
     except Exception as e:
         logger.error("record_quiz_attempt error user=%s: %s", user_id, e)
+
+
+# ── digests ──────────────────────────────────────────────────────────────────
+# A digest is unread until the learner acknowledges it. That acknowledgement is
+# the only evidence we have that one actually landed, so it drives both the
+# catch-up screen and the decision not to pile a second digest on an unread one.
+#
+# `status` missing means unread: digests written before the field existed have
+# never been acknowledged either, so `{"status": {"$ne": "marked"}}` is the
+# honest query rather than a special case.
+DIGESTS = "learning_digests"
+
+
+def enforce_single_in_progress(topics: list) -> None:
+    """A roadmap has exactly one topic underway at a time. Mutates in place.
+
+    The whole drip-feed keys off that single topic — two of them would mean two
+    streams of digests competing for the same attention — so the invariant is
+    enforced here rather than trusted at each call site.
+
+    A topic sitting at `needs_review` holds the slot: it has been taught in full
+    and owes a checkpoint, and starting something new would let the learner
+    accumulate unfinished topics instead of closing one out.
+    """
+    ordered = sorted(topics, key=lambda t: t.order)
+    started = [t for t in ordered if t.progress_status == "in_progress"]
+    for extra in started[1:]:
+        extra.progress_status = "not_started"
+    if started or any(t.progress_status == "needs_review" for t in ordered):
+        return
+
+    nxt = next((t for t in ordered if t.progress_status not in DONE_STATUSES), None)
+    if nxt:
+        nxt.progress_status = "in_progress"
+
+
+async def start_topic(roadmapId: str, topicId: str, user_id: str) -> bool:
+    """Make `topicId` the one topic underway, demoting whichever held the slot.
+
+    One update with two array filters, so there is never a moment where the
+    roadmap has two topics in progress or none.
+    """
+    try:
+        res = await get_db()["roadmaps"].update_one(
+            {"_id": ObjectId(roadmapId), "user_id": user_id, "topics.id": topicId},
+            {
+                "$set": {
+                    "topics.$[other].progress_status": "not_started",
+                    "topics.$[target].progress_status": "in_progress",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            array_filters=[
+                {"other.progress_status": "in_progress", "other.id": {"$ne": topicId}},
+                {"target.id": topicId},
+            ],
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("start_topic error id=%s topic=%s: %s", roadmapId, topicId, e)
+        return False
+
+
+def in_progress_topic(roadmap: Optional[dict]) -> Optional[dict]:
+    """The topic a learner has actually started, in `order`.
+
+    Digests are only generated for these. A topic sitting at `not_started` hasn't
+    been picked up yet, and drip-feeding tips about something nobody has opened
+    is how an inbox fills with things nobody asked for.
+    """
+    topics = sorted((roadmap or {}).get("topics", []), key=lambda t: t.get("order", 0))
+    return next((t for t in topics if t.get("progress_status") == "in_progress"), None)
+
+
+async def unread_digest_count(
+    user_id: str, roadmapId: str, topicId: Optional[str]
+) -> int:
+    try:
+        return await get_db()[DIGESTS].count_documents(
+            {
+                "user_id": user_id,
+                "roadmapId": roadmapId,
+                "topicId": topicId,
+                "status": {"$ne": "marked"},
+            }
+        )
+    except Exception as e:
+        logger.error("unread_digest_count error user=%s: %s", user_id, e)
+        # Fail closed: if we can't tell how many are waiting, don't add another.
+        return DIGEST_MAX_UNREAD
+
+
+async def topic_digests(
+    user_id: str, roadmapId: str, topicId: Optional[str]
+) -> list[dict]:
+    """Every digest sent for a topic, oldest first — the running record of what
+    the learner has been told, which both the recall quiz and the coverage check
+    are built from."""
+    try:
+        cursor = (
+            get_db()[DIGESTS]
+            .find({"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId})
+            .sort([("createdAt", 1), ("_id", 1)])
+        )
+        return await cursor.to_list(None)
+    except Exception as e:
+        logger.error("topic_digests error user=%s: %s", user_id, e)
+        return []
+
+
+async def list_digests(
+    user_id: str,
+    status: Optional[str] = None,
+    active_only: bool = False,
+    limit: int = 20,
+) -> list[dict]:
+    """A learner's digests, newest first.
+
+    `active_only` narrows to roadmaps still in play — the catch-up view exists to
+    surface what's outstanding, and a digest for an archived roadmap isn't.
+    """
+    query: dict = {"user_id": user_id}
+    if status == "unread":
+        query["status"] = {"$ne": "marked"}
+    elif status:
+        query["status"] = status
+
+    labels = await _label_map(user_id)
+    if active_only:
+        try:
+            cursor = get_db()["roadmaps"].find(
+                {"user_id": user_id, "status": "active"}, projection={"_id": 1}
+            )
+            ids = [str(r["_id"]) for r in await cursor.to_list(None)]
+        except Exception as e:
+            logger.error("list_digests roadmap filter error user=%s: %s", user_id, e)
+            return []
+        if not ids:
+            return []
+        query["roadmapId"] = {"$in": ids}
+
+    try:
+        cursor = (
+            get_db()[DIGESTS]
+            .find(query)
+            .sort([("createdAt", -1), ("_id", -1)])
+            .limit(max(limit, 1))
+        )
+        docs = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("list_digests error user=%s: %s", user_id, e)
+        return []
+
+    # Attach each recall check's questions so the card can render it without a
+    # second round trip. One query for the whole page, and the answer key is
+    # stripped — grading stays server-side.
+    quiz_ids = [d["quizId"] for d in docs if d.get("quizId")]
+    quizzes: dict[str, list] = {}
+    if quiz_ids:
+        try:
+            found = await (
+                get_db()["quizzes"]
+                .find({"_id": {"$in": [ObjectId(q) for q in quiz_ids]}})
+                .to_list(None)
+            )
+            quizzes = {
+                str(q["_id"]): [
+                    {"question": x.get("question"), "options": x.get("options")}
+                    for x in q.get("questions") or []
+                ]
+                for q in found
+            }
+        except Exception as e:
+            logger.error("list_digests quiz fetch error user=%s: %s", user_id, e)
+
+    for d in docs:
+        d["_id"] = str(d["_id"])
+        d.setdefault("status", "unread")
+        d["roadmapTitle"] = (labels.get(d.get("roadmapId")) or {}).get("title")
+        d["quiz"] = quizzes.get(d.get("quizId")) or []
+    return docs
+
+
+async def learning_focus(user_id: str) -> dict:
+    """What the learner is on right now, and when the next digest is due.
+
+    The home screen's answer to "nothing waiting — so what now?". Every path
+    returns a `blocked_reason` rather than an empty payload, because "no digest
+    is coming" always has a cause worth showing: the topic is finished, the
+    backlog is full, or digests are switched off.
+    """
+    empty = {
+        "roadmapId": None,
+        "roadmapTitle": None,
+        "topic": None,
+        "progress": roadmap_progress(None),
+        "unread": 0,
+        "cap": DIGEST_MAX_UNREAD,
+        "can_generate": False,
+        "next_at": None,
+        "blocked_reason": "no_roadmap",
+    }
+
+    roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id), user_id)
+    if not roadmap:
+        return empty
+
+    topics = roadmap.get("topics") or []
+    topic = in_progress_topic(roadmap)
+    awaiting = next(
+        (t for t in topics if t.get("progress_status") == "needs_review"), None
+    )
+
+    unread = 0
+    reason = None
+    if topic:
+        unread = await unread_digest_count(user_id, str(roadmap["_id"]), topic.get("id"))
+        if unread >= DIGEST_MAX_UNREAD:
+            reason = "cap_reached"
+    elif awaiting:
+        # Fully taught; only the checkpoint stands between here and the next topic.
+        reason = "needs_review"
+    else:
+        reason = "roadmap_complete"
+
+    next_at = None
+    try:
+        trig = await get_db()["triggers"].find_one(
+            {"user_id": user_id, "action_type": "learning_digest"}
+        )
+        if trig:
+            next_at = next_run_at(trig)
+            if next_at is None and reason is None:
+                reason = "digests_off"
+        elif reason is None:
+            # Never opted in — the scheduler won't fire, but they can still pull
+            # one by hand.
+            reason = "digests_off"
+    except Exception as e:
+        logger.error("learning_focus trigger error user=%s: %s", user_id, e)
+
+    return {
+        "roadmapId": str(roadmap["_id"]),
+        "roadmapTitle": roadmap.get("title"),
+        "topic": (
+            {
+                "id": (topic or awaiting or {}).get("id"),
+                "title": (topic or awaiting or {}).get("title"),
+                "progress_status": (topic or awaiting or {}).get("progress_status"),
+                "order": (topic or awaiting or {}).get("order"),
+            }
+            if (topic or awaiting)
+            else None
+        ),
+        "progress": roadmap_progress(roadmap),
+        "unread": unread,
+        "cap": DIGEST_MAX_UNREAD,
+        # Generation is only meaningful for a topic still being taught.
+        "can_generate": bool(topic) and unread < DIGEST_MAX_UNREAD,
+        "next_at": next_at,
+        "blocked_reason": reason,
+    }
+
+
+async def fetch_digest(digestId: str, user_id: str) -> Optional[dict]:
+    try:
+        doc = await get_db()[DIGESTS].find_one(
+            {"_id": ObjectId(digestId), "user_id": user_id}
+        )
+        if doc:
+            doc["_id"] = str(doc["_id"])
+        return doc
+    except Exception as e:
+        logger.error("fetch_digest error id=%s: %s", digestId, e)
+        return None
+
+
+async def mark_digest(digestId: str, user_id: str) -> bool:
+    """Acknowledge a digest. `updatedAt` doubles as when it was noticed, since
+    marking is the only thing that ever updates one."""
+    try:
+        res = await get_db()[DIGESTS].update_one(
+            {"_id": ObjectId(digestId), "user_id": user_id},
+            {
+                "$set": {
+                    "status": "marked",
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("mark_digest error id=%s: %s", digestId, e)
+        return False
 
 
 # ── notes ────────────────────────────────────────────────────────────────────

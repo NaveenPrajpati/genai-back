@@ -93,8 +93,19 @@ RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 # Percentage a learner must score on a topic's checkpoint before it counts as
 # completed. Also the bar a spaced-repetition review has to clear to push the
 # next review further out.
-CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 70)
+CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 80)
 CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 4)
+
+# --- Learning digests ---
+# How many unacknowledged digests one topic may accumulate before the generator
+# stops. Digests are nudges; a stack of unread ones is just noise, and each costs
+# a web search and an LLM call.
+DIGEST_MAX_UNREAD = _int_env("DIGEST_MAX_UNREAD", 3)
+# From the second digest on a topic, acknowledging it requires recalling what the
+# earlier ones said. Short and all-or-nothing on purpose: this is a "did you read
+# it" check, not an exam — the topic checkpoint is the exam.
+DIGEST_QUIZ_QUESTIONS = _int_env("DIGEST_QUIZ_QUESTIONS", 2)
+DIGEST_QUIZ_PASS_SCORE = _int_env("DIGEST_QUIZ_PASS_SCORE", 100)
 
 # --- MCP (meal planner published over Model Context Protocol) ---
 # app.main mounts the server at /mcp of this same process, so the default URL

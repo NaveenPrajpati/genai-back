@@ -146,9 +146,10 @@ def test_merge_preserves_progress_for_echoed_topics():
     assert kept.mastery_score == 90
     assert kept.completed_at == "2026-02-02T00:00:00+00:00"
 
-    # A genuinely new topic starts clean with a fresh server-minted id.
+    # A genuinely new topic starts clean with a fresh server-minted id — no
+    # earned progress carried in from anywhere.
     added = merged.topics[1]
-    assert added.progress_status == "not_started"
+    assert added.mastery_score is None and added.completed_at is None
     assert added.id not in {"keep-1", "keep-2"}
 
 
@@ -162,7 +163,8 @@ def test_merge_ignores_an_unknown_existing_id():
     """An id the model invented must not silently bind to anything."""
     merged = repo.merge_roadmap(_STORED, _draft(_topic(1, "Macros", existing_id="nope")))
     assert merged.topics[0].id not in {"keep-1", "keep-2"}
-    assert merged.topics[0].progress_status == "not_started"
+    assert merged.topics[0].mastery_score is None
+    assert merged.topics[0].completed_at is None
 
 
 def test_merge_lets_each_stored_topic_be_claimed_once():
@@ -176,7 +178,7 @@ def test_merge_lets_each_stored_topic_be_claimed_once():
     )
     assert merged.topics[0].id == "keep-1"
     assert merged.topics[1].id != "keep-1"
-    assert merged.topics[1].progress_status == "not_started"
+    assert merged.topics[1].completed_at is None  # didn't inherit keep-1's progress
 
 
 def test_merge_keeps_the_original_creation_time():
@@ -196,8 +198,8 @@ def test_the_model_cannot_set_status_ids_or_progress():
 
     roadmap = repo.materialize_roadmap(_draft(_topic(1, "Ownership")))
     assert roadmap.status == "active"  # never the old "archived" default
-    assert roadmap.topics[0].progress_status == "not_started"
     assert roadmap.topics[0].id and roadmap.topics[0].completed_at is None
+    assert roadmap.topics[0].mastery_score is None
 
 
 def test_topics_get_distinct_ids_and_are_linked_to_their_stage():
@@ -483,6 +485,559 @@ async def test_a_freshly_generated_roadmap_starts_at_zero_not_complete():
         "total": 2,
         "percent": 0,
     }
+
+
+# --------------------------------------------------------------------------- #
+# digests: acknowledgement and the catch-up queue
+# --------------------------------------------------------------------------- #
+def repo_coverage(covered: bool, missing=()):
+    from app.agents.learning_tracker.state import CoverageOutput
+
+    return CoverageOutput(covered=covered, missing=list(missing))
+
+
+def _quiz_output(n: int = 2):
+    from app.agents.learning_tracker.state import Question, QuizOutput
+
+    return QuizOutput(
+        quiz=[Question(question=f"q{i}", options=["a", "b"], answer=0) for i in range(n)]
+    )
+
+
+def _fake_tips(monkeypatch, trig, bullets=("a tip",)):
+    """Replace the tips chain with a Runnable so no model is called."""
+    from langchain_core.runnables import RunnableLambda
+
+    from app.agents.learning_tracker.state import TopicTipsOutput
+
+    fake = MagicMock()
+    fake.with_structured_output.return_value = RunnableLambda(
+        lambda _: TopicTipsOutput(bullets=list(bullets))
+    )
+    monkeypatch.setattr(trig, "llm", fake)
+
+
+def _digest_db(monkeypatch, digests=(), roadmaps=(), unread=None):
+    digest_col, roadmap_col = _collection(), _collection()
+    digest_col.find = MagicMock(
+        return_value=MagicMock(
+            sort=lambda *_: MagicMock(
+                limit=lambda *_: MagicMock(to_list=AsyncMock(return_value=list(digests)))
+            )
+        )
+    )
+    digest_col.find_one = AsyncMock(return_value=unread)
+    roadmap_col.find = MagicMock(
+        return_value=MagicMock(to_list=AsyncMock(return_value=list(roadmaps)))
+    )
+    monkeypatch.setattr(
+        repo, "get_db", lambda: {repo.DIGESTS: digest_col, "roadmaps": roadmap_col}
+    )
+    return digest_col
+
+
+async def test_unread_means_not_marked_so_older_digests_still_count(monkeypatch):
+    """Digests written before `status` existed have never been acknowledged
+    either, so they belong in the unread queue rather than being filtered out."""
+    col = _digest_db(monkeypatch)
+    await repo.list_digests("userA", status="unread")
+    assert col.find.call_args.args[0]["status"] == {"$ne": "marked"}
+
+
+async def test_the_catch_up_queue_only_spans_active_roadmaps(monkeypatch):
+    col = _digest_db(monkeypatch, roadmaps=[{"_id": "r1"}, {"_id": "r2"}])
+    await repo.list_digests("userA", status="unread", active_only=True)
+    assert col.find.call_args.args[0]["roadmapId"] == {"$in": ["r1", "r2"]}
+
+
+async def test_no_active_roadmaps_means_an_empty_queue_not_everything(monkeypatch):
+    _digest_db(monkeypatch, digests=[{"_id": _OID}], roadmaps=[])
+    assert await repo.list_digests("userA", status="unread", active_only=True) == []
+
+
+async def test_digests_default_to_unread_when_listed(monkeypatch):
+    _digest_db(
+        monkeypatch,
+        digests=[{"_id": _OID, "roadmapId": "r1"}],
+        roadmaps=[{"_id": "r1", "title": "Rust", "topics": []}],
+    )
+    d = (await repo.list_digests("userA"))[0]
+    assert d["status"] == "unread"
+    assert d["roadmapTitle"] == "Rust"
+
+
+async def test_marking_a_digest_is_user_scoped_and_stamps_when(monkeypatch):
+    col = _digest_db(monkeypatch)
+    assert await repo.mark_digest(_OID, "userA") is True
+
+    filt, update = col.update_one.await_args.args
+    assert filt["user_id"] == "userA"
+    assert update["$set"]["status"] == "marked"
+    assert update["$set"]["updatedAt"]
+
+
+def _started(**over) -> dict:
+    return {"id": "t1", "title": "A", "order": 1, "progress_status": "in_progress", **over}
+
+
+def _digest_gen(monkeypatch, unread_count=0, prior=()):
+    """Stub build_digest's collaborators, and record whether it spent anything."""
+    import app.agents.learning_tracker.triggers as trig
+
+    monkeypatch.setattr(trig, "unread_digest_count", AsyncMock(return_value=unread_count))
+    monkeypatch.setattr(trig, "topic_digests", AsyncMock(return_value=list(prior)))
+    search = MagicMock()
+    search.ainvoke = AsyncMock(return_value={"results": []})
+    monkeypatch.setattr(trig, "tavily_search_tool", search)
+    # build_digest writes through its own module's get_db.
+    col = _collection()
+    monkeypatch.setattr(trig, "get_db", lambda: {trig.DIGESTS: col, "quizzes": col})
+    monkeypatch.setattr(trig, "set_topic_progress", AsyncMock(return_value=True))
+    return trig, search
+
+
+# ── when the next digest lands ──────────────────────────────────────────────
+def _at(iso: str):
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso)
+
+
+def test_next_run_is_today_when_the_hour_is_still_ahead():
+    from app.agents.trigger_store import next_run_at
+
+    trig = {"enabled": True, "schedule_hour": 9, "timezone": "UTC"}
+    assert next_run_at(trig, _at("2026-08-02T06:00:00+00:00")).startswith("2026-08-02T09:00")
+
+
+def test_next_run_rolls_to_tomorrow_once_the_hour_has_passed():
+    from app.agents.trigger_store import next_run_at
+
+    trig = {"enabled": True, "schedule_hour": 9, "timezone": "UTC"}
+    assert next_run_at(trig, _at("2026-08-02T10:00:00+00:00")).startswith("2026-08-03T09:00")
+
+
+def test_next_run_skips_today_when_it_already_fired():
+    """Mirrors is_due's same-day guard — otherwise the countdown would point at
+    an hour that has already been used up."""
+    from app.agents.trigger_store import next_run_at
+
+    trig = {
+        "enabled": True,
+        "schedule_hour": 9,
+        "timezone": "UTC",
+        "last_run_at": "2026-08-02T09:00:00+00:00",
+    }
+    assert next_run_at(trig, _at("2026-08-02T07:00:00+00:00")).startswith("2026-08-03T09:00")
+
+
+def test_next_run_respects_the_learners_timezone():
+    from app.agents.trigger_store import next_run_at
+
+    trig = {"enabled": True, "schedule_hour": 9, "timezone": "Asia/Kolkata"}
+    # 09:00 IST is 03:30 UTC.
+    assert next_run_at(trig, _at("2026-08-02T00:00:00+00:00")).startswith("2026-08-02T03:30")
+
+
+def test_a_disabled_trigger_has_no_next_run():
+    from app.agents.trigger_store import next_run_at
+
+    assert next_run_at({"enabled": False, "schedule_hour": 9}) is None
+
+
+def test_next_run_honours_a_weekly_schedule():
+    from app.agents.trigger_store import next_run_at
+
+    # 2026-08-02 is a Sunday; dow=2 is Wednesday.
+    trig = {"enabled": True, "schedule_hour": 9, "timezone": "UTC", "schedule_dow": 2}
+    assert next_run_at(trig, _at("2026-08-02T10:00:00+00:00")).startswith("2026-08-05T09:00")
+
+
+# ── what the home screen shows when the queue is clear ──────────────────────
+def _focus_db(monkeypatch, roadmap=None, trigger=None, unread=0):
+    col = _collection()
+    col.find_one = AsyncMock(side_effect=[roadmap, trigger])
+    col.count_documents = AsyncMock(return_value=unread)
+    monkeypatch.setattr(
+        repo, "get_db", lambda: {"roadmaps": col, "triggers": col, repo.DIGESTS: col}
+    )
+    monkeypatch.setattr(repo, "resolve_roadmap_id", AsyncMock(return_value=_OID))
+    return col
+
+
+_ENABLED_TRIGGER = {"enabled": True, "schedule_hour": 9, "timezone": "UTC"}
+
+
+async def test_focus_names_the_roadmap_and_the_topic_underway(monkeypatch):
+    _focus_db(
+        monkeypatch,
+        roadmap={
+            "_id": _OID,
+            "title": "Rust",
+            "topics": [
+                {"id": "t1", "order": 1, "title": "Ownership", "progress_status": "in_progress"},
+                {"id": "t2", "order": 2, "title": "Traits"},
+            ],
+        },
+        trigger=_ENABLED_TRIGGER,
+    )
+    focus = await repo.learning_focus("userA")
+
+    assert focus["roadmapTitle"] == "Rust"
+    assert focus["topic"]["title"] == "Ownership"
+    assert focus["can_generate"] is True
+    assert focus["next_at"]
+    assert focus["blocked_reason"] is None
+
+
+async def test_focus_explains_a_full_backlog_rather_than_offering_more(monkeypatch):
+    from app.core.config import DIGEST_MAX_UNREAD
+
+    _focus_db(
+        monkeypatch,
+        roadmap={
+            "_id": _OID,
+            "title": "Rust",
+            "topics": [{"id": "t1", "order": 1, "progress_status": "in_progress"}],
+        },
+        trigger=_ENABLED_TRIGGER,
+        unread=DIGEST_MAX_UNREAD,
+    )
+    focus = await repo.learning_focus("userA")
+    assert focus["blocked_reason"] == "cap_reached"
+    assert focus["can_generate"] is False
+
+
+async def test_focus_points_at_the_checkpoint_when_a_topic_is_fully_taught(monkeypatch):
+    _focus_db(
+        monkeypatch,
+        roadmap={
+            "_id": _OID,
+            "title": "Rust",
+            "topics": [
+                {"id": "t1", "order": 1, "title": "Ownership", "progress_status": "needs_review"}
+            ],
+        },
+        trigger=_ENABLED_TRIGGER,
+    )
+    focus = await repo.learning_focus("userA")
+
+    assert focus["blocked_reason"] == "needs_review"
+    assert focus["topic"]["title"] == "Ownership"  # still worth naming
+    assert focus["can_generate"] is False
+
+
+async def test_focus_reports_a_finished_roadmap(monkeypatch):
+    _focus_db(
+        monkeypatch,
+        roadmap={
+            "_id": _OID,
+            "title": "Rust",
+            "topics": [{"id": "t1", "order": 1, "progress_status": "completed"}],
+        },
+        trigger=_ENABLED_TRIGGER,
+    )
+    assert (await repo.learning_focus("userA"))["blocked_reason"] == "roadmap_complete"
+
+
+async def test_focus_flags_digests_being_switched_off(monkeypatch):
+    _focus_db(
+        monkeypatch,
+        roadmap={
+            "_id": _OID,
+            "title": "Rust",
+            "topics": [{"id": "t1", "order": 1, "progress_status": "in_progress"}],
+        },
+        trigger={"enabled": False, "schedule_hour": 9, "timezone": "UTC"},
+    )
+    focus = await repo.learning_focus("userA")
+
+    assert focus["blocked_reason"] == "digests_off"
+    assert focus["next_at"] is None
+    # Still pullable by hand — the schedule is off, not the feature.
+    assert focus["can_generate"] is True
+
+
+async def test_focus_on_no_roadmap_says_so(monkeypatch):
+    monkeypatch.setattr(repo, "resolve_roadmap_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(repo, "fetch_roadmap", AsyncMock(return_value=None))
+    focus = await repo.learning_focus("userA")
+    assert focus["blocked_reason"] == "no_roadmap"
+    assert focus["roadmapTitle"] is None
+
+
+# ── exactly one topic underway ──────────────────────────────────────────────
+def test_a_new_roadmap_opens_with_its_first_topic_underway():
+    """So the learner has something in flight, and digests, without a separate step."""
+    roadmap = repo.materialize_roadmap(
+        _draft(_topic(1, "A"), _topic(2, "B"), _topic(3, "C"))
+    )
+    assert [t.progress_status for t in roadmap.topics] == [
+        "in_progress",
+        "not_started",
+        "not_started",
+    ]
+
+
+def _nodes(*statuses):
+    from app.agents.learning_tracker.state import TopicNode
+
+    return [
+        TopicNode(id=f"t{i}", order=i + 1, title=f"T{i}", description="", progress_status=s)
+        for i, s in enumerate(statuses)
+    ]
+
+
+def test_a_second_in_progress_topic_is_demoted():
+    topics = _nodes("in_progress", "in_progress", "not_started")
+    repo.enforce_single_in_progress(topics)
+    assert [t.progress_status for t in topics] == [
+        "in_progress",
+        "not_started",
+        "not_started",
+    ]
+
+
+def test_the_slot_passes_to_the_first_unfinished_topic():
+    topics = _nodes("completed", "not_started", "not_started")
+    repo.enforce_single_in_progress(topics)
+    assert topics[1].progress_status == "in_progress"
+
+
+def test_a_topic_awaiting_its_checkpoint_holds_the_slot():
+    """Otherwise the learner accumulates half-finished topics instead of
+    closing one out."""
+    topics = _nodes("needs_review", "not_started")
+    repo.enforce_single_in_progress(topics)
+    assert [t.progress_status for t in topics] == ["needs_review", "not_started"]
+
+
+def test_a_finished_roadmap_starts_nothing():
+    topics = _nodes("completed", "skipped")
+    repo.enforce_single_in_progress(topics)
+    assert [t.progress_status for t in topics] == ["completed", "skipped"]
+
+
+def test_an_edit_that_drops_the_started_topic_still_leaves_one_underway():
+    existing = {
+        "status": "active",
+        "topics": [{"id": "gone", "order": 1, "title": "Gone", "progress_status": "in_progress"}],
+    }
+    merged = repo.merge_roadmap(existing, _draft(_topic(1, "Fresh"), _topic(2, "Later")))
+    assert [t.progress_status for t in merged.topics] == ["in_progress", "not_started"]
+
+
+async def test_starting_a_topic_swaps_the_slot_in_one_write(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    assert await repo.start_topic(_OID, "t2", "userA") is True
+
+    _, update = col.update_one.await_args.args
+    kwargs = col.update_one.await_args.kwargs
+    assert update["$set"]["topics.$[target].progress_status"] == "in_progress"
+    assert update["$set"]["topics.$[other].progress_status"] == "not_started"
+    # Both halves in one update, so the roadmap is never briefly two-or-none.
+    assert kwargs["array_filters"][0]["other.id"] == {"$ne": "t2"}
+
+
+async def test_set_topic_progress_routes_starting_through_the_swap(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    col.find_one = AsyncMock(return_value={"status": "active", "topics": []})
+
+    await repo.set_topic_progress(_OID, "t1", "in_progress", "userA")
+    assert "array_filters" in col.update_one.await_args_list[0].kwargs
+
+
+async def test_passing_a_checkpoint_hands_the_slot_to_the_next_topic(monkeypatch):
+    col = _collection()
+    col.find_one = AsyncMock(
+        return_value={
+            "_id": _OID,
+            "status": "active",
+            "topics": [
+                {"id": "t1", "order": 1, "title": "A", "progress_status": "in_progress"},
+                {"id": "t2", "order": 2, "title": "B", "progress_status": "not_started"},
+            ],
+        }
+    )
+    _patch_db(monkeypatch, col)
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+
+    assert out["passed"] is True
+    assert out["advanced_to"] == {"topicId": "t2", "title": "B"}
+
+
+async def test_passing_a_review_does_not_move_the_slot(monkeypatch):
+    """A review of an already-finished topic isn't progress through the roadmap."""
+    col = _collection()
+    col.find_one = AsyncMock(
+        return_value={
+            "_id": _OID,
+            "status": "active",
+            "topics": [
+                {"id": "t1", "order": 1, "progress_status": "completed", "completed_at": "x"},
+                {"id": "t2", "order": 2, "progress_status": "not_started"},
+            ],
+        }
+    )
+    _patch_db(monkeypatch, col)
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+    assert out["was_review"] is True
+    assert out["advanced_to"] is None
+
+
+async def test_full_coverage_sends_the_topic_to_needs_review(monkeypatch):
+    """The drip-feed is done; the checkpoint is what completes it now."""
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(True)))
+    _fake_tips(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert trig.set_topic_progress.await_args.args[2] == "needs_review"
+
+
+async def test_partial_coverage_leaves_the_topic_underway(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    trig.set_topic_progress.assert_not_awaited()
+
+
+# ── which topics get digests ────────────────────────────────────────────────
+@pytest.mark.parametrize("status", ["not_started", "completed", "skipped", "needs_review"])
+async def test_only_a_started_topic_gets_digests(monkeypatch, status):
+    """A topic nobody has picked up shouldn't be filling an inbox."""
+    trig, search = _digest_gen(monkeypatch)
+    out = await trig.build_digest(
+        "userA", {"_id": _OID, "topics": [_started(progress_status=status)]}
+    )
+    assert out is None
+    search.ainvoke.assert_not_awaited()
+
+
+async def test_digests_stop_once_three_are_waiting(monkeypatch):
+    """Otherwise a learner who ignores them for a week returns to seven."""
+    from app.core.config import DIGEST_MAX_UNREAD
+
+    trig, search = _digest_gen(monkeypatch, unread_count=DIGEST_MAX_UNREAD)
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]})
+
+    assert out is None
+    search.ainvoke.assert_not_awaited()  # no search, no LLM call, no spend
+
+
+async def test_digests_resume_once_the_backlog_drops(monkeypatch):
+    from app.core.config import DIGEST_MAX_UNREAD
+
+    trig, search = _digest_gen(monkeypatch, unread_count=DIGEST_MAX_UNREAD - 1)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert out is not None
+    assert out["sequence"] == 1
+
+
+async def test_a_backlog_read_failure_holds_off_rather_than_piling_on(monkeypatch):
+    """unread_digest_count fails closed — an unknown backlog is treated as full."""
+    col = _digest_db(monkeypatch)
+    col.count_documents = AsyncMock(side_effect=RuntimeError("mongo down"))
+    from app.core.config import DIGEST_MAX_UNREAD
+
+    assert await repo.unread_digest_count("userA", "r1", "t1") == DIGEST_MAX_UNREAD
+
+
+def test_in_progress_topic_picks_the_started_one_in_order():
+    roadmap = {
+        "topics": [
+            {"id": "a", "order": 1, "progress_status": "completed"},
+            {"id": "b", "order": 2, "progress_status": "in_progress"},
+            {"id": "c", "order": 3, "progress_status": "in_progress"},
+            {"id": "d", "order": 4, "progress_status": "not_started"},
+        ]
+    }
+    assert repo.in_progress_topic(roadmap)["id"] == "b"
+    assert repo.in_progress_topic({"topics": []}) is None
+
+
+# ── the recall check on later digests ───────────────────────────────────────
+async def test_the_first_digest_carries_no_recall_check(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert out["sequence"] == 1
+    assert out["quizId"] is None  # nothing to recall yet
+
+
+async def test_later_digests_are_quizzed_on_the_earlier_ones_only(monkeypatch):
+    """Quizzing on the digest they haven't acknowledged yet would make marking
+    it impossible."""
+    trig, _ = _digest_gen(
+        monkeypatch, prior=[{"bullets": ["earlier point"]}]
+    )
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig, bullets=["brand new point"])
+    seen = {}
+
+    async def _quiz(topic_title, bullets):
+        seen["bullets"] = bullets
+        return _quiz_output()
+
+    monkeypatch.setattr(trig, "build_digest_quiz", _quiz)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out["sequence"] == 2
+    assert out["quizId"]
+    assert seen["bullets"] == ["earlier point"]
+    assert "brand new point" not in seen["bullets"]
+
+
+async def test_a_failed_quiz_generation_still_ships_the_digest(monkeypatch):
+    """A digest nobody can acknowledge is worse than one without a recall check."""
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["earlier"]}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+    monkeypatch.setattr(trig, "build_digest_quiz", AsyncMock(side_effect=RuntimeError("boom")))
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert out is not None and out["quizId"] is None
+
+
+# ── coverage ────────────────────────────────────────────────────────────────
+async def test_coverage_is_recorded_on_every_digest(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(
+        trig, "check_coverage", AsyncMock(return_value=repo_coverage(True, ["x"]))
+    )
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert out["coverage_complete"] is True
+    assert out["missing_outcomes"] == ["x"]
+
+
+async def test_a_topic_with_no_outcomes_is_never_declared_covered():
+    """Nothing concrete to measure against, so don't end the drip-feed on a guess."""
+    from app.agents.learning_tracker.service import check_coverage
+
+    out = await check_coverage({"title": "A", "learning_outcomes": []}, ["a bullet"])
+    assert out.covered is False
+
+
+async def test_a_coverage_failure_does_not_block_the_digest(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(side_effect=RuntimeError("boom")))
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert out is not None and out["coverage_complete"] is False
 
 
 # --------------------------------------------------------------------------- #

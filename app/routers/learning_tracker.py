@@ -16,8 +16,9 @@ from app.dependencies import get_current_user
 from app.database import get_db
 from app.agents.approval_store import get_pending
 from app.agents.memory_store import MEMORIES, get_profile, save_profile
-from app.core.config import CHECKPOINT_PASS_SCORE
+from app.core.config import CHECKPOINT_PASS_SCORE, DIGEST_QUIZ_PASS_SCORE
 from app.agents.learning_tracker.service import build_checkpoint
+from app.agents.learning_tracker.triggers import build_digest
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
     apply_checkpoint,
@@ -25,13 +26,17 @@ from app.agents.learning_tracker.repository import (
     create_note,
     delete_note,
     due_reviews,
+    fetch_digest,
     fetch_quiz,
     fetch_roadmap,
     find_topic,
     grade_quiz,
+    learning_focus,
     learning_stats,
+    list_digests,
     list_notes,
     list_roadmaps,
+    mark_digest,
     note_counts,
     profile_drift,
     profile_snapshot,
@@ -506,22 +511,135 @@ async def delete_memory(current_user: Annotated[dict, Depends(get_current_user)]
 @router.get("/digests")
 async def get_digests(
     current_user: Annotated[dict, Depends(get_current_user)],
+    status: Optional[Literal["unread", "marked"]] = None,
+    active_only: bool = False,
     limit: int = 20,
 ):
-    """Return the caller's daily learning digests, most recent first."""
-    try:
-        cursor = (
-            get_db()["learning_digests"]
-            .find({"user_id": current_user["uid"]})
-            .sort("createdAt", -1)
-            .limit(limit)
+    """The caller's digests, most recent first.
+
+    `status=unread&active_only=true` is the catch-up view: everything still
+    outstanding across roadmaps they're actually working on.
+    """
+    return {
+        "status": "done",
+        "result": await list_digests(
+            current_user["uid"], status=status, active_only=active_only, limit=limit
+        ),
+    }
+
+
+class DigestMark(BaseModel):
+    # Required when the digest carries a recall check (every digest after the
+    # first on a topic).
+    answers: list[Answer] = Field(default_factory=list)
+    # Generate the next digest for this topic straight after marking.
+    generate_next: bool = False
+
+
+@router.post("/digests/{digestId}/mark")
+async def acknowledge_digest(
+    digestId: str,
+    body: DigestMark,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Acknowledge a digest, optionally pulling the next one in the same step.
+
+    A digest carrying a recall check can only be marked by passing it — that's
+    what makes acknowledgement mean "I read this" rather than "I dismissed this".
+    The check covers earlier digests only, so it's always answerable.
+    """
+    user_id = current_user["uid"]
+    digest = await fetch_digest(digestId, user_id)
+    if not digest:
+        raise HTTPException(status_code=404, detail="Digest not found.")
+
+    quiz_result = None
+    quiz_id = digest.get("quizId")
+    if quiz_id and digest.get("status") != "marked":
+        quiz = await fetch_quiz(user_id, quiz_id)
+        if quiz:
+            graded = grade_quiz(
+                quiz.get("questions", []), {a.question: a.answer for a in body.answers}
+            )
+            if graded["score"] < DIGEST_QUIZ_PASS_SCORE:
+                # 422, not 403: the request was understood, the answers just
+                # weren't right. The body carries what they got wrong so the card
+                # can show it and let them retry.
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "Not quite — check the earlier tips and try again.",
+                        "quiz_result": graded,
+                        "pass_score": DIGEST_QUIZ_PASS_SCORE,
+                    },
+                )
+            quiz_result = graded
+            await record_quiz_attempt(
+                user_id, quiz_id, digest.get("roadmapId"), digest.get("topicId"), graded
+            )
+
+    if not await mark_digest(digestId, user_id):
+        raise HTTPException(status_code=404, detail="Digest not found.")
+
+    generated = None
+    if body.generate_next:
+        roadmap = await fetch_roadmap(digest.get("roadmapId"), user_id)
+        if roadmap:
+            try:
+                generated = await build_digest(user_id, roadmap, notify=False)
+            except Exception as e:
+                # Marking already succeeded; a generation failure must not undo it.
+                logger.error("digest generate-after-mark failed: %s", e)
+
+    remaining = await list_digests(user_id, status="unread", active_only=True, limit=50)
+    return {
+        "status": "done",
+        "result": {
+            "digestId": digestId,
+            "quiz_result": quiz_result,
+            "generated": generated,
+            "remaining": len(remaining),
+            "next": remaining[0] if remaining else None,
+            # Once the tips have covered the topic, the checkpoint is what comes
+            # next — not another digest.
+            "coverage_complete": bool(digest.get("coverage_complete")),
+            "topicId": digest.get("topicId"),
+            "roadmapId": digest.get("roadmapId"),
+        },
+    }
+
+
+@router.get("/focus")
+async def get_focus(current_user: Annotated[dict, Depends(get_current_user)]):
+    """What the learner is working on and when the next digest lands — what the
+    home screen shows once the queue is clear."""
+    return {"status": "done", "result": await learning_focus(current_user["uid"])}
+
+
+@router.post("/digests/generate")
+async def generate_digest(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    roadmapId: Optional[str] = None,
+):
+    """Pull the next digest now rather than waiting for tomorrow's sweep.
+
+    Deliberately not folded into marking: a digest costs a web search and an LLM
+    call, so it happens when the learner asks for it, not as a side effect of
+    acknowledging one. `build_digest` still declines if the current topic already
+    has an unread digest, so this can't be used to stack them up.
+    """
+    user_id = current_user["uid"]
+    roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
+    if not roadmap:
+        raise HTTPException(status_code=404, detail="No active roadmap to digest.")
+
+    digest = await build_digest(user_id, roadmap, notify=False)
+    if not digest:
+        raise HTTPException(
+            status_code=409,
+            detail="Nothing new to send — finish the digest you already have, or the roadmap is complete.",
         )
-        docs = await cursor.to_list(None)
-        for doc in docs:
-            doc["_id"] = str(doc["_id"])
-        return {"status": "done", "result": docs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "done", "result": digest}
 
 
 NoteKind = Literal["note", "snippet", "link", "question"]

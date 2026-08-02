@@ -16,10 +16,10 @@ from typing import Optional, List
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import CHECKPOINT_QUESTIONS
+from app.core.config import CHECKPOINT_QUESTIONS, DIGEST_QUIZ_QUESTIONS
 from app.core.llm import llm
 from app.agents.personal_assistant.service import TaskSpec, create_tasks as create_pa_tasks
-from .state import QuizOutput, RoadmapDraft, RoadmapOutput
+from .state import CoverageOutput, QuizOutput, RoadmapDraft, RoadmapOutput
 from .repository import insertRoadmapToDb, materialize_roadmap, profile_snapshot
 
 logger = logging.getLogger(__name__)
@@ -131,6 +131,74 @@ async def build_checkpoint(
             "outcomes": outcomes or "- (none given)",
             "roadmap_title": roadmap_title or "general",
             "memory": memory or "none",
+        }
+    )
+
+
+_DIGEST_QUIZ_SYSTEM = (
+    "You are checking whether a learner actually read the study tips they were "
+    "sent about ONE topic.\n"
+    "Write exactly {count} multiple-choice questions answerable purely from the "
+    "tips below — nothing from outside them, and nothing about the newest tips, "
+    "which they haven't acknowledged yet.\n"
+    "Keep them short and concrete. Exactly one option is correct, and `answer` is "
+    "its 0-based index. Make the wrong options plausible.\n"
+    "Topic: {topic}\n"
+    "Tips already sent:\n{bullets}"
+)
+
+_COVERAGE_SYSTEM = (
+    "You are deciding whether a drip-feed of study tips has finished teaching a "
+    "topic.\n"
+    "Given the topic's description and its learning outcomes, judge whether the "
+    "tips sent so far substantively cover ALL of the outcomes.\n"
+    "Set covered=true only if a learner who absorbed these tips could meet every "
+    "outcome. List any outcomes still untouched in `missing` — those are what the "
+    "next tips should be about.\n"
+    "Be strict: saying a topic is covered ends the drip-feed and sends the learner "
+    "to a graded checkpoint.\n"
+    "Topic: {topic}\n"
+    "Description: {description}\n"
+    "Learning outcomes:\n{outcomes}\n"
+    "Tips sent so far:\n{bullets}"
+)
+
+
+async def build_digest_quiz(topic_title: str, bullets: List[str]) -> QuizOutput:
+    """A short recall check over tips the learner has already been sent."""
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _DIGEST_QUIZ_SYSTEM), ("human", "Write the check.")]
+    ) | llm.with_structured_output(QuizOutput)
+    return await chain.ainvoke(
+        {
+            "count": DIGEST_QUIZ_QUESTIONS,
+            "topic": topic_title,
+            "bullets": "\n".join(f"- {b}" for b in bullets),
+        }
+    )
+
+
+async def check_coverage(topic: dict, bullets: List[str]) -> CoverageOutput:
+    """Have the digests so far taught the whole topic?
+
+    Judged against the topic's own learning outcomes rather than a digest count,
+    so a topic with two outcomes isn't dragged out to the same length as one with
+    eight.
+    """
+    outcomes = topic.get("learning_outcomes") or []
+    if not outcomes:
+        # Nothing concrete to measure against — don't declare victory on a guess.
+        return CoverageOutput(covered=False, missing=[])
+
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _COVERAGE_SYSTEM), ("human", "Judge the coverage.")]
+    ) | llm.with_structured_output(CoverageOutput)
+    return await chain.ainvoke(
+        {
+            "topic": topic.get("title", ""),
+            "description": topic.get("description", ""),
+            "outcomes": "\n".join(f"- {o}" for o in outcomes),
+            "bullets": "\n".join(f"- {b}" for b in bullets) or "- (none yet)",
         }
     )
 
