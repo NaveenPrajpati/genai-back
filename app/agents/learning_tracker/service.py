@@ -17,8 +17,11 @@ from typing import Optional, List
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.config import CHECKPOINT_QUESTIONS, DIGEST_QUIZ_QUESTIONS
-from app.core.llm import llm
-from app.agents.personal_assistant.service import TaskSpec, create_tasks as create_pa_tasks
+from app.core.llm import llm, fast_llm
+from app.agents.personal_assistant.service import (
+    TaskSpec,
+    create_tasks as create_pa_tasks,
+)
 from .state import CoverageOutput, QuizOutput, RoadmapDraft, RoadmapOutput
 from .repository import insertRoadmapToDb, materialize_roadmap, profile_snapshot
 
@@ -164,14 +167,18 @@ _COVERAGE_SYSTEM = (
 )
 
 
-async def build_digest_quiz(topic_title: str, bullets: List[str]) -> QuizOutput:
+async def build_digest_quiz(
+    topic_title: str,
+    bullets: List[str],
+    questioncount: Optional[int] = DIGEST_QUIZ_QUESTIONS,
+) -> QuizOutput:
     """A short recall check over tips the learner has already been sent."""
     chain = ChatPromptTemplate.from_messages(
         [("system", _DIGEST_QUIZ_SYSTEM), ("human", "Write the check.")]
-    ) | llm.with_structured_output(QuizOutput)
+    ) | fast_llm.with_structured_output(QuizOutput)
     return await chain.ainvoke(
         {
-            "count": DIGEST_QUIZ_QUESTIONS,
+            "count": 4 if questioncount > 4 else questioncount,
             "topic": topic_title,
             "bullets": "\n".join(f"- {b}" for b in bullets),
         }

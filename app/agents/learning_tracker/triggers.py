@@ -34,21 +34,20 @@ _TIPS_PROMPT = ChatPromptTemplate.from_messages(
             "rule of thumb, or a tiny worked example. Where a short snippet makes "
             "the idea land, put it inline.\n"
             "NEVER write a bullet that merely points at a resource. "
-            "\"W3Schools has a tutorial\", \"check out Khan Academy\", \"use the "
-            "official docs\" — these teach nothing, and links are already listed "
+            '"W3Schools has a tutorial", "check out Khan Academy", "use the '
+            'official docs" — these teach nothing, and links are already listed '
             "separately below the bullets. Treat the search results as reference "
             "material for getting the facts right, not as the subject.\n"
             "Aim at these outcomes, in order, and go deep enough that a learner "
-            "could actually do them:\n{outstanding}\n"
+            # "could actually do them:\n{outstanding}\n"
             "Do not repeat what has already been sent:\n{covered}\n"
             "Keep each bullet to one or two sentences.",
         ),
         (
             "human",
             "Topic: {topic}\n"
-            "What it covers: {description}\n"
-            "Roadmap context: {summary}\n"
-            "Reference material:\n{results}",
+            # "What it covers: {description}\n"
+            "Roadmap context: {summary}\n" "Reference material:\n{results}",
         ),
     ]
 )
@@ -116,9 +115,10 @@ async def build_digest(
     # ones. Built from `prior_bullets` only — quizzing someone on the digest they
     # haven't read yet would make marking impossible.
     quiz_id = None
+    quiz = None
     if sequence >= 2 and prior_bullets:
         try:
-            quiz = await build_digest_quiz(topic_title, prior_bullets)
+            quiz = await build_digest_quiz(topic_title, prior_bullets, sequence)
             res_quiz = await get_db()["quizzes"].insert_one(
                 {
                     "user_id": user_id,
@@ -130,6 +130,7 @@ async def build_digest(
                 }
             )
             quiz_id = str(res_quiz.inserted_id)
+
         except Exception as e:
             # A digest the learner can't acknowledge is worse than one without a
             # recall check, so a generation failure degrades to no quiz.
@@ -194,6 +195,7 @@ async def build_digest(
             data={"type": "learning_digest", "topicId": topic.get("id")},
         )
 
+    doc["quiz"] = quiz.quiz if quiz else None
     return {**doc, "_id": str(res.inserted_id)}
 
 

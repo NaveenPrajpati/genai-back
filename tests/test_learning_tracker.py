@@ -654,15 +654,23 @@ def test_next_run_honours_a_weekly_schedule():
 
 
 # ── what the home screen shows when the queue is clear ──────────────────────
-def _focus_db(monkeypatch, roadmap=None, trigger=None, unread=0):
+def _focus_db(monkeypatch, roadmap=None, roadmaps=None, trigger=None, unread=0):
+    docs = roadmaps if roadmaps is not None else ([roadmap] if roadmap else [])
     col = _collection()
-    col.find_one = AsyncMock(side_effect=[roadmap, trigger])
+    col.find_one = AsyncMock(return_value=trigger)  # the digest trigger
     col.count_documents = AsyncMock(return_value=unread)
+    col.find.return_value.sort.return_value.skip.return_value.limit.return_value.to_list = AsyncMock(
+        return_value=[dict(d) for d in docs]
+    )
     monkeypatch.setattr(
         repo, "get_db", lambda: {"roadmaps": col, "triggers": col, repo.DIGESTS: col}
     )
-    monkeypatch.setattr(repo, "resolve_roadmap_id", AsyncMock(return_value=_OID))
     return col
+
+
+async def _focus_one(user_id="userA"):
+    """The single-roadmap entry, for the cases that only set up one."""
+    return (await repo.learning_focus(user_id))["roadmaps"][0]
 
 
 _ENABLED_TRIGGER = {"enabled": True, "schedule_hour": 9, "timezone": "UTC"}
@@ -682,12 +690,53 @@ async def test_focus_names_the_roadmap_and_the_topic_underway(monkeypatch):
         trigger=_ENABLED_TRIGGER,
     )
     focus = await repo.learning_focus("userA")
+    first = focus["roadmaps"][0]
 
-    assert focus["roadmapTitle"] == "Rust"
-    assert focus["topic"]["title"] == "Ownership"
-    assert focus["can_generate"] is True
+    assert first["roadmapTitle"] == "Rust"
+    assert first["topic"]["title"] == "Ownership"
+    assert first["can_generate"] is True
+    assert first["blocked_reason"] is None
     assert focus["next_at"]
     assert focus["blocked_reason"] is None
+
+
+async def test_focus_covers_every_active_roadmap_not_just_the_latest(monkeypatch):
+    """The daily sweep digests each active roadmap, so the home screen shows each
+    of them — surfacing one hid the queues building on the others."""
+    _focus_db(
+        monkeypatch,
+        roadmaps=[
+            {
+                "_id": _OID,
+                "title": "Rust",
+                "topics": [
+                    {"id": "t1", "order": 1, "title": "Ownership", "progress_status": "in_progress"}
+                ],
+            },
+            {
+                "_id": _OID,
+                "title": "Go",
+                "topics": [
+                    {"id": "t9", "order": 1, "title": "Goroutines", "progress_status": "needs_review"}
+                ],
+            },
+        ],
+        trigger=_ENABLED_TRIGGER,
+    )
+    focus = await repo.learning_focus("userA")
+
+    assert [r["roadmapTitle"] for r in focus["roadmaps"]] == ["Rust", "Go"]
+    # Each carries its own verdict — one blocked roadmap doesn't speak for the rest.
+    assert focus["roadmaps"][0]["blocked_reason"] is None
+    assert focus["roadmaps"][1]["blocked_reason"] == "needs_review"
+    assert focus["blocked_reason"] is None
+
+
+async def test_focus_only_counts_roadmaps_still_active(monkeypatch):
+    col = _focus_db(monkeypatch, roadmap={"_id": _OID, "title": "Rust", "topics": []})
+    await repo.learning_focus("userA")
+
+    assert col.find.call_args.args[0] == {"user_id": "userA", "status": "active"}
 
 
 async def test_focus_explains_a_full_backlog_rather_than_offering_more(monkeypatch):
@@ -703,7 +752,7 @@ async def test_focus_explains_a_full_backlog_rather_than_offering_more(monkeypat
         trigger=_ENABLED_TRIGGER,
         unread=DIGEST_MAX_UNREAD,
     )
-    focus = await repo.learning_focus("userA")
+    focus = await _focus_one()
     assert focus["blocked_reason"] == "cap_reached"
     assert focus["can_generate"] is False
 
@@ -720,7 +769,7 @@ async def test_focus_points_at_the_checkpoint_when_a_topic_is_fully_taught(monke
         },
         trigger=_ENABLED_TRIGGER,
     )
-    focus = await repo.learning_focus("userA")
+    focus = await _focus_one()
 
     assert focus["blocked_reason"] == "needs_review"
     assert focus["topic"]["title"] == "Ownership"  # still worth naming
@@ -737,7 +786,7 @@ async def test_focus_reports_a_finished_roadmap(monkeypatch):
         },
         trigger=_ENABLED_TRIGGER,
     )
-    assert (await repo.learning_focus("userA"))["blocked_reason"] == "roadmap_complete"
+    assert (await _focus_one())["blocked_reason"] == "roadmap_complete"
 
 
 async def test_focus_flags_digests_being_switched_off(monkeypatch):
@@ -753,17 +802,17 @@ async def test_focus_flags_digests_being_switched_off(monkeypatch):
     focus = await repo.learning_focus("userA")
 
     assert focus["blocked_reason"] == "digests_off"
+    assert focus["roadmaps"][0]["blocked_reason"] == "digests_off"
     assert focus["next_at"] is None
     # Still pullable by hand — the schedule is off, not the feature.
-    assert focus["can_generate"] is True
+    assert focus["roadmaps"][0]["can_generate"] is True
 
 
 async def test_focus_on_no_roadmap_says_so(monkeypatch):
-    monkeypatch.setattr(repo, "resolve_roadmap_id", AsyncMock(return_value=None))
-    monkeypatch.setattr(repo, "fetch_roadmap", AsyncMock(return_value=None))
+    _focus_db(monkeypatch, roadmaps=[], trigger=_ENABLED_TRIGGER)
     focus = await repo.learning_focus("userA")
     assert focus["blocked_reason"] == "no_roadmap"
-    assert focus["roadmapTitle"] is None
+    assert focus["roadmaps"] == []
 
 
 # ── exactly one topic underway ──────────────────────────────────────────────

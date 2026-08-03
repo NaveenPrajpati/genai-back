@@ -243,14 +243,18 @@ def merge_roadmap(
         # An edit re-personalizes against the profile as it stands now; without
         # a profile to hand, keep whatever the roadmap was built from.
         personalization=(
-            profile_snapshot(memory) if memory is not None else existing.get("personalization")
+            profile_snapshot(memory)
+            if memory is not None
+            else existing.get("personalization")
         ),
     )
 
     claimed = set()
     # Same sort as materialize_roadmap, so each materialized topic lines up with
     # the draft topic it was built from.
-    for topic, drafted in zip(merged.topics, sorted(draft.topics, key=lambda t: t.order)):
+    for topic, drafted in zip(
+        merged.topics, sorted(draft.topics, key=lambda t: t.order)
+    ):
         prior = stored.get(drafted.existing_id) if drafted.existing_id else None
         if prior is None:
             prior = by_title.get(drafted.title.strip().lower())
@@ -315,7 +319,9 @@ async def fetch_roadmap(roadmapId: Optional[str], user_id: str) -> Optional[dict
     return None
 
 
-async def resolve_roadmap_id(user_id: str, explicit: Optional[str] = None) -> Optional[str]:
+async def resolve_roadmap_id(
+    user_id: str, explicit: Optional[str] = None
+) -> Optional[str]:
     """Whatever the caller passed, else the learner's most recently touched
     roadmap that's still in play — so a bare "what should I study next?" works
     without the client tracking an id. Archived and completed roadmaps are behind
@@ -522,7 +528,11 @@ async def _rollup_roadmap_status(roadmapId: str, user_id: str) -> None:
         )
         # Only ever move between active and completed: never un-archive or
         # un-pause a roadmap the learner parked by hand.
-        if topics and doc.get("status") in ("active", "completed") and doc["status"] != rolled:
+        if (
+            topics
+            and doc.get("status") in ("active", "completed")
+            and doc["status"] != rolled
+        ):
             await col.update_one(
                 {"_id": ObjectId(roadmapId), "user_id": user_id},
                 {
@@ -607,9 +617,7 @@ async def apply_checkpoint(
     # digests start straight away.
     advanced = None
     if passed and not was_completed:
-        ordered = sorted(
-            roadmap.get("topics") or [], key=lambda t: t.get("order", 0)
-        )
+        ordered = sorted(roadmap.get("topics") or [], key=lambda t: t.get("order", 0))
         nxt = next(
             (
                 t
@@ -951,83 +959,98 @@ async def list_digests(
 
 
 async def learning_focus(user_id: str) -> dict:
-    """What the learner is on right now, and when the next digest is due.
+    """Every roadmap the learner has in play, and when the next digest is due.
 
-    The home screen's answer to "nothing waiting — so what now?". Every path
-    returns a `blocked_reason` rather than an empty payload, because "no digest
-    is coming" always has a cause worth showing: the topic is finished, the
-    backlog is full, or digests are switched off.
+    The home screen's answer to "nothing waiting — so what now?". One entry per
+    active roadmap rather than a single "current" one, because the daily sweep
+    generates a digest for each of them — reporting only the most recently
+    touched hid the other queues the learner is actually accumulating.
+
+    Every entry carries a `blocked_reason` rather than going quiet, because "no
+    digest is coming" always has a cause worth showing: the topic is finished,
+    the backlog is full, or digests are switched off.
     """
-    empty = {
-        "roadmapId": None,
-        "roadmapTitle": None,
-        "topic": None,
-        "progress": roadmap_progress(None),
-        "unread": 0,
-        "cap": DIGEST_MAX_UNREAD,
-        "can_generate": False,
-        "next_at": None,
-        "blocked_reason": "no_roadmap",
-    }
-
-    roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id), user_id)
-    if not roadmap:
-        return empty
-
-    topics = roadmap.get("topics") or []
-    topic = in_progress_topic(roadmap)
-    awaiting = next(
-        (t for t in topics if t.get("progress_status") == "needs_review"), None
-    )
-
-    unread = 0
-    reason = None
-    if topic:
-        unread = await unread_digest_count(user_id, str(roadmap["_id"]), topic.get("id"))
-        if unread >= DIGEST_MAX_UNREAD:
-            reason = "cap_reached"
-    elif awaiting:
-        # Fully taught; only the checkpoint stands between here and the next topic.
-        reason = "needs_review"
-    else:
-        reason = "roadmap_complete"
-
+    # The schedule is per-user, not per-roadmap — one trigger drives the sweep
+    # across all of them — so it's resolved once and reported at the top.
     next_at = None
+    digests_off = False
     try:
         trig = await get_db()["triggers"].find_one(
             {"user_id": user_id, "action_type": "learning_digest"}
         )
-        if trig:
-            next_at = next_run_at(trig)
-            if next_at is None and reason is None:
-                reason = "digests_off"
-        elif reason is None:
-            # Never opted in — the scheduler won't fire, but they can still pull
-            # one by hand.
-            reason = "digests_off"
+        # No trigger means never opted in, and a trigger with no next run means
+        # switched off. Either way the scheduler won't fire, though digests can
+        # still be pulled by hand.
+        next_at = next_run_at(trig) if trig else None
+        digests_off = next_at is None
     except Exception as e:
+        # Can't tell — so don't claim they're off.
         logger.error("learning_focus trigger error user=%s: %s", user_id, e)
 
-    return {
-        "roadmapId": str(roadmap["_id"]),
-        "roadmapTitle": roadmap.get("title"),
-        "topic": (
+    try:
+        roadmaps = await list_roadmaps(user_id, status="active", limit=50)
+    except Exception as e:
+        logger.error("learning_focus roadmap fetch error user=%s: %s", user_id, e)
+        roadmaps = []
+
+    items = []
+    for roadmap in roadmaps:
+        topics = roadmap.get("topics") or []
+        topic = in_progress_topic(roadmap)
+        awaiting = next(
+            (t for t in topics if t.get("progress_status") == "needs_review"), None
+        )
+
+        unread = 0
+        reason = None
+        if topic:
+            unread = await unread_digest_count(
+                user_id, str(roadmap["_id"]), topic.get("id")
+            )
+            if unread >= DIGEST_MAX_UNREAD:
+                reason = "cap_reached"
+            elif digests_off:
+                reason = "digests_off"
+        elif awaiting:
+            # Fully taught; only the checkpoint stands between here and the next
+            # topic.
+            reason = "needs_review"
+        else:
+            reason = "roadmap_complete"
+
+        current = topic or awaiting
+        items.append(
             {
-                "id": (topic or awaiting or {}).get("id"),
-                "title": (topic or awaiting or {}).get("title"),
-                "progress_status": (topic or awaiting or {}).get("progress_status"),
-                "order": (topic or awaiting or {}).get("order"),
+                "roadmapId": str(roadmap["_id"]),
+                "roadmapTitle": roadmap.get("title"),
+                "topic": (
+                    {
+                        "id": current.get("id"),
+                        "title": current.get("title"),
+                        "progress_status": current.get("progress_status"),
+                        "order": current.get("order"),
+                    }
+                    if current
+                    else None
+                ),
+                "progress": roadmap_progress(roadmap),
+                "unread": unread,
+                # Generation is only meaningful for a topic still being taught.
+                "can_generate": bool(topic) and unread < DIGEST_MAX_UNREAD,
+                "blocked_reason": reason,
             }
-            if (topic or awaiting)
-            else None
-        ),
-        "progress": roadmap_progress(roadmap),
-        "unread": unread,
+        )
+
+    return {
+        "roadmaps": items,
+        "unread": sum(i["unread"] for i in items),
         "cap": DIGEST_MAX_UNREAD,
-        # Generation is only meaningful for a topic still being taught.
-        "can_generate": bool(topic) and unread < DIGEST_MAX_UNREAD,
         "next_at": next_at,
-        "blocked_reason": reason,
+        # Account-level only. Anything that blocks a single roadmap is reported
+        # on that roadmap's entry, since the others may still be running.
+        "blocked_reason": (
+            "no_roadmap" if not items else ("digests_off" if digests_off else None)
+        ),
     }
 
 
@@ -1112,7 +1135,8 @@ async def _label_map(user_id: str) -> dict:
     """
     try:
         cursor = get_db()["roadmaps"].find(
-            {"user_id": user_id}, projection={"title": 1, "topics.id": 1, "topics.title": 1}
+            {"user_id": user_id},
+            projection={"title": 1, "topics.id": 1, "topics.title": 1},
         )
         return {
             str(r["_id"]): {

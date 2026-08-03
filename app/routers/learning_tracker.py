@@ -442,7 +442,10 @@ async def getPlan(
     roadmap = await fetch_roadmap(roadmapId, current_user["uid"])
     if not roadmap:
         raise HTTPException(status_code=404, detail="Roadmap not found.")
-    return {"status": "done", "result": await _roadmap_view(roadmap, current_user["uid"])}
+    return {
+        "status": "done",
+        "result": await _roadmap_view(roadmap, current_user["uid"]),
+    }
 
 
 class RoadmapStatusUpdate(BaseModel):
@@ -562,9 +565,7 @@ async def acknowledge_digest(
                 quiz.get("questions", []), {a.question: a.answer for a in body.answers}
             )
             if graded["score"] < DIGEST_QUIZ_PASS_SCORE:
-                # 422, not 403: the request was understood, the answers just
-                # weren't right. The body carries what they got wrong so the card
-                # can show it and let them retry.
+
                 raise HTTPException(
                     status_code=422,
                     detail={
@@ -612,7 +613,12 @@ async def acknowledge_digest(
 @router.get("/focus")
 async def get_focus(current_user: Annotated[dict, Depends(get_current_user)]):
     """What the learner is working on and when the next digest lands — what the
-    home screen shows once the queue is clear."""
+    home screen shows once the queue is clear.
+
+    `result.roadmaps` carries one entry per active roadmap, newest first, each
+    with its own topic, progress and `blocked_reason`; `next_at` and `cap` sit at
+    the top because they're account-wide.
+    """
     return {"status": "done", "result": await learning_focus(current_user["uid"])}
 
 
@@ -620,6 +626,7 @@ async def get_focus(current_user: Annotated[dict, Depends(get_current_user)]):
 async def generate_digest(
     current_user: Annotated[dict, Depends(get_current_user)],
     roadmapId: Optional[str] = None,
+    topicId: Optional[str] = None,
 ):
     """Pull the next digest now rather than waiting for tomorrow's sweep.
 
@@ -817,7 +824,9 @@ async def submit_checkpoint(
     if not quiz or not quiz.get("topicId") or not quiz.get("roadmapId"):
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
 
-    graded = grade_quiz(quiz.get("questions", []), {a.question: a.answer for a in body.answers})
+    graded = grade_quiz(
+        quiz.get("questions", []), {a.question: a.answer for a in body.answers}
+    )
     await record_quiz_attempt(
         user_id, body.quizId, quiz.get("roadmapId"), quiz.get("topicId"), graded
     )
