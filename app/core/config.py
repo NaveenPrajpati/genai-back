@@ -96,6 +96,14 @@ RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 80)
 CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 4)
 
+# --- Learning roadmaps ---
+# How many roadmaps a learner may have `active` at once. Active is what the
+# daily sweep digests and what a bare "what should I study next?" resolves to, so
+# this is really a cap on how many things are being drip-fed in parallel — past
+# two, every stream gets less attention than it needs and the digest queue turns
+# into noise. Parked and archived roadmaps don't count; they cost nothing.
+MAX_ACTIVE_ROADMAPS = _int_env("MAX_ACTIVE_ROADMAPS", 2)
+
 # --- Learning digests ---
 # How many unacknowledged digests one topic may accumulate before the generator
 # stops. Digests are nudges; a stack of unread ones is just noise, and each costs
@@ -105,6 +113,10 @@ DIGEST_MAX_UNREAD = _int_env("DIGEST_MAX_UNREAD", 3)
 # earlier ones said. Short and all-or-nothing on purpose: this is a "did you read
 # it" check, not an exam — the topic checkpoint is the exam.
 DIGEST_QUIZ_QUESTIONS = _int_env("DIGEST_QUIZ_QUESTIONS", 2)
+# How often that check rides along: every 2nd digest (#2, #4, #6 …). A check on
+# every digest past the first turns a nudge into homework — this is a "did you
+# read it" tap on the shoulder, and the topic checkpoint is the real assessment.
+DIGEST_QUIZ_EVERY = _int_env("DIGEST_QUIZ_EVERY", 2)
 DIGEST_QUIZ_PASS_SCORE = _int_env("DIGEST_QUIZ_PASS_SCORE", 100)
 
 # --- MCP (meal planner published over Model Context Protocol) ---

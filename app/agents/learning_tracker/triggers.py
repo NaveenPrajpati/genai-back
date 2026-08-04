@@ -15,10 +15,12 @@ from .service import build_digest_quiz, check_coverage
 from .state import CoverageOutput, TopicTipsOutput
 from .repository import (
     DIGESTS,
+    digest_carries_quiz,
+    digest_quiz_gate,
+    digest_quiz_window,
     in_progress_topic,
     set_topic_progress,
     topic_digests,
-    unread_digest_count,
 )
 from .tools import tavily_search_tool
 
@@ -54,7 +56,7 @@ _TIPS_PROMPT = ChatPromptTemplate.from_messages(
 
 
 async def build_digest(
-    user_id: str, roadmap: dict, notify: bool = True
+    user_id: str, roadmap: dict, topicId: str, notify: bool = True
 ) -> Optional[dict]:
     """Generate and store one digest for the topic a learner is working on.
 
@@ -63,11 +65,13 @@ async def build_digest(
 
     Returns None when there's nothing to send:
       * no topic is `in_progress` — nothing has been picked up yet;
-      * DIGEST_MAX_UNREAD digests for it are already waiting.
+      * DIGEST_MAX_UNREAD digests for it are already waiting;
+      * the previous recall check hasn't been passed (see `digest_quiz_gate`).
 
-    Each digest past the first also carries a short recall check over the earlier
-    ones, and every digest re-asks whether the topic has now been covered end to
-    end — at which point the drip-feed stops and the checkpoint takes over.
+    Every other digest — #2, #4, #6 — carries a short recall check over the ones
+    since the last check, and every digest re-asks whether the topic has now been
+    covered end to end, at which point the drip-feed stops and the checkpoint
+    takes over.
     """
     topic = in_progress_topic(roadmap)
     if not topic:
@@ -75,7 +79,13 @@ async def build_digest(
 
     roadmap_id = str(roadmap["_id"])
     topic_id = topic.get("id")
-    unread = await unread_digest_count(user_id, roadmap_id, topic_id)
+
+    prior = await topic_digests(user_id, roadmap_id, topic_id)
+    sequence = len(prior) + 1
+
+    # Both guards run before the web search and the LLM call — a digest that
+    # won't be stored shouldn't cost anything to decline.
+    unread = sum(1 for d in prior if d.get("status") != "marked")
     if unread >= DIGEST_MAX_UNREAD:
         logger.info(
             "digest skipped, %s unread on topic=%s (cap %s)",
@@ -85,9 +95,17 @@ async def build_digest(
         )
         return None
 
-    prior = await topic_digests(user_id, roadmap_id, topic_id)
+    gated_on = digest_quiz_gate(prior)
+    if gated_on:
+        logger.info(
+            "digest #%s held on topic=%s: recall check for #%s not passed",
+            sequence,
+            topic_id,
+            gated_on,
+        )
+        return None
+
     prior_bullets = [b for d in prior for b in d.get("bullets") or []]
-    sequence = len(prior) + 1
 
     topic_title = topic.get("title", "")
     results = []
@@ -111,14 +129,15 @@ async def build_digest(
         }
     )
 
-    # From the second digest on, acknowledging requires recalling the earlier
-    # ones. Built from `prior_bullets` only — quizzing someone on the digest they
-    # haven't read yet would make marking impossible.
+    # Every other digest, acknowledging requires recalling what came since the
+    # last check. Built from earlier digests only — quizzing someone on the one
+    # they haven't read yet would make marking impossible.
     quiz_id = None
     quiz = None
-    if sequence >= 2 and prior_bullets:
+    checked = [b for d in digest_quiz_window(prior) for b in d.get("bullets") or []]
+    if digest_carries_quiz(sequence) and checked:
         try:
-            quiz = await build_digest_quiz(topic_title, prior_bullets, sequence)
+            quiz = await build_digest_quiz(topic_title, checked)
             res_quiz = await get_db()["quizzes"].insert_one(
                 {
                     "user_id": user_id,

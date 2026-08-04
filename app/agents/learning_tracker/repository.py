@@ -22,7 +22,12 @@ from typing import Optional
 
 from bson import ObjectId
 
-from app.core.config import CHECKPOINT_PASS_SCORE, DIGEST_MAX_UNREAD
+from app.core.config import (
+    CHECKPOINT_PASS_SCORE,
+    DIGEST_MAX_UNREAD,
+    DIGEST_QUIZ_EVERY,
+    MAX_ACTIVE_ROADMAPS,
+)
 from app.database import get_db
 from app.agents.memory_store import extract_and_save
 from app.agents.trigger_store import next_run_at
@@ -282,6 +287,17 @@ async def insertRoadmapToDb(
     try:
         doc = roadmap.model_dump()
         doc["user_id"] = user_id
+        # A new roadmap defaults to active, but not past the cap: approving one
+        # while two are already running parks it rather than refusing to save
+        # what the learner just built. They pick which two run from the roadmap
+        # list, and nothing they asked for is lost.
+        if (
+            doc.get("status") == "active"
+            and user_id
+            and len(await active_roadmaps(user_id)) >= MAX_ACTIVE_ROADMAPS
+        ):
+            doc["status"] = "paused"
+            logger.info("new roadmap parked at active cap user=%s", user_id)
         res = await get_db()["roadmaps"].insert_one(doc)
         logger.info("insertRoadmapToDb inserted: %s", res.inserted_id)
         return str(res.inserted_id)
@@ -384,7 +400,17 @@ async def learning_stats(user_id: str) -> dict:
     except Exception as e:
         logger.error("learning_stats roadmap error user=%s: %s", user_id, e)
 
-    counts = {"total": len(roadmaps), "active": 0, "completed": 0}
+    # `max_active` rides along so the roadmap list can show "1 of 2 running" and
+    # disable resume at the cap, instead of finding out via a 409.
+    counts = {
+        "total": len(roadmaps),
+        "active": 0,
+        "completed": 0,
+        # Parked, so it's separable from archived: a paused roadmap is a
+        # candidate for a free slot, an archived one is behind the learner.
+        "paused": 0,
+        "max_active": MAX_ACTIVE_ROADMAPS,
+    }
     total_topics = 0
     reviews_due = 0
     completed_days: list[str] = []  # ISO date per completed topic
@@ -394,6 +420,8 @@ async def learning_stats(user_id: str) -> dict:
             counts["active"] += 1
         elif r.get("status") == "completed":
             counts["completed"] += 1
+        elif r.get("status") == "paused":
+            counts["paused"] += 1
         for t in r.get("topics") or []:
             total_topics += 1
             if t.get("progress_status") == "completed":
@@ -448,7 +476,61 @@ async def learning_stats(user_id: str) -> dict:
     }
 
 
+class ActiveRoadmapLimit(Exception):
+    """Raised when activating a roadmap would exceed MAX_ACTIVE_ROADMAPS.
+
+    A distinct type rather than a False return because the caller has to tell
+    "no such roadmap" (404) from "park one first" (409) — they need different
+    words in the UI.
+    """
+
+    def __init__(self, limit: int, active: list[dict]):
+        self.limit = limit
+        # What's holding the slots, so the client can name them in the prompt
+        # instead of making the learner go and look.
+        self.active = active
+        super().__init__(f"At most {limit} roadmaps can be active at once.")
+
+
+async def active_roadmaps(
+    user_id: str, exclude: Optional[str] = None
+) -> list[dict]:
+    """The learner's active roadmaps as `{_id, title}`, oldest slot first.
+
+    Used to decide whether another one can be activated, so it's deliberately a
+    list and not a count: refusing is only useful if we can say what to park.
+    """
+    try:
+        cursor = get_db()["roadmaps"].find(
+            {"user_id": user_id, "status": "active"},
+            projection={"title": 1},
+        )
+        docs = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("active_roadmaps error user=%s: %s", user_id, e)
+        return []
+    return [
+        {"_id": str(d["_id"]), "title": d.get("title")}
+        for d in docs
+        if str(d["_id"]) != exclude
+    ]
+
+
 async def set_roadmap_status(roadmapId: str, user_id: str, status: str) -> bool:
+    """Park, resume, or archive a roadmap.
+
+    Raises ActiveRoadmapLimit when resuming would put the learner over
+    MAX_ACTIVE_ROADMAPS. Enforced here rather than in the route so every caller
+    is covered by the same check — `active` is what the digest sweep runs on, so
+    a bypass doesn't just break a rule, it starts another drip-feed.
+    """
+    if status == "active":
+        # Excluding this roadmap makes activating an already-active one a no-op
+        # rather than a spurious refusal.
+        holders = await active_roadmaps(user_id, exclude=roadmapId)
+        if len(holders) >= MAX_ACTIVE_ROADMAPS:
+            raise ActiveRoadmapLimit(MAX_ACTIVE_ROADMAPS, holders)
+
     try:
         res = await get_db()["roadmaps"].update_one(
             {"_id": ObjectId(roadmapId), "user_id": user_id},
@@ -526,6 +608,14 @@ async def _rollup_roadmap_status(roadmapId: str, user_id: str) -> None:
             if all(t.get("progress_status") in DONE_STATUSES for t in topics)
             else "active"
         )
+        # Reopening a topic on a finished roadmap would otherwise take the
+        # learner over the active cap without them ever asking for it. It gets
+        # parked instead — still reopened, just not drip-feeding until they free
+        # a slot themselves.
+        if rolled == "active" and doc.get("status") == "completed":
+            if len(await active_roadmaps(user_id, exclude=roadmapId)) >= MAX_ACTIVE_ROADMAPS:
+                rolled = "paused"
+
         # Only ever move between active and completed: never un-archive or
         # un-pause a roadmap the learner parked by hand.
         if (
@@ -885,22 +975,97 @@ async def topic_digests(
         return []
 
 
+# ── digest cadence ───────────────────────────────────────────────────────────
+# A recall check rides every other digest — #2, #4, #6 — rather than every one
+# past the first. Back-to-back checks turn a nudge into homework; the point is to
+# catch a digest that was swiped away, not to examine.
+def digest_carries_quiz(sequence: int) -> bool:
+    """Whether the digest at `sequence` (1-based) carries a recall check."""
+    return sequence % DIGEST_QUIZ_EVERY == 0
+
+
+def digest_quiz_window(prior: list[dict]) -> list[dict]:
+    """The digests a new check should cover: everything since the last one.
+
+    Never includes the digest the check is attached to — the learner hasn't read
+    it yet, so quizzing on it would make marking impossible. #2 covers #1, #4
+    covers #2 and #3, #6 covers #4 and #5. Re-asking about material an earlier
+    check already cleared would make each check longer than the last for no gain.
+    """
+    return prior[max(len(prior) + 1 - 3, 0) :]
+
+
+def digest_quiz_gate(prior: list[dict]) -> Optional[int]:
+    """The sequence of an outstanding recall check blocking the next digest, or
+    None when the way is clear.
+
+    Marking a check-bearing digest requires passing its check, so `marked` is the
+    record that it was passed — there is no separate flag to consult.
+
+    Only a check-bearing digest is gated: #4 waits on #2's check, but #3 arrives
+    while that check is still outstanding. That's what keeps the DIGEST_MAX_UNREAD
+    buffer usable — the learner can read one ahead, just not indefinitely.
+    """
+    nxt = len(prior) + 1
+    if not digest_carries_quiz(nxt) or nxt < 4:
+        return None
+    blocking = nxt - DIGEST_QUIZ_EVERY
+    return blocking if prior[blocking - 1].get("status") != "marked" else None
+
+
+async def topic_digest_states(
+    user_id: str, roadmapId: str, topicId: Optional[str]
+) -> list[dict]:
+    """Every digest for a topic as `{status}`, oldest first.
+
+    A projection, not `topic_digests`: the two questions asked before spending a
+    web search and an LLM call — how many are unread, and is a check outstanding
+    — need nothing else. Position is the sequence, since digests are only ever
+    appended.
+    """
+    try:
+        cursor = (
+            get_db()[DIGESTS]
+            .find(
+                {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
+                projection={"status": 1},
+            )
+            .sort([("createdAt", 1), ("_id", 1)])
+        )
+        return await cursor.to_list(None)
+    except Exception as e:
+        logger.error("topic_digest_states error user=%s: %s", user_id, e)
+        # Fail closed, as `unread_digest_count` does: an unreadable history must
+        # not read as "nothing sent yet, generate away".
+        return [{"status": "unread"}] * DIGEST_MAX_UNREAD
+
+
 async def list_digests(
     user_id: str,
     status: Optional[str] = None,
     active_only: bool = False,
     limit: int = 20,
+    roadmapId: Optional[str] = None,
+    topicId: Optional[str] = None,
 ) -> list[dict]:
     """A learner's digests, newest first.
 
     `active_only` narrows to roadmaps still in play — the catch-up view exists to
     surface what's outstanding, and a digest for an archived roadmap isn't.
+
+    `roadmapId`/`topicId` narrow to one roadmap and then one of its topics, which
+    is how the digest archive is browsed. Filtering here rather than in the client
+    keeps `limit` meaning "the newest N of what you asked for" — paginating the
+    whole history and then discarding most of it client-side would show a nearly
+    empty page for any topic that hasn't been written about recently.
     """
     query: dict = {"user_id": user_id}
     if status == "unread":
         query["status"] = {"$ne": "marked"}
     elif status:
         query["status"] = status
+    if topicId:
+        query["topicId"] = topicId
 
     labels = await _label_map(user_id)
     if active_only:
@@ -912,9 +1077,16 @@ async def list_digests(
         except Exception as e:
             logger.error("list_digests roadmap filter error user=%s: %s", user_id, e)
             return []
+        # The two narrow together rather than one replacing the other: asking for
+        # a parked roadmap's digests under active_only must return nothing, not
+        # quietly widen back to every active roadmap.
+        if roadmapId:
+            ids = [i for i in ids if i == roadmapId]
         if not ids:
             return []
         query["roadmapId"] = {"$in": ids}
+    elif roadmapId:
+        query["roadmapId"] = roadmapId
 
     try:
         cursor = (
@@ -968,7 +1140,7 @@ async def learning_focus(user_id: str) -> dict:
 
     Every entry carries a `blocked_reason` rather than going quiet, because "no
     digest is coming" always has a cause worth showing: the topic is finished,
-    the backlog is full, or digests are switched off.
+    the backlog is full, a recall check is outstanding, or digests are off.
     """
     # The schedule is per-user, not per-roadmap — one trigger drives the sweep
     # across all of them — so it's resolved once and reported at the top.
@@ -1004,11 +1176,16 @@ async def learning_focus(user_id: str) -> dict:
         unread = 0
         reason = None
         if topic:
-            unread = await unread_digest_count(
+            # One projection answers both questions the generator asks, so the
+            # button on screen agrees with what pressing it would actually do.
+            states = await topic_digest_states(
                 user_id, str(roadmap["_id"]), topic.get("id")
             )
+            unread = sum(1 for d in states if d.get("status") != "marked")
             if unread >= DIGEST_MAX_UNREAD:
                 reason = "cap_reached"
+            elif digest_quiz_gate(states):
+                reason = "awaiting_quiz"
             elif digests_off:
                 reason = "digests_off"
         elif awaiting:
@@ -1035,8 +1212,10 @@ async def learning_focus(user_id: str) -> dict:
                 ),
                 "progress": roadmap_progress(roadmap),
                 "unread": unread,
-                # Generation is only meaningful for a topic still being taught.
-                "can_generate": bool(topic) and unread < DIGEST_MAX_UNREAD,
+                # Generation is only meaningful for a topic still being taught,
+                # and only when nothing the generator checks would refuse it.
+                "can_generate": bool(topic)
+                and reason not in ("cap_reached", "awaiting_quiz"),
                 "blocked_reason": reason,
             }
         )

@@ -21,16 +21,19 @@ from app.agents.learning_tracker.service import build_checkpoint
 from app.agents.learning_tracker.triggers import build_digest
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
+    ActiveRoadmapLimit,
     apply_checkpoint,
     completion_forecast,
     create_note,
     delete_note,
+    digest_quiz_gate,
     due_reviews,
     fetch_digest,
     fetch_quiz,
     fetch_roadmap,
     find_topic,
     grade_quiz,
+    in_progress_topic,
     learning_focus,
     learning_stats,
     list_digests,
@@ -46,6 +49,7 @@ from app.agents.learning_tracker.repository import (
     roadmap_progress,
     set_roadmap_status,
     set_topic_progress,
+    topic_digest_states,
     write_memory,
 )
 from app.agents.learning_tracker.state import (
@@ -459,8 +463,26 @@ async def updateRoadmapStatus(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Park, resume, or archive a roadmap. Which one is `active` decides what a
-    bare "what should I study next?" resolves to."""
-    updated = await set_roadmap_status(roadmapId, current_user["uid"], body.status)
+    bare "what should I study next?" resolves to, and what the daily digest
+    sweep runs on.
+
+    Resuming past MAX_ACTIVE_ROADMAPS is a 409 naming the roadmaps holding the
+    slots — the learner has to park one, and it's not the server's call which.
+    """
+    try:
+        updated = await set_roadmap_status(roadmapId, current_user["uid"], body.status)
+    except ActiveRoadmapLimit as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"You can run {e.limit} roadmaps at a time. "
+                    "Pause one to make room for this."
+                ),
+                "limit": e.limit,
+                "active": e.active,
+            },
+        )
     if not updated:
         raise HTTPException(status_code=404, detail="Roadmap not found.")
     return {"status": "done", "roadmapId": roadmapId, "roadmap_status": body.status}
@@ -517,16 +539,27 @@ async def get_digests(
     status: Optional[Literal["unread", "marked"]] = None,
     active_only: bool = False,
     limit: int = 20,
+    roadmapId: Optional[str] = None,
+    topicId: Optional[str] = None,
 ):
     """The caller's digests, most recent first.
 
     `status=unread&active_only=true` is the catch-up view: everything still
     outstanding across roadmaps they're actually working on.
+
+    `roadmapId` and then `topicId` narrow the archive to one roadmap and one of
+    its topics. Both are scoped by the caller's uid in the query, so an id
+    belonging to someone else matches nothing rather than reading across.
     """
     return {
         "status": "done",
         "result": await list_digests(
-            current_user["uid"], status=status, active_only=active_only, limit=limit
+            current_user["uid"],
+            status=status,
+            active_only=active_only,
+            limit=limit,
+            roadmapId=roadmapId,
+            topicId=topicId,
         ),
     }
 
@@ -587,7 +620,7 @@ async def acknowledge_digest(
         roadmap = await fetch_roadmap(digest.get("roadmapId"), user_id)
         if roadmap:
             try:
-                generated = await build_digest(user_id, roadmap, notify=False)
+                generated = await build_digest(user_id, roadmap, None, notify=False)
             except Exception as e:
                 # Marking already succeeded; a generation failure must not undo it.
                 logger.error("digest generate-after-mark failed: %s", e)
@@ -632,15 +665,37 @@ async def generate_digest(
 
     Deliberately not folded into marking: a digest costs a web search and an LLM
     call, so it happens when the learner asks for it, not as a side effect of
-    acknowledging one. `build_digest` still declines if the current topic already
-    has an unread digest, so this can't be used to stack them up.
+    acknowledging one. `build_digest` applies the same guards either way — the
+    unread cap and the outstanding recall check — so this can't be used to stack
+    them up or to skip a check.
     """
     user_id = current_user["uid"]
     roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
     if not roadmap:
         raise HTTPException(status_code=404, detail="No active roadmap to digest.")
 
-    digest = await build_digest(user_id, roadmap, notify=False)
+    # Checked here as well as inside `build_digest` only to say which check is
+    # outstanding. `build_digest` returns a bare None, and "nothing new to send"
+    # would send the learner looking for a digest that isn't the problem.
+    topic = in_progress_topic(roadmap)
+    if topic:
+        gated_on = digest_quiz_gate(
+            await topic_digest_states(user_id, str(roadmap["_id"]), topic.get("id"))
+        )
+        if gated_on:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"Pass the recall check on digest #{gated_on} first — "
+                        "it's on the digest itself."
+                    ),
+                    "blocked_reason": "awaiting_quiz",
+                    "sequence": gated_on,
+                },
+            )
+
+    digest = await build_digest(user_id, roadmap, topicId, notify=False)
     if not digest:
         raise HTTPException(
             status_code=409,

@@ -13,6 +13,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from bson import ObjectId
 
 import app.agents.learning_tracker.repository as repo
 import app.agents.learning_tracker.workflow as lt
@@ -394,6 +395,108 @@ async def test_modifying_a_roadmap_you_dont_own_creates_nothing(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# at most MAX_ACTIVE_ROADMAPS run at once
+#
+# `active` is what the digest sweep drips on, so every path that can mint an
+# active roadmap has to respect the cap — not just the button that says "resume".
+# --------------------------------------------------------------------------- #
+def _active_db(monkeypatch, active: list[dict]):
+    """A learner already running `active` roadmaps."""
+    col = _collection()
+    col.find.return_value.to_list = AsyncMock(return_value=active)
+    _patch_db(monkeypatch, col)
+    return col
+
+
+def _other(n: int) -> list[dict]:
+    return [{"_id": ObjectId(), "title": f"Roadmap {i}"} for i in range(n)]
+
+
+async def test_resuming_past_the_cap_is_refused(monkeypatch):
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS))
+
+    with pytest.raises(repo.ActiveRoadmapLimit) as excinfo:
+        await repo.set_roadmap_status(_OID, "userA", "active")
+
+    # Named, so the client can say which to park rather than "go and look".
+    assert len(excinfo.value.active) == repo.MAX_ACTIVE_ROADMAPS
+    col.update_one.assert_not_awaited()
+
+
+async def test_a_free_slot_lets_a_roadmap_resume(monkeypatch):
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS - 1))
+    assert await repo.set_roadmap_status(_OID, "userA", "active") is True
+    assert col.update_one.await_args.args[1]["$set"]["status"] == "active"
+
+
+async def test_reactivating_an_already_active_roadmap_is_not_a_refusal(monkeypatch):
+    """It holds one of the slots it would be counted against."""
+    others = _other(repo.MAX_ACTIVE_ROADMAPS - 1)
+    _active_db(monkeypatch, [{"_id": ObjectId(_OID), "title": "Rust"}, *others])
+    assert await repo.set_roadmap_status(_OID, "userA", "active") is True
+
+
+@pytest.mark.parametrize("status", ["paused", "archived", "completed"])
+async def test_parking_a_roadmap_is_never_capped(monkeypatch, status):
+    """The cap exists to limit what's running; it must not trap a learner who is
+    already over it — otherwise there's no way back under."""
+    _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS + 1))
+    assert await repo.set_roadmap_status(_OID, "userA", status) is True
+
+
+async def test_a_new_roadmap_is_parked_rather_than_lost_at_the_cap(monkeypatch):
+    """Approving a roadmap while the slots are full still saves it — refusing
+    would throw away what the learner just built with the tutor."""
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS))
+    await repo.insertRoadmapToDb(
+        repo.materialize_roadmap(_draft(_topic(1, "Ownership"))), "userA"
+    )
+    assert col.insert_one.await_args.args[0]["status"] == "paused"
+
+
+async def test_a_new_roadmap_starts_active_when_there_is_room(monkeypatch):
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS - 1))
+    await repo.insertRoadmapToDb(
+        repo.materialize_roadmap(_draft(_topic(1, "Ownership"))), "userA"
+    )
+    assert col.insert_one.await_args.args[0]["status"] == "active"
+
+
+async def test_reopening_a_finished_roadmap_parks_it_when_the_slots_are_full(
+    monkeypatch,
+):
+    """The rollup would otherwise hand out a third active roadmap off the back of
+    a topic edit — an activation nobody asked for."""
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS))
+    col.find_one = AsyncMock(
+        return_value={"status": "completed", "topics": [{"progress_status": "in_progress"}]}
+    )
+
+    await repo._rollup_roadmap_status(_OID, "userA")
+
+    assert col.update_one.await_args.args[1]["$set"]["status"] == "paused"
+
+
+async def test_reopening_a_finished_roadmap_resumes_it_when_a_slot_is_free(monkeypatch):
+    col = _active_db(monkeypatch, _other(repo.MAX_ACTIVE_ROADMAPS - 1))
+    col.find_one = AsyncMock(
+        return_value={"status": "completed", "topics": [{"progress_status": "in_progress"}]}
+    )
+
+    await repo._rollup_roadmap_status(_OID, "userA")
+
+    assert col.update_one.await_args.args[1]["$set"]["status"] == "active"
+
+
+async def test_stats_report_the_cap_so_the_list_can_show_it(monkeypatch):
+    col = _collection()
+    col.find.return_value.to_list = AsyncMock(return_value=[])
+    _patch_db(monkeypatch, col)
+    stats = await repo.learning_stats("userA")
+    assert stats["roadmaps"]["max_active"] == repo.MAX_ACTIVE_ROADMAPS
+
+
+# --------------------------------------------------------------------------- #
 # progress write/read contract
 #
 # A tracker stuck at 0% is the symptom of the writer and the readers disagreeing
@@ -581,11 +684,17 @@ def _started(**over) -> dict:
 
 
 def _digest_gen(monkeypatch, unread_count=0, prior=()):
-    """Stub build_digest's collaborators, and record whether it spent anything."""
+    """Stub build_digest's collaborators, and record whether it spent anything.
+
+    `build_digest` reads the backlog off the digest history rather than counting
+    it separately, so an unread count is expressed as history: `prior` entries
+    are acknowledged, and `unread_count` unacknowledged ones follow.
+    """
     import app.agents.learning_tracker.triggers as trig
 
-    monkeypatch.setattr(trig, "unread_digest_count", AsyncMock(return_value=unread_count))
-    monkeypatch.setattr(trig, "topic_digests", AsyncMock(return_value=list(prior)))
+    history = [{"status": "marked", **d} for d in prior]
+    history += [{"status": "unread", "bullets": []} for _ in range(unread_count)]
+    monkeypatch.setattr(trig, "topic_digests", AsyncMock(return_value=history))
     search = MagicMock()
     search.ainvoke = AsyncMock(return_value={"results": []})
     monkeypatch.setattr(trig, "tavily_search_tool", search)
@@ -654,11 +763,20 @@ def test_next_run_honours_a_weekly_schedule():
 
 
 # ── what the home screen shows when the queue is clear ──────────────────────
-def _focus_db(monkeypatch, roadmap=None, roadmaps=None, trigger=None, unread=0):
+def _focus_db(monkeypatch, roadmap=None, roadmaps=None, trigger=None, unread=0, digests=None):
     docs = roadmaps if roadmaps is not None else ([roadmap] if roadmap else [])
+    # The focus read derives the backlog from the digest history, so `unread` is
+    # expressed as that many unacknowledged digests unless a history is given.
+    history = (
+        digests
+        if digests is not None
+        else [{"status": "unread"} for _ in range(unread)]
+    )
     col = _collection()
     col.find_one = AsyncMock(return_value=trigger)  # the digest trigger
-    col.count_documents = AsyncMock(return_value=unread)
+    # Two chains off one double: roadmaps paginate (…skip.limit), digest states
+    # don't (…sort straight to to_list).
+    col.find.return_value.sort.return_value.to_list = AsyncMock(return_value=list(history))
     col.find.return_value.sort.return_value.skip.return_value.limit.return_value.to_list = AsyncMock(
         return_value=[dict(d) for d in docs]
     )
@@ -1034,7 +1152,7 @@ async def test_later_digests_are_quizzed_on_the_earlier_ones_only(monkeypatch):
     _fake_tips(monkeypatch, trig, bullets=["brand new point"])
     seen = {}
 
-    async def _quiz(topic_title, bullets):
+    async def _quiz(topic_title, bullets, questioncount=None):
         seen["bullets"] = bullets
         return _quiz_output()
 
@@ -1551,7 +1669,13 @@ async def test_stats_counts_topics_across_every_roadmap(monkeypatch):
     )
 
     stats = await repo.learning_stats("userA")
-    assert stats["roadmaps"] == {"total": 2, "active": 1, "completed": 1}
+    assert stats["roadmaps"] == {
+        "total": 2,
+        "active": 1,
+        "completed": 1,
+        "paused": 0,
+        "max_active": repo.MAX_ACTIVE_ROADMAPS,
+    }
     assert stats["topics"] == {"total": 3, "completed": 2, "percent": 67}
     assert stats["quizzes"] == {"attempts": 2, "average_score": 70}
 
