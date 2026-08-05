@@ -18,7 +18,9 @@ from .repository import (
     digest_carries_quiz,
     digest_quiz_gate,
     digest_quiz_window,
+    find_topic,
     in_progress_topic,
+    revision_outstanding,
     set_topic_progress,
     topic_digests,
 )
@@ -40,6 +42,11 @@ _TIPS_PROMPT = ChatPromptTemplate.from_messages(
             'official docs" — these teach nothing, and links are already listed '
             "separately below the bullets. Treat the search results as reference "
             "material for getting the facts right, not as the subject.\n"
+            "Never name a course, book, author, website, channel or platform in a "
+            "bullet. If the reference material turns out to be mostly lists of "
+            "places to learn this — course roundups, 'top 10' posts, forum threads "
+            "recommending tutorials — then it contains nothing to teach: ignore it "
+            "entirely and write the bullets from your own knowledge of the topic.\n"
             "Aim at these outcomes, in order, and go deep enough that a learner "
             # "could actually do them:\n{outstanding}\n"
             "Do not repeat what has already been sent:\n{covered}\n"
@@ -56,7 +63,7 @@ _TIPS_PROMPT = ChatPromptTemplate.from_messages(
 
 
 async def build_digest(
-    user_id: str, roadmap: dict, topicId: str, notify: bool = True
+    user_id: str, roadmap: dict, topicId: Optional[str] = None, notify: bool = True
 ) -> Optional[dict]:
     """Generate and store one digest for the topic a learner is working on.
 
@@ -110,8 +117,19 @@ async def build_digest(
     topic_title = topic.get("title", "")
     results = []
     try:
+        # Search the SUBJECT, not the marketplace around it. Asking for "best
+        # free learning resources for X" returns course roundups and "top 10"
+        # listicles, whose content is about where to learn X rather than about X
+        # — so the bullets written from them drift into naming courses and
+        # authors, and the recall check built from those bullets ends up quizzing
+        # the learner on who wrote which tutorial.
         search = await tavily_search_tool.ainvoke(
-            {"query": f"best free learning resources for {topic_title}"}
+            {
+                "query": (
+                    f"{topic_title} explained: key concepts, worked examples, "
+                    "common mistakes"
+                )
+            }
         )
         results = search.get("results", []) if isinstance(search, dict) else search
     except Exception as e:
@@ -137,19 +155,31 @@ async def build_digest(
     checked = [b for d in digest_quiz_window(prior) for b in d.get("bullets") or []]
     if digest_carries_quiz(sequence) and checked:
         try:
-            quiz = await build_digest_quiz(topic_title, checked)
-            res_quiz = await get_db()["quizzes"].insert_one(
-                {
-                    "user_id": user_id,
-                    "roadmapId": roadmap_id,
-                    "topicId": topic_id,
-                    "kind": "digest",
-                    "questions": [q.model_dump() for q in quiz.quiz],
-                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            quiz_id = str(res_quiz.inserted_id)
-
+            built = await build_digest_quiz(topic_title, checked)
+            # An empty set is a legitimate outcome — the generator is told to
+            # write nothing rather than ask about the provenance of a tip that
+            # only points at a resource. It must not be attached: a digest whose
+            # quiz has no questions scores 0 against a pass mark of 100, so it can
+            # never be marked, and being unmarkable it holds a slot under
+            # DIGEST_MAX_UNREAD forever and jams the whole topic.
+            if built.quiz:
+                quiz = built
+                res_quiz = await get_db()["quizzes"].insert_one(
+                    {
+                        "user_id": user_id,
+                        "roadmapId": roadmap_id,
+                        "topicId": topic_id,
+                        "kind": "digest",
+                        "questions": [q.model_dump() for q in quiz.quiz],
+                        "createdAt": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                quiz_id = str(res_quiz.inserted_id)
+            else:
+                logger.info(
+                    "digest quiz empty topic=%s — nothing checkable in the tips",
+                    topic_id,
+                )
         except Exception as e:
             # A digest the learner can't acknowledge is worse than one without a
             # recall check, so a generation failure degrades to no quiz.
@@ -218,10 +248,132 @@ async def build_digest(
     return {**doc, "_id": str(res.inserted_id)}
 
 
+_REVISION_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "A learner has just failed the checkpoint on a topic they have "
+            "already been taught. Write 3-5 bullets that close the specific gaps "
+            "the failed questions expose.\n"
+            "This is NOT a re-introduction. They have read everything below and "
+            "still got these questions wrong, so restating it the same way will "
+            "fail the same way. Come at each miss from a different angle: a "
+            "worked example where the earlier bullet gave a rule, the "
+            "distinction being confused, the case that breaks the wrong mental "
+            "model.\n"
+            "Address every question they missed. Do not reveal or restate the "
+            "answer options — they will face these questions again, and a bullet "
+            "that hands over the answer teaches nothing.\n"
+            "Questions they got wrong:\n{missed}\n"
+            "What they have already been told (do not simply repeat it):\n{covered}",
+        ),
+        ("human", "Topic: {topic}\nRoadmap context: {summary}"),
+    ]
+)
+
+
+async def build_revision_digest(
+    user_id: str, roadmap: dict, topicId: str, notify: bool = True
+) -> Optional[dict]:
+    """Generate the revision digest a failed checkpoint owes the learner.
+
+    Separate from `build_digest` because it answers a different question. A
+    teaching digest asks "what hasn't been covered yet?" and stops when coverage
+    is complete; a revision digest starts from coverage being complete and asks
+    "what did they get wrong?". Running the teaching path here would generate one
+    more digest about a topic already declared fully taught, which is the loop
+    this exists to break.
+
+    No web search: the material is the learner's own missed questions and the
+    bullets they've already been sent. Nothing on the open web knows either.
+
+    Returns None when nothing is owed, or when one is already waiting — a stack
+    of revision digests is a worse answer to a failed checkpoint than one.
+    """
+    topic = find_topic(roadmap, topicId)
+    if not topic or not revision_outstanding(topic):
+        return None
+
+    roadmap_id = str(roadmap["_id"])
+    prior = await topic_digests(user_id, roadmap_id, topicId)
+    if any(
+        d.get("kind") == "revision" and d.get("status") != "marked" for d in prior
+    ):
+        logger.info("revision digest already waiting on topic=%s", topicId)
+        return None
+
+    missed = topic.get("weak_points") or []
+    covered = [b for d in prior for b in d.get("bullets") or []]
+    topic_title = topic.get("title", "")
+
+    chain = _REVISION_PROMPT | llm.with_structured_output(TopicTipsOutput)
+    tips: TopicTipsOutput = await chain.ainvoke(
+        {
+            "topic": topic_title,
+            "summary": roadmap.get("summary", ""),
+            "missed": "\n".join(f"- {m}" for m in missed) or "- (not recorded)",
+            "covered": "\n".join(f"- {b}" for b in covered) or "- (nothing yet)",
+        }
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "user_id": user_id,
+        "roadmapId": roadmap_id,
+        "topicId": topicId,
+        "topicTitle": topic_title,
+        # Deliberately outside the teaching sequence: revision doesn't advance
+        # the drip-feed, so it must not shift where the recall-check cadence
+        # falls for the topic's remaining digests.
+        "sequence": None,
+        "kind": "revision",
+        "bullets": tips.bullets,
+        "resources": [],
+        # No recall check. The checkpoint waiting on the other side of this IS
+        # the assessment; gating revision behind its own quiz would put two
+        # quizzes back to back between the learner and their retry.
+        "quizId": None,
+        "coverage_complete": True,
+        "missing_outcomes": [],
+        "weak_points": missed,
+        "status": "unread",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    res = await get_db()[DIGESTS].insert_one(doc)
+    logger.info(
+        "revision digest created user=%s topic=%s misses=%s",
+        user_id,
+        topic_title,
+        len(missed),
+    )
+
+    if notify:
+        await send_push_notification(
+            user_id,
+            title=f"Revision: {topic_title}",
+            body=(
+                tips.bullets[0]
+                if tips.bullets
+                else "A few things to go over before you retry."
+            ),
+            data={"type": "learning_revision", "topicId": topicId},
+        )
+
+    doc["quiz"] = None
+    return {**doc, "_id": str(res.inserted_id)}
+
+
 async def run_triggers(agent=None):
     """Hourly sweep: for every user who opted in via /toggle-trigger, fire only
     when the current hour matches their chosen schedule_hour in their timezone,
-    then generate a digest for each active roadmap's current topic."""
+    then generate a digest for each active roadmap's current topic.
+
+    A roadmap whose topic is owed revision after a failed checkpoint gets that
+    instead — the topic is no longer being taught, so the teaching path would
+    find nothing to send and the learner would sit blocked until they thought to
+    ask for revision by hand.
+    """
     logger.info("learning digest job running")
     now = datetime.now(timezone.utc)
 
@@ -244,7 +396,18 @@ async def run_triggers(agent=None):
 
         for roadmap in roadmaps:
             try:
-                await build_digest(user_id, roadmap)
+                owed = next(
+                    (
+                        t
+                        for t in roadmap.get("topics") or []
+                        if revision_outstanding(t)
+                    ),
+                    None,
+                )
+                if owed:
+                    await build_revision_digest(user_id, roadmap, owed["id"])
+                else:
+                    await build_digest(user_id, roadmap)
             except Exception as e:
                 logger.error(
                     "learning digest error roadmap=%s: %s", roadmap.get("_id"), e

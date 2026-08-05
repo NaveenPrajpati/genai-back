@@ -1106,7 +1106,9 @@ async def test_digests_resume_once_the_backlog_drops(monkeypatch):
 
     out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
     assert out is not None
-    assert out["sequence"] == 1
+    # One below the cap, so it sends — and it's the next in the run, not a
+    # restart: the backlog *is* the history those digests came from.
+    assert out["sequence"] == DIGEST_MAX_UNREAD
 
 
 async def test_a_backlog_read_failure_holds_off_rather_than_piling_on(monkeypatch):
@@ -1464,12 +1466,19 @@ async def test_passing_a_checkpoint_is_what_completes_a_topic(monkeypatch):
 async def test_failing_a_first_attempt_does_not_complete_the_topic(monkeypatch):
     col = _checkpoint_db(monkeypatch, {"id": "t1", "progress_status": "not_started"})
 
-    out = await repo.apply_checkpoint(_OID, "t1", "userA", 25)
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 25, missed=["Q about moves"])
 
     assert out["passed"] is False
-    assert out["progress_status"] == "in_progress"
-    assert _written(col).get("topics.$.completed_at") is None
-    # Still scheduled — a topic you struggled with should come back soonest.
+    # Held at needs_review, not dropped back to in_progress: coverage already
+    # declared the topic taught, so what's owed is revision of what was missed.
+    assert out["progress_status"] == "needs_review"
+    assert out["needs_revision"] is True
+    written = _written(col)
+    assert written.get("topics.$.completed_at") is None
+    # Nothing was completed, so there is no next review to schedule.
+    assert "topics.$.next_review_at" not in written
+    assert written["topics.$.checkpoint_attempts"] == 1
+    assert written["topics.$.weak_points"] == ["Q about moves"]
     assert out["review_count"] == 0
 
 

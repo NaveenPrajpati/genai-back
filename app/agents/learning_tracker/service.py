@@ -16,14 +16,32 @@ from typing import Optional, List
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import CHECKPOINT_QUESTIONS, DIGEST_QUIZ_QUESTIONS
-from app.core.llm import llm, fast_llm
+from app.core.config import (
+    CHECKPOINT_QUESTIONS,
+    DIGEST_QUIZ_QUESTIONS,
+    MISCONCEPTION_MAX_PATTERNS,
+    MISCONCEPTION_MIN_EVIDENCE,
+)
+from app.core.llm import llm, fast_llm, get_llm
 from app.agents.personal_assistant.service import (
     TaskSpec,
     create_tasks as create_pa_tasks,
 )
-from .state import CoverageOutput, QuizOutput, RoadmapDraft, RoadmapOutput
-from .repository import insertRoadmapToDb, materialize_roadmap, profile_snapshot
+from .state import (
+    CoverageOutput,
+    MisconceptionOutput,
+    QuizOutput,
+    RoadmapDraft,
+    RoadmapOutput,
+)
+from .repository import (
+    get_misconceptions,
+    insertRoadmapToDb,
+    materialize_roadmap,
+    profile_snapshot,
+    save_misconceptions,
+    topic_misses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +83,7 @@ async def build_roadmap(topic: str, memory: Optional[dict] = None) -> RoadmapDra
     chain = ChatPromptTemplate.from_messages(
         [("system", _NEW_ROADMAP_SYSTEM), ("human", "{text}")]
     ) | llm.with_structured_output(RoadmapDraft)
+
     return await chain.ainvoke({"text": topic, "memory": memory or "none"})
 
 
@@ -94,6 +113,12 @@ _CHECKPOINT_SYSTEM = (
     "learning outcomes.\n"
     "- Exactly one option is correct, and `answer` is its 0-based index.\n"
     "- Make the wrong options plausible; an obviously silly distractor tests nothing.\n"
+    "- Set `outcome` to the learning outcome or sub-skill the question checks.\n"
+    "- Set `hint` to one sentence pointing at what to go back over. The learner "
+    "sees the hint WITHOUT the answer when they get the question wrong, so it "
+    "must not state or paraphrase the correct option, identify it by position, "
+    "or rule the wrong ones out. 'Re-read how ownership transfers on assignment' "
+    "is a hint; 'it's the one about borrowing' is not.\n"
     "Write exactly {count} questions.\n"
     "Topic: {title}\n"
     "Description: {description}\n"
@@ -108,21 +133,67 @@ _REVIEW_NOTE = (
     "the goal is durable recall, not recognising a question they've already seen."
 )
 
+_AVOID_NOTE = (
+    "\nThis learner has already been asked the following on this topic. Do not "
+    "ask any of them again, and do not ask a reworded version of one — the same "
+    "question in new clothes tests whether they remember the answer, which is "
+    "exactly what a review must not measure:\n{asked}\n"
+    "Come at the same outcomes from angles these did not cover: apply it to a "
+    "scenario, compare it with a neighbouring idea, ask what breaks if it is done "
+    "wrong, or work from a concrete case back to the rule. If the topic is small "
+    "enough that you have genuinely run out of distinct questions, change the "
+    "setting and the specifics rather than repeating one."
+)
+
+_MISCONCEPTION_NOTE = (
+    "\nThis learner has a history on this topic. These are the misunderstandings "
+    "their past wrong answers point to:\n{patterns}\n"
+    "Aim at least one question squarely at each, up to half the set — a checkpoint "
+    "that only re-probes old mistakes stops covering the topic. Target the belief, "
+    "not the wording: reusing a question they've already seen tests whether they "
+    "remember being caught, not whether they now understand.\n"
+    "Say nothing about their history in the question text. A question that "
+    "announces itself as remedial tells them where to concentrate and reads as an "
+    "accusation."
+)
+
 
 async def build_checkpoint(
     topic: dict,
     roadmap_title: str,
     memory: Optional[dict] = None,
     is_review: bool = False,
+    misconceptions: Optional[List[dict]] = None,
+    asked: Optional[List[str]] = None,
 ) -> QuizOutput:
     """Generate a topic-scoped checkpoint quiz.
 
     Grounded in the topic's own description and learning outcomes so the
     questions can't wander into material the learner hasn't reached yet — the
     failure mode that would make a completion gate feel arbitrary.
+
+    `misconceptions` are the patterns inferred from this learner's previous wrong
+    answers across every quiz kind. Passing them makes a retry a genuinely
+    different test: same outcomes, aimed at what they actually got wrong, rather
+    than a fresh roll of the dice or a repeat of the set they just failed.
+
+    `asked` is what this learner has already been shown on this topic. Without
+    it, regenerating produces near-identical questions — the same description and
+    outcomes lead the model to the same obvious few every time, which over a
+    spaced-repetition ladder measures memory of the answer, not the material.
     """
     outcomes = "\n".join(f"- {o}" for o in topic.get("learning_outcomes") or [])
     system = _CHECKPOINT_SYSTEM + (_REVIEW_NOTE if is_review else "")
+    if asked:
+        system += _AVOID_NOTE.format(asked="\n".join(f"- {a}" for a in asked))
+    if misconceptions:
+        system += _MISCONCEPTION_NOTE.format(
+            patterns="\n".join(
+                f"- {m.get('label')}: {m.get('detail')} "
+                f"(probe: {m.get('probe')})".strip()
+                for m in misconceptions
+            )
+        )
     chain = ChatPromptTemplate.from_messages(
         [("system", system), ("human", "Write the checkpoint.")]
     ) | llm.with_structured_output(QuizOutput)
@@ -138,12 +209,108 @@ async def build_checkpoint(
     )
 
 
+_MISCONCEPTION_SYSTEM = (
+    "You are diagnosing a learner from their wrong answers on ONE topic.\n"
+    "Below is every question they got wrong, what they picked, the right answer, "
+    "and which kind of check it came from — a `digest` recall check, a "
+    "`checkpoint` they must pass to complete the topic, or a `review` of material "
+    "they finished earlier and are revisiting.\n"
+    "Find at most {count} RECURRING misunderstandings. A misunderstanding is a "
+    "belief that explains several wrong answers at once — not a restatement of "
+    "one. If the mistakes have nothing in common, return fewer patterns, or none: "
+    "a learner having one bad day is not a misconception, and inventing one sends "
+    "every future checkpoint chasing something that was never there.\n"
+    "Weight the evidence. A mistake repeated across different kinds of check, or "
+    "one that persists into a `review`, is a real gap; a single early `digest` "
+    "slip probably isn't. Prefer what they got wrong most recently — a belief "
+    "they have since corrected must not keep steering their questions.\n"
+    "For each pattern give: `label`, a short name; `detail`, what they appear to "
+    "believe and what is actually true; `probe`, how a future question could "
+    "re-test that belief from a different angle; and `evidence`, the 0-based "
+    "indices of the misses that support it.\n"
+    "Topic: {topic}\n"
+    "Their wrong answers:\n{misses}"
+)
+
+
+async def extract_misconceptions(
+    topic_title: str, misses: List[dict]
+) -> MisconceptionOutput:
+    """Read a topic's wrong answers for the belief underneath them.
+
+    Deliberately allowed to return nothing. The useful output here is a pattern
+    that survives contact with several mistakes; a model pressed to always
+    produce one will paraphrase the most recent miss and call it a diagnosis,
+    which then steers checkpoints at a problem the learner doesn't have.
+    """
+    rendered = "\n".join(
+        f"{i}. [{m.get('kind') or 'quiz'}] {m.get('question')}\n"
+        f"   picked: {m.get('chosen') or '(left blank)'}\n"
+        f"   correct: {m.get('correct') or '(unknown)'}"
+        for i, m in enumerate(misses)
+    )
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _MISCONCEPTION_SYSTEM), ("human", "Diagnose.")]
+    ) | llm.with_structured_output(MisconceptionOutput)
+    return await chain.ainvoke(
+        {
+            "count": MISCONCEPTION_MAX_PATTERNS,
+            "topic": topic_title,
+            "misses": rendered,
+        }
+    )
+
+
+async def refresh_misconceptions(
+    user_id: str, roadmapId: str, topicId: str, topic_title: str
+) -> Optional[list[dict]]:
+    """Re-read a topic's wrong answers if there's new evidence worth reading.
+
+    Runs off the request path (a background task after grading), so the checkpoint
+    that consumes it only ever does a cached read. Skips when the evidence is too
+    thin to generalise from, and when nothing has been added since last time —
+    re-deriving the same patterns from the same misses is a wasted LLM call.
+    """
+    misses = await topic_misses(user_id, roadmapId, topicId)
+    if len(misses) < MISCONCEPTION_MIN_EVIDENCE:
+        return None
+
+    stored = await get_misconceptions(user_id, roadmapId, topicId)
+    if stored and stored.get("misses_analyzed") == len(misses):
+        return stored.get("patterns")
+
+    try:
+        out = await extract_misconceptions(topic_title, misses)
+    except Exception as e:
+        logger.error("misconception analysis failed topic=%s: %s", topicId, e)
+        return stored.get("patterns") if stored else None
+
+    patterns = [p.model_dump() for p in out.patterns]
+    await save_misconceptions(user_id, roadmapId, topicId, patterns, len(misses))
+    logger.info(
+        "misconceptions for topic=%s: %s pattern(s) from %s miss(es)",
+        topicId,
+        len(patterns),
+        len(misses),
+    )
+    return patterns
+
+
 _DIGEST_QUIZ_SYSTEM = (
     "You are checking whether a learner actually read the study tips they were "
     "sent about ONE topic.\n"
-    "Write exactly {count} multiple-choice questions answerable purely from the "
+    "Write up to {count} multiple-choice questions answerable purely from the "
     "tips below — nothing from outside them, and nothing about the newest tips, "
     "which they haven't acknowledged yet.\n"
+    "Question the IDEA in a tip, never its provenance. Do not ask which book, "
+    "course, site, channel or author something came from, where to learn the "
+    "topic, or what a named tutorial covers — knowing that Wes McKinney wrote a "
+    "book is not knowing pandas, and a check made of those questions measures "
+    "nothing about the material.\n"
+    "Some tips may only point at a resource rather than teach anything. Skip "
+    "those: there is nothing in them to have understood. If that leaves too "
+    "little to ask about, write fewer questions, or none at all — a short check "
+    "beats a check about trivia.\n"
     "Keep them short and concrete. Exactly one option is correct, and `answer` is "
     "its 0-based index. Make the wrong options plausible.\n"
     "Topic: {topic}\n"

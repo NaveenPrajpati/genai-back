@@ -15,6 +15,7 @@ existed (a bare `covered: bool`) are not supported and are not read.
 """
 
 import logging
+import re
 import uuid
 from datetime import date, timedelta, datetime, timezone
 from math import ceil
@@ -23,13 +24,17 @@ from typing import Optional
 from bson import ObjectId
 
 from app.core.config import (
+    CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
     CHECKPOINT_PASS_SCORE,
+    CHECKPOINT_RETRY_COOLDOWN_MINUTES,
     DIGEST_MAX_UNREAD,
     DIGEST_QUIZ_EVERY,
     MAX_ACTIVE_ROADMAPS,
+    MISCONCEPTION_EVIDENCE_WINDOW,
 )
 from app.database import get_db
 from app.agents.memory_store import extract_and_save
+from app.agents.personal_assistant.repository import TODOS
 from app.agents.trigger_store import next_run_at
 from .state import (
     DONE_STATUSES,
@@ -272,6 +277,13 @@ def merge_roadmap(
         topic.mastery_score = prior.get("mastery_score")
         topic.completed_at = prior.get("completed_at")
         topic.next_review_at = prior.get("next_review_at")
+        # `review_count` rides along or the edit silently resets the spaced-
+        # repetition ladder to day one; the revision debt rides along or an edit
+        # becomes a way to skip revising after a failed checkpoint.
+        topic.review_count = int(prior.get("review_count") or 0)
+        topic.checkpoint_attempts = int(prior.get("checkpoint_attempts") or 0)
+        topic.revisions_done = int(prior.get("revisions_done") or 0)
+        topic.weak_points = list(prior.get("weak_points") or [])
 
     # An edit can drop the topic that was underway, or carry two across; either
     # way the roadmap comes out with exactly one.
@@ -376,6 +388,145 @@ async def list_roadmaps(
     return docs
 
 
+# ── mastery ──────────────────────────────────────────────────────────────────
+# A flat average over every attempt a learner has ever made is a weak signal: it
+# treats a quiz failed in week one as evidence about today, and it can only move
+# a fraction of a point once there's any history, so it stops responding exactly
+# when the learner starts improving. Two decays fix that.
+#
+# The first weights attempts by age, so mastery reflects where they are now
+# rather than where they started. The second decays a topic once its scheduled
+# review is overdue: a topic aced in March and untouched since is not knowledge
+# you still have, and pretending otherwise is how a dashboard talks a learner out
+# of revising.
+MASTERY_ATTEMPT_HALF_LIFE_DAYS = 14
+MASTERY_OVERDUE_HALF_LIFE_DAYS = 21
+# Below this, "improving" and "slipping" are noise in a 4-question quiz.
+MASTERY_TREND_BAND = 5
+
+
+def _age_days(stamp: Optional[str], now: datetime) -> Optional[float]:
+    try:
+        when = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max((now - when).total_seconds() / 86_400, 0.0)
+
+
+def topic_mastery(
+    attempts: list[dict],
+    next_review_at: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Optional[dict]:
+    """How well one topic is actually held, from its graded attempts.
+
+    `score` is an age-weighted mean of the attempts — each one counts half as
+    much per MASTERY_ATTEMPT_HALF_LIFE_DAYS, so a learner is measured on where
+    they are rather than on their first stumble. `retention` is 1.0 until the
+    topic's scheduled review falls due, then decays; `mastery` is the two
+    combined, and is the number worth showing.
+
+    `trend` compares the newest attempt against the weighted mean of the ones
+    before it. Returns None when there's nothing graded — a topic with no
+    attempts has no mastery, which is different from a mastery of zero.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    dated = []
+    for a in attempts:
+        age = _age_days(a.get("createdAt"), now)
+        score = a.get("score")
+        if age is not None and isinstance(score, (int, float)):
+            dated.append((age, float(score)))
+    if not dated:
+        return None
+
+    dated.sort(key=lambda p: p[0])  # newest first
+
+    def weighted(points: list[tuple[float, float]]) -> float:
+        total = sum(0.5 ** (age / MASTERY_ATTEMPT_HALF_LIFE_DAYS) for age, _ in points)
+        if total <= 0:
+            return points[0][1]
+        return (
+            sum(
+                (0.5 ** (age / MASTERY_ATTEMPT_HALF_LIFE_DAYS)) * s
+                for age, s in points
+            )
+            / total
+        )
+
+    score = weighted(dated)
+
+    # Overdue decay, measured against the spaced-repetition schedule rather than
+    # raw elapsed time: a topic reviewed on time hasn't faded, however long the
+    # rung was. Keeps this number and `reviews_due` telling one story.
+    retention = 1.0
+    overdue = _age_days(next_review_at, now) if next_review_at else None
+    if overdue:
+        retention = 0.5 ** (overdue / MASTERY_OVERDUE_HALF_LIFE_DAYS)
+
+    latest = dated[0][1]
+    delta = latest - weighted(dated[1:]) if len(dated) > 1 else 0.0
+    trend = "new"
+    if len(dated) > 1:
+        trend = (
+            "improving"
+            if delta >= MASTERY_TREND_BAND
+            else "slipping" if delta <= -MASTERY_TREND_BAND else "steady"
+        )
+
+    return {
+        "score": round(score),
+        "retention": round(retention, 2),
+        "mastery": round(score * retention),
+        "trend": trend,
+        "delta": round(delta),
+        "attempts": len(dated),
+        "overdue_days": round(overdue) if overdue else 0,
+    }
+
+
+def mastery_summary(topics: list[dict]) -> dict:
+    """Roll per-topic mastery into the one figure a landing screen can carry.
+
+    Unweighted across topics on purpose: every topic the learner has been graded
+    on counts the same, so a topic they quietly stopped practising drags the
+    number down instead of being averaged away by whatever they drilled most.
+    """
+    scored = [t for t in topics if t.get("mastery") is not None]
+    if not scored:
+        return {
+            "score": None,
+            "trend": "new",
+            "delta": 0,
+            "topics_scored": 0,
+            "weakest": [],
+        }
+
+    overall = sum(t["mastery"] for t in scored) / len(scored)
+    delta = sum(t["delta"] for t in scored) / len(scored)
+    movers = [t for t in scored if t["trend"] != "new"]
+    trend = "new"
+    if movers:
+        trend = (
+            "improving"
+            if delta >= MASTERY_TREND_BAND
+            else "slipping" if delta <= -MASTERY_TREND_BAND else "steady"
+        )
+
+    return {
+        "score": round(overall),
+        "trend": trend,
+        "delta": round(delta),
+        "topics_scored": len(scored),
+        # What to actually do about it. Sorted by mastery so the weakest lead,
+        # and capped — a list of everything is a list nobody acts on.
+        "weakest": sorted(scored, key=lambda t: t["mastery"])[:3],
+    }
+
+
 async def learning_stats(user_id: str) -> dict:
     """Progress aggregated across ALL of a learner's roadmaps, for the landing
     screen.
@@ -390,7 +541,10 @@ async def learning_stats(user_id: str) -> dict:
         cursor = get_db()["roadmaps"].find(
             {"user_id": user_id},
             projection={
+                "title": 1,
                 "status": 1,
+                "topics.id": 1,
+                "topics.title": 1,
                 "topics.progress_status": 1,
                 "topics.completed_at": 1,
                 "topics.next_review_at": 1,
@@ -448,10 +602,19 @@ async def learning_stats(user_id: str) -> dict:
     this_week = sum(1 for d in completed_days if d and d >= week_start)
 
     attempts, average = 0, 0
+    rows: list[dict] = []
     try:
         rows = await (
             get_db()["quiz_attempts"]
-            .find({"user_id": user_id}, projection={"score": 1})
+            .find(
+                {"user_id": user_id},
+                projection={
+                    "score": 1,
+                    "createdAt": 1,
+                    "roadmapId": 1,
+                    "topicId": 1,
+                },
+            )
             .to_list(None)
         )
         scores = [r["score"] for r in rows if isinstance(r.get("score"), (int, float))]
@@ -459,6 +622,36 @@ async def learning_stats(user_id: str) -> dict:
         average = round(sum(scores) / len(scores)) if scores else 0
     except Exception as e:
         logger.error("learning_stats quiz error user=%s: %s", user_id, e)
+
+    # Per-topic mastery, from the same rows the average came from.
+    by_topic: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = (r.get("roadmapId"), r.get("topicId"))
+        if all(key):
+            by_topic.setdefault(key, []).append(r)
+
+    scored_topics = []
+    for r in roadmaps:
+        # Mastery is an extra on top of the counts; a roadmap we can't key
+        # attempts against loses its mastery, not the whole stats response.
+        if not r.get("_id"):
+            continue
+        rid = str(r["_id"])
+        for t in r.get("topics") or []:
+            graded = by_topic.get((rid, t.get("id")))
+            if not graded:
+                continue
+            m = topic_mastery(graded, t.get("next_review_at"))
+            if m:
+                scored_topics.append(
+                    {
+                        **m,
+                        "roadmapId": rid,
+                        "roadmapTitle": r.get("title"),
+                        "topicId": t.get("id"),
+                        "title": t.get("title"),
+                    }
+                )
 
     return {
         "roadmaps": counts,
@@ -472,8 +665,85 @@ async def learning_stats(user_id: str) -> dict:
         "completed_this_week": this_week,
         "streak_days": streak,
         "reviews_due": reviews_due,
+        # The lifetime average is kept because shipped clients read it, but it's
+        # the weak signal `mastery` exists to replace — see the note above
+        # MASTERY_ATTEMPT_HALF_LIFE_DAYS.
         "quizzes": {"attempts": attempts, "average_score": average},
+        "mastery": mastery_summary(scored_topics),
     }
+
+
+async def delete_roadmap(roadmapId: str, user_id: str) -> Optional[dict]:
+    """Delete a roadmap and everything the learning tracker stored against it.
+
+    Returns per-collection counts of what went, or None when there was no such
+    roadmap for this caller. Distinct from archiving, which keeps the record and
+    the history — this is for a roadmap the learner wants gone.
+
+    Everything keyed by `roadmapId` goes with it. Leaving the children behind
+    would put digests for a roadmap that no longer exists into the catch-up
+    queue, notes under a heading that can't be resolved, and graded attempts into
+    the mastery average for a topic the learner can no longer open.
+
+    The roadmap document is deleted FIRST, and the cascade only runs once that
+    lands. It is also what enforces ownership: scoped by `user_id`, so a guessed
+    id matches nothing and nothing downstream is touched. If a later step fails
+    the leftovers are orphans — invisible and re-cleanable — where the reverse
+    order would strip the history off a roadmap that still exists.
+    """
+    try:
+        res = await get_db()["roadmaps"].delete_one(
+            {"_id": ObjectId(roadmapId), "user_id": user_id}
+        )
+    except Exception as e:
+        logger.error("delete_roadmap error id=%s: %s", roadmapId, e)
+        return None
+    if res.deleted_count == 0:
+        return None
+
+    removed = {"roadmap": res.deleted_count}
+    for label, collection in (
+        ("digests", DIGESTS),
+        ("notes", NOTES),
+        ("quizzes", "quizzes"),
+        ("attempts", "quiz_attempts"),
+        ("misconceptions", MISCONCEPTIONS),
+    ):
+        try:
+            out = await get_db()[collection].delete_many(
+                {"user_id": user_id, "roadmapId": roadmapId}
+            )
+            removed[label] = out.deleted_count
+        except Exception as e:
+            # The roadmap is already gone; a failed sweep must not report the
+            # delete as failed and invite the learner to try again.
+            logger.error(
+                "delete_roadmap cascade error id=%s collection=%s: %s",
+                roadmapId,
+                collection,
+                e,
+            )
+            removed[label] = 0
+
+    # Not deleted: to-dos the learner may have rescheduled or annotated live in
+    # the personal assistant, and clearing someone's task list as a side effect
+    # of deleting a roadmap is a bigger decision than this endpoint should make.
+    # Counted so the caller can say they're still there.
+    try:
+        removed["linked_tasks"] = await get_db()[TODOS].count_documents(
+            {
+                "user_id": user_id,
+                # The string `roadmap_task_specs` stamps on every task it creates.
+                "source": "learning_tracker",
+                "source_ref": {"$regex": f"^{re.escape(roadmapId)}:"},
+            }
+        )
+    except Exception as e:
+        logger.error("delete_roadmap task count error id=%s: %s", roadmapId, e)
+        removed["linked_tasks"] = 0
+
+    logger.info("roadmap %s deleted user=%s removed=%s", roadmapId, user_id, removed)
+    return removed
 
 
 class ActiveRoadmapLimit(Exception):
@@ -657,18 +927,32 @@ def find_topic(roadmap: Optional[dict], topicId: str) -> Optional[dict]:
 
 
 async def apply_checkpoint(
-    roadmapId: str, topicId: str, user_id: str, score: int
+    roadmapId: str,
+    topicId: str,
+    user_id: str,
+    score: int,
+    missed: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """Fold a graded checkpoint into the topic: mastery, completion, next review.
 
     Passing is what completes a topic — the point of gating completion on active
     recall rather than on a checkbox.
 
-    Failing is deliberately asymmetric. A failed *first* attempt leaves the topic
-    `in_progress` and simply doesn't complete it. A failed *review* does NOT
-    un-complete a topic the learner already finished; it drags the next review
-    back to the front of the ladder instead. Clawing back progress for an honest
-    attempt would punish the exact behaviour this feature exists to encourage.
+    Failing is deliberately asymmetric:
+
+    * A failed *first* attempt holds the topic at `needs_review` and opens a
+      revision debt (see `revision_outstanding`). It does NOT drop back to
+      `in_progress`: coverage has already declared the topic fully taught, so
+      re-opening the teaching drip-feed would generate one more arbitrary digest
+      and then bounce straight back here. What's owed is revision of the specific
+      things that were missed, which is a different artefact.
+    * A failed *review* does NOT un-complete a topic the learner already
+      finished; it drags the next review back to the front of the ladder instead.
+      Clawing back progress for an honest attempt would punish the exact
+      behaviour this feature exists to encourage.
+
+    `missed` is the text of the questions got wrong, and becomes what the
+    revision digest is written against.
     """
     roadmap = await fetch_roadmap(roadmapId, user_id)
     topic = find_topic(roadmap, topicId)
@@ -678,18 +962,28 @@ async def apply_checkpoint(
     passed = score >= CHECKPOINT_PASS_SCORE
     was_completed = topic.get("progress_status") == "completed"
     review_count = (int(topic.get("review_count") or 0) + 1) if passed else 0
-    status = "completed" if (passed or was_completed) else "in_progress"
+    status = "completed" if (passed or was_completed) else "needs_review"
 
     now = datetime.now(timezone.utc).isoformat()
     updates = {
         "topics.$.progress_status": status,
         "topics.$.mastery_score": score,
         "topics.$.review_count": review_count,
-        "topics.$.next_review_at": next_review_at(review_count),
         "updated_at": now,
     }
-    if status == "completed" and not topic.get("completed_at"):
-        updates["topics.$.completed_at"] = now
+    if status == "completed":
+        # Only a completed topic has a next review to schedule. Stamping one on a
+        # topic that has never been passed puts a date on the resurface ladder
+        # for something that hasn't been learned yet.
+        updates["topics.$.next_review_at"] = next_review_at(review_count)
+        if not topic.get("completed_at"):
+            updates["topics.$.completed_at"] = now
+    else:
+        # A failed first attempt owes one round of revision before the next try.
+        updates["topics.$.checkpoint_attempts"] = (
+            int(topic.get("checkpoint_attempts") or 0) + 1
+        )
+        updates["topics.$.weak_points"] = missed or []
 
     try:
         res = await get_db()["roadmaps"].update_one(
@@ -726,11 +1020,51 @@ async def apply_checkpoint(
         "passed": passed,
         "progress_status": status,
         "review_count": review_count,
-        "next_review_at": updates["topics.$.next_review_at"],
+        "next_review_at": updates.get("topics.$.next_review_at"),
         "was_review": was_completed,
         # The topic that just picked up the baton, if any.
         "advanced_to": advanced,
+        # Set when the failure opened a revision debt, so the client can send the
+        # learner to revise rather than straight back to the same questions.
+        "needs_revision": not passed and not was_completed,
+        "weak_points": [] if passed else (missed or []),
     }
+
+
+def revision_outstanding(topic: Optional[dict]) -> bool:
+    """Whether a failed checkpoint still owes this topic a round of revision.
+
+    The gate on retrying: every failed attempt has to be answered by
+    acknowledging one revision digest before the next attempt is issued. Without
+    it, "retry" is just re-rolling the same questions until they stick by
+    accident, which is the opposite of what a recall check is for.
+    """
+    t = topic or {}
+    return int(t.get("checkpoint_attempts") or 0) > int(t.get("revisions_done") or 0)
+
+
+async def record_revision(roadmapId: str, topicId: str, user_id: str) -> bool:
+    """Credit one round of revision — called when a revision digest is marked.
+
+    Never counts past what's owed: acknowledging a second revision digest for a
+    single failure must not bank credit against a failure that hasn't happened,
+    which would let the learner skip the revision after their next one.
+    """
+    topic = find_topic(await fetch_roadmap(roadmapId, user_id), topicId)
+    if not revision_outstanding(topic):
+        return False
+    try:
+        res = await get_db()["roadmaps"].update_one(
+            {"_id": ObjectId(roadmapId), "user_id": user_id, "topics.id": topicId},
+            {
+                "$inc": {"topics.$.revisions_done": 1},
+                "$set": {"updated_at": datetime.now(timezone.utc).isoformat()},
+            },
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("record_revision error id=%s topic=%s: %s", roadmapId, topicId, e)
+        return False
 
 
 async def due_reviews(user_id: str, limit: int = 20) -> list[dict]:
@@ -840,16 +1174,55 @@ async def fetch_quiz(user_id: str, quizId: Optional[str] = None) -> Optional[dic
         return None
 
 
+def attempt_misses(questions: list[dict], result: dict) -> list[dict]:
+    """What a learner got wrong, in words rather than indices.
+
+    `grade_quiz` reports misses positionally, which is all the caller needs to
+    render a result screen and useless the moment the quiz itself is out of
+    scope. Resolving them against the questions here is what makes an attempt
+    readable months later, and is the whole basis of misconception analysis.
+    """
+    misses = []
+    for r in result.get("review") or []:
+        idx = r.get("question")
+        if not isinstance(idx, int) or not 0 <= idx < len(questions):
+            continue
+        options = questions[idx].get("options") or []
+        chosen = r.get("selected")
+        misses.append(
+            {
+                "question": questions[idx].get("question", ""),
+                # None when they skipped it — a blank is different evidence from
+                # a wrong pick, and flattening the two would invent a belief the
+                # learner never expressed.
+                "chosen": (
+                    options[chosen]
+                    if isinstance(chosen, int) and 0 <= chosen < len(options)
+                    else None
+                ),
+                "correct": r.get("correctOption"),
+            }
+        )
+    return misses
+
+
 async def record_quiz_attempt(
     user_id: str,
     quizId: Optional[str],
     roadmapId: Optional[str],
     topicId: Optional[str],
     result: dict,
+    questions: Optional[list[dict]] = None,
+    kind: Optional[str] = None,
 ) -> None:
-    """Persist one graded attempt. Nothing reads it yet — it's the record that
-    makes score history and weak-topic detection possible later, for the cost of
-    one insert instead of data we never captured."""
+    """Persist one graded attempt, including what was got wrong and why it was
+    being asked.
+
+    `misses` and `kind` are what turn this from a score log into evidence: a
+    stream of "62%" says a learner is struggling, but not at what — and "wrong on
+    a digest recall check" means something different from "wrong on a
+    spaced-repetition review of a topic they completed months ago".
+    """
     try:
         await get_db()["quiz_attempts"].insert_one(
             {
@@ -857,14 +1230,269 @@ async def record_quiz_attempt(
                 "quizId": quizId,
                 "roadmapId": roadmapId,
                 "topicId": topicId,
+                # digest | checkpoint | review | chat
+                "kind": kind,
                 "total": result.get("total"),
                 "correct": result.get("correct"),
                 "score": result.get("score"),
+                "misses": attempt_misses(questions or [], result),
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
         )
     except Exception as e:
         logger.error("record_quiz_attempt error user=%s: %s", user_id, e)
+
+
+# ── misconceptions ───────────────────────────────────────────────────────────
+# What a learner keeps getting wrong, inferred from their attempt history and
+# cached per topic. Every quiz kind feeds one pool: a digest recall check, a
+# completion checkpoint and a spaced-repetition review are three vantage points
+# on the same understanding, and a mistake visible from more than one of them is
+# exactly the durable kind worth re-probing.
+MISCONCEPTIONS = "learning_misconceptions"
+
+
+async def topic_misses(
+    user_id: str,
+    roadmapId: str,
+    topicId: str,
+    limit: int = MISCONCEPTION_EVIDENCE_WINDOW,
+) -> list[dict]:
+    """Every wrong answer recorded for one topic, oldest first, tagged with the
+    kind of quiz it came from. The evidence the analysis reads."""
+    try:
+        cursor = (
+            get_db()["quiz_attempts"]
+            .find(
+                {
+                    "user_id": user_id,
+                    "roadmapId": roadmapId,
+                    "topicId": topicId,
+                    "misses": {"$nin": [None, []]},
+                }
+            )
+            .sort([("createdAt", 1), ("_id", 1)])
+        )
+        attempts = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("topic_misses error user=%s: %s", user_id, e)
+        return []
+
+    misses = [
+        {**m, "kind": a.get("kind"), "at": a.get("createdAt")}
+        for a in attempts
+        for m in a.get("misses") or []
+    ]
+    # Newest evidence wins once there's more than the analysis should chew on: a
+    # belief the learner has since corrected shouldn't keep steering questions.
+    return misses[-limit:]
+
+
+async def get_misconceptions(
+    user_id: str, roadmapId: str, topicId: str
+) -> Optional[dict]:
+    try:
+        return await get_db()[MISCONCEPTIONS].find_one(
+            {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
+            projection={"_id": 0},
+        )
+    except Exception as e:
+        logger.error("get_misconceptions error user=%s: %s", user_id, e)
+        return None
+
+
+async def save_misconceptions(
+    user_id: str,
+    roadmapId: str,
+    topicId: str,
+    patterns: list[dict],
+    misses_analyzed: int,
+) -> None:
+    """Upsert the analysis, stamped with how much evidence it was drawn from.
+
+    `misses_analyzed` is the watermark that keeps the analysis from re-running on
+    unchanged history — the whole point of caching an LLM call.
+    """
+    try:
+        await get_db()[MISCONCEPTIONS].update_one(
+            {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
+            {
+                "$set": {
+                    "patterns": patterns,
+                    "misses_analyzed": misses_analyzed,
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+            upsert=True,
+        )
+    except Exception as e:
+        logger.error("save_misconceptions error user=%s: %s", user_id, e)
+
+
+async def list_misconceptions(
+    user_id: str, roadmapId: Optional[str] = None
+) -> list[dict]:
+    """Everything inferred about a learner, for the insight screen. Titles are
+    resolved here so the client doesn't need a roadmap in hand to read it."""
+    query: dict = {"user_id": user_id}
+    if roadmapId:
+        query["roadmapId"] = roadmapId
+    try:
+        cursor = get_db()[MISCONCEPTIONS].find(query, projection={"_id": 0})
+        docs = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("list_misconceptions error user=%s: %s", user_id, e)
+        return []
+
+    labels = await _label_map(user_id)
+    out = []
+    for d in docs:
+        if not d.get("patterns"):
+            continue
+        meta = labels.get(d.get("roadmapId")) or {}
+        d["roadmapTitle"] = meta.get("title")
+        d["topicTitle"] = (meta.get("topics") or {}).get(d.get("topicId"))
+        out.append(d)
+    return out
+
+
+# ── checkpoint attempt policy ────────────────────────────────────────────────
+def redact_review(result: dict, reveal: bool, questions: list[dict]) -> dict:
+    """The graded result as the learner may see it.
+
+    Answers are revealed only on a pass. On a failure the learner gets the hint
+    and the outcome each missed question was testing — enough to know what to go
+    back over, not enough to fill in the right box next time. Handing back
+    `correctOption` on a failure turns the retry into transcription, which is
+    exactly what a completion gate must not permit.
+
+    Grading is unchanged; this only filters what leaves the server.
+    """
+    if reveal:
+        return result
+
+    redacted = []
+    for r in result.get("review") or []:
+        idx = r.get("question")
+        q = questions[idx] if isinstance(idx, int) and 0 <= idx < len(questions) else {}
+        redacted.append(
+            {
+                "question": idx,
+                "selected": r.get("selected"),
+                # Deliberately absent rather than nulled: a client that renders
+                # `correctOption ?? '—'` shows a dash either way, and a null here
+                # would read as "we don't know" instead of "not yet".
+                "outcome": q.get("outcome"),
+                "hint": q.get("hint"),
+            }
+        )
+    return {**result, "review": redacted, "answers_revealed": False}
+
+
+async def asked_questions(
+    user_id: str, roadmapId: str, topicId: str, limit: int = 30
+) -> list[str]:
+    """Every checkpoint question this learner has already been asked on a topic,
+    newest first.
+
+    Regenerating a review is not the same as varying it. The generator sees the
+    same description and the same outcomes every time, so left to itself it
+    converges on the same handful of obvious questions — and across a 1/3/7/16/35
+    day ladder that rewards remembering the answer rather than the material.
+    Feeding the previous questions back is what makes each review a new angle.
+    """
+    try:
+        cursor = (
+            get_db()["quizzes"]
+            .find(
+                {
+                    "user_id": user_id,
+                    "roadmapId": roadmapId,
+                    "topicId": topicId,
+                    "kind": {"$in": ["checkpoint", "review"]},
+                },
+                projection={"questions.question": 1},
+            )
+            .sort([("_id", -1)])
+            .limit(10)
+        )
+        quizzes = await cursor.to_list(None)
+    except Exception as e:
+        logger.error("asked_questions error user=%s: %s", user_id, e)
+        return []
+
+    seen: list[str] = []
+    for q in quizzes:
+        for item in q.get("questions") or []:
+            text = (item.get("question") or "").strip()
+            if text and text not in seen:
+                seen.append(text)
+    return seen[:limit]
+
+
+async def recent_attempts(
+    user_id: str, roadmapId: str, topicId: str, kinds: tuple[str, ...] = ()
+) -> list[dict]:
+    """A topic's graded attempts, newest first."""
+    query: dict = {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId}
+    if kinds:
+        query["kind"] = {"$in": list(kinds)}
+    try:
+        cursor = (
+            get_db()["quiz_attempts"]
+            .find(query, projection={"createdAt": 1, "score": 1, "kind": 1, "quizId": 1})
+            .sort([("createdAt", -1), ("_id", -1)])
+            .limit(50)
+        )
+        return await cursor.to_list(None)
+    except Exception as e:
+        logger.error("recent_attempts error user=%s: %s", user_id, e)
+        # Fail closed: an unreadable history must not read as "no attempts yet"
+        # and hand out an unlimited retry.
+        return [{"createdAt": datetime.now(timezone.utc).isoformat(), "score": 0}] * (
+            CHECKPOINT_MAX_ATTEMPTS_PER_DAY
+        )
+
+
+def retry_block(attempts: list[dict], now: Optional[datetime] = None) -> Optional[dict]:
+    """Why a new attempt can't be issued yet, or None if it can.
+
+    Two independent limits. The cooldown is about the seconds after a failure,
+    when the instinct is to bounce straight back in; the daily cap is about the
+    afternoon spent grinding one topic until a regenerated set happens to land on
+    what they know. Neither applies to a learner's first go.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    def when(a: dict) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(a["createdAt"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    stamps = [t for t in (when(a) for a in attempts) if t]
+    if not stamps:
+        return None
+
+    day_ago = now - timedelta(days=1)
+    today = [t for t in stamps if t >= day_ago]
+    if len(today) >= CHECKPOINT_MAX_ATTEMPTS_PER_DAY:
+        return {
+            "reason": "daily_limit",
+            "retry_at": (min(today) + timedelta(days=1)).isoformat(),
+            "attempts_today": len(today),
+            "limit": CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
+        }
+
+    ready = max(stamps) + timedelta(minutes=CHECKPOINT_RETRY_COOLDOWN_MINUTES)
+    if ready > now:
+        return {
+            "reason": "cooldown",
+            "retry_at": ready.isoformat(),
+            "attempts_today": len(today),
+            "limit": CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
+        }
+    return None
 
 
 # ── digests ──────────────────────────────────────────────────────────────────
@@ -1172,10 +1800,21 @@ async def learning_focus(user_id: str) -> dict:
         awaiting = next(
             (t for t in topics if t.get("progress_status") == "needs_review"), None
         )
+        # A topic owed revision is also `needs_review`, but pointing the learner
+        # at a checkpoint they'd be refused is worse than saying nothing.
+        owed = next((t for t in topics if revision_outstanding(t)), None)
 
         unread = 0
         reason = None
-        if topic:
+        if owed:
+            # A failed checkpoint takes precedence over everything else on this
+            # roadmap: it's the only thing the learner can act on here.
+            states = await topic_digest_states(
+                user_id, str(roadmap["_id"]), owed.get("id")
+            )
+            unread = sum(1 for d in states if d.get("status") != "marked")
+            reason = "needs_revision"
+        elif topic:
             # One projection answers both questions the generator asks, so the
             # button on screen agrees with what pressing it would actually do.
             states = await topic_digest_states(
@@ -1195,7 +1834,7 @@ async def learning_focus(user_id: str) -> dict:
         else:
             reason = "roadmap_complete"
 
-        current = topic or awaiting
+        current = owed or topic or awaiting
         items.append(
             {
                 "roadmapId": str(roadmap["_id"]),
@@ -1212,10 +1851,15 @@ async def learning_focus(user_id: str) -> dict:
                 ),
                 "progress": roadmap_progress(roadmap),
                 "unread": unread,
-                # Generation is only meaningful for a topic still being taught,
-                # and only when nothing the generator checks would refuse it.
-                "can_generate": bool(topic)
-                and reason not in ("cap_reached", "awaiting_quiz"),
+                # Generation is meaningful for a topic still being taught, and
+                # for one owed revision — where what it produces is the revision
+                # digest. Only when nothing the generator checks would refuse it.
+                "can_generate": (
+                    bool(owed) and unread == 0
+                    if owed
+                    else bool(topic)
+                    and reason not in ("cap_reached", "awaiting_quiz")
+                ),
                 "blocked_reason": reason,
             }
         )

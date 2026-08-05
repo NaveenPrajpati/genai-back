@@ -297,7 +297,13 @@ async def quiz_grader_agent(state: LearningState):
     )
 
     await record_quiz_attempt(
-        user_id, str(quiz["_id"]), quiz.get("roadmapId"), quiz.get("topicId"), result
+        user_id,
+        str(quiz["_id"]),
+        quiz.get("roadmapId"),
+        quiz.get("topicId"),
+        result,
+        questions=questions,
+        kind=quiz.get("kind") or "chat",
     )
     return {"quiz_result": result, "quizId": str(quiz["_id"])}
 

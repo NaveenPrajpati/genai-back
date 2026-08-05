@@ -96,6 +96,24 @@ RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 80)
 CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 4)
 
+# --- Checkpoint retries ---
+# A completion gate is only a gate if failing costs something. Two limits, doing
+# different jobs: the cooldown stops reflexive re-submission in the seconds after
+# a fail, and the daily cap stops a learner grinding the same topic until a
+# regenerated question set happens to land somewhere they know.
+CHECKPOINT_RETRY_COOLDOWN_MINUTES = _int_env("CHECKPOINT_RETRY_COOLDOWN_MINUTES", 15)
+CHECKPOINT_MAX_ATTEMPTS_PER_DAY = _int_env("CHECKPOINT_MAX_ATTEMPTS_PER_DAY", 3)
+
+# --- Misconception analysis ---
+# Wrong answers pooled across digest checks, checkpoints and reviews, then read
+# by an LLM for the belief underneath them. Below this much evidence there's
+# nothing to generalise from and the model invents a pattern from one bad day.
+MISCONCEPTION_MIN_EVIDENCE = _int_env("MISCONCEPTION_MIN_EVIDENCE", 3)
+# Analysis window and output size. A learner who has moved on shouldn't keep
+# being probed on a belief they corrected ten attempts ago.
+MISCONCEPTION_EVIDENCE_WINDOW = _int_env("MISCONCEPTION_EVIDENCE_WINDOW", 40)
+MISCONCEPTION_MAX_PATTERNS = _int_env("MISCONCEPTION_MAX_PATTERNS", 4)
+
 # --- Learning roadmaps ---
 # How many roadmaps a learner may have `active` at once. Active is what the
 # daily sweep digests and what a bare "what should I study next?" resolves to, so

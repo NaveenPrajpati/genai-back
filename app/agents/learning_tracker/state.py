@@ -125,6 +125,18 @@ class TopicNode(BaseModel):
     review_count: int = 0
     next_review_at: Optional[str] = None
 
+    # Recovery from a failed checkpoint. A failure owes the learner one round of
+    # revision before the next attempt, and these two counters are that debt:
+    # while `checkpoint_attempts` exceeds `revisions_done`, a revision digest is
+    # owed and a retry is refused. Counters rather than a flag, so a second
+    # failure asks for a second round instead of being absorbed by the first.
+    checkpoint_attempts: int = 0
+    revisions_done: int = 0
+    # The questions missed on the most recent failed attempt, verbatim. What the
+    # revision digest is written against — "re-teach this topic" would just
+    # restate what the learner has already been sent and failed on.
+    weak_points: list[str] = Field(default_factory=list)
+
 
 class RoadmapOutput(BaseModel):
     """One roadmap as stored. Mongo's `_id` is the identifier — there is no
@@ -153,6 +165,20 @@ class Question(BaseModel):
     question: str
     options: list[str]
     answer: int
+    # What this question tests, and a nudge toward it. These are what a learner
+    # sees when they get it wrong — the answer itself is never sent back on a
+    # failure, or a retry is just transcription. Written at generation time so
+    # feedback costs no extra call at grading time.
+    outcome: Optional[str] = Field(
+        default=None, description="The learning outcome or sub-skill this checks"
+    )
+    hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "One sentence pointing at what to re-read. Must NOT state or paraphrase "
+            "the correct option, name it by position, or eliminate the wrong ones."
+        ),
+    )
 
 
 class QuizOutput(BaseModel):
@@ -173,6 +199,29 @@ class CoverageOutput(BaseModel):
     missing: list[str] = Field(default_factory=list)
 
 
+class Misconception(BaseModel):
+    """One recurring mistake, inferred from a learner's wrong answers.
+
+    Not a list of missed questions — those are the evidence. This is the belief
+    underneath them, which is what a future question has to be aimed at.
+    """
+
+    label: str = Field(description="Short name for the misunderstanding, under 8 words")
+    detail: str = Field(
+        description="What the learner appears to believe, and what is actually true"
+    )
+    probe: str = Field(
+        description="How a future question could re-test this specific belief"
+    )
+    # Which of the supplied misses support it, 0-based. Keeps the pattern
+    # falsifiable: a claim with no evidence behind it is the model editorialising.
+    evidence: list[int] = Field(default_factory=list)
+
+
+class MisconceptionOutput(BaseModel):
+    patterns: list[Misconception] = Field(default_factory=list)
+
+
 class CheckpointOutcome(BaseModel):
     """What a graded checkpoint did to the topic. Returned to the client so the
     UI can explain the result rather than silently ticking (or not ticking) a box."""
@@ -189,6 +238,16 @@ class CheckpointOutcome(BaseModel):
     # True when this checkpoint was a scheduled review of an already-completed
     # topic, rather than the first attempt that completes it.
     was_review: bool = False
+    # The topic that picked up the slot after this one completed. Declared here
+    # or it is silently dropped on the way out — pydantic ignores kwargs with no
+    # matching field, so `apply_checkpoint` returning it was never enough.
+    advanced_to: Optional[dict] = None
+    # A failed first attempt owes a round of revision before the retry.
+    needs_revision: bool = False
+    # False when the answers were withheld because the attempt didn't pass, so
+    # the client can label the feedback rather than render blanks where the
+    # answers used to be.
+    answers_revealed: bool = True
 
 
 class SubmittedAnswer(BaseModel):

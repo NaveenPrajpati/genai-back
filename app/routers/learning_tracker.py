@@ -3,7 +3,7 @@
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal, Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,24 +17,28 @@ from app.database import get_db
 from app.agents.approval_store import get_pending
 from app.agents.memory_store import MEMORIES, get_profile, save_profile
 from app.core.config import CHECKPOINT_PASS_SCORE, DIGEST_QUIZ_PASS_SCORE
-from app.agents.learning_tracker.service import build_checkpoint
-from app.agents.learning_tracker.triggers import build_digest
+from app.agents.learning_tracker.service import build_checkpoint, refresh_misconceptions
+from app.agents.learning_tracker.triggers import build_digest, build_revision_digest
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
     ActiveRoadmapLimit,
     apply_checkpoint,
+    asked_questions,
     completion_forecast,
     create_note,
     delete_note,
+    delete_roadmap,
     digest_quiz_gate,
     due_reviews,
     fetch_digest,
     fetch_quiz,
     fetch_roadmap,
     find_topic,
+    get_misconceptions,
     grade_quiz,
     in_progress_topic,
     learning_focus,
+    list_misconceptions,
     learning_stats,
     list_digests,
     list_notes,
@@ -43,7 +47,12 @@ from app.agents.learning_tracker.repository import (
     note_counts,
     profile_drift,
     profile_snapshot,
+    recent_attempts,
     record_quiz_attempt,
+    record_revision,
+    redact_review,
+    retry_block,
+    revision_outstanding,
     update_note,
     resolve_roadmap_id,
     roadmap_progress,
@@ -359,8 +368,16 @@ async def submit_quiz(
     questions = quiz.get("questions", [])
     result = grade_quiz(questions, {a.question: a.answer for a in body.answers})
     await record_quiz_attempt(
-        user_id, body.quizId, quiz.get("roadmapId"), quiz.get("topicId"), result
+        user_id,
+        body.quizId,
+        quiz.get("roadmapId"),
+        quiz.get("topicId"),
+        result,
+        questions=questions,
+        kind=quiz.get("kind") or "chat",
     )
+    # A quiz raised in chat gates nothing, so there's nothing to protect by
+    # withholding the answers — seeing them is the whole point of asking.
     return {"status": "done", "result": result}
 
 
@@ -488,6 +505,27 @@ async def updateRoadmapStatus(
     return {"status": "done", "roadmapId": roadmapId, "roadmap_status": body.status}
 
 
+@router.delete("/roadmaps/{roadmapId}")
+async def deleteRoadmap(
+    roadmapId: str, current_user: Annotated[dict, Depends(get_current_user)]
+):
+    """Delete a roadmap and everything stored against it — digests, notes,
+    quizzes, graded attempts, misconception analysis.
+
+    Irreversible, and distinct from `PATCH … {"status": "archived"}`, which keeps
+    the record and the history. Archiving is the reversible way to put a roadmap
+    down; this is for one the learner wants gone.
+
+    `result.linked_tasks` counts to-dos in the personal assistant that came from
+    this roadmap. They are deliberately left alone — the learner may have
+    rescheduled or annotated them — so the client can mention they're still there.
+    """
+    removed = await delete_roadmap(roadmapId, current_user["uid"])
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Roadmap not found.")
+    return {"status": "done", "roadmapId": roadmapId, "result": removed}
+
+
 @router.get("/memory")
 async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
     """Let the UI show the learner what the system remembers about them. Reads the
@@ -593,7 +631,12 @@ async def acknowledge_digest(
     quiz_id = digest.get("quizId")
     if quiz_id and digest.get("status") != "marked":
         quiz = await fetch_quiz(user_id, quiz_id)
-        if quiz:
+        # A check with no questions scores 0 against a pass mark of 100, so
+        # gating on it would make the digest permanently unmarkable — and an
+        # unmarkable digest holds a slot under DIGEST_MAX_UNREAD forever, which
+        # stops the topic getting any further digests at all. Nothing to answer
+        # means nothing to gate on.
+        if quiz and quiz.get("questions"):
             graded = grade_quiz(
                 quiz.get("questions", []), {a.question: a.answer for a in body.answers}
             )
@@ -609,14 +652,29 @@ async def acknowledge_digest(
                 )
             quiz_result = graded
             await record_quiz_attempt(
-                user_id, quiz_id, digest.get("roadmapId"), digest.get("topicId"), graded
+                user_id,
+                quiz_id,
+                digest.get("roadmapId"),
+                digest.get("topicId"),
+                graded,
+                questions=quiz.get("questions", []),
+                kind="digest",
             )
 
     if not await mark_digest(digestId, user_id):
         raise HTTPException(status_code=404, detail="Digest not found.")
 
+    # Acknowledging the revision digest is what settles the debt a failed
+    # checkpoint opened, and so what re-opens the retry.
+    revision_cleared = False
+    if digest.get("kind") == "revision":
+        revision_cleared = await record_revision(
+            digest.get("roadmapId"), digest.get("topicId"), user_id
+        )
+
     generated = None
-    if body.generate_next:
+    if body.generate_next and not revision_cleared:
+        # Not after revision: what comes next there is the retry, not a digest.
         roadmap = await fetch_roadmap(digest.get("roadmapId"), user_id)
         if roadmap:
             try:
@@ -637,6 +695,8 @@ async def acknowledge_digest(
             # Once the tips have covered the topic, the checkpoint is what comes
             # next — not another digest.
             "coverage_complete": bool(digest.get("coverage_complete")),
+            # The retry is now unblocked: send them to the checkpoint.
+            "revision_cleared": revision_cleared,
             "topicId": digest.get("topicId"),
             "roadmapId": digest.get("roadmapId"),
         },
@@ -673,6 +733,27 @@ async def generate_digest(
     roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
     if not roadmap:
         raise HTTPException(status_code=404, detail="No active roadmap to digest.")
+
+    # A topic owed revision after a failed checkpoint gets that instead. It's no
+    # longer `in_progress`, so the teaching path below would find nothing to send
+    # and report "nothing new" to a learner who is in fact blocked.
+    owed = next(
+        (t for t in roadmap.get("topics") or [] if revision_outstanding(t)), None
+    )
+    if owed and topicId in (None, owed["id"]):
+        revision = await build_revision_digest(
+            user_id, roadmap, owed["id"], notify=False
+        )
+        if revision:
+            return {"status": "done", "result": revision}
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Your revision tips are already waiting — go over those first.",
+                "blocked_reason": "needs_revision",
+                "topicId": owed["id"],
+            },
+        )
 
     # Checked here as well as inside `build_digest` only to say which check is
     # outstanding. `build_digest` returns a bare None, and "nothing new to send"
@@ -806,10 +887,10 @@ async def start_checkpoint(
 ):
     """Issue the active-recall checkpoint for a topic.
 
-    Reuses the outstanding question set on a retry so a learner who failed sees
-    the same material again rather than a fresh roll of the dice; a scheduled
-    review always gets new questions, since recognising an old question isn't
-    recall. Answers are stripped — grading happens server-side.
+    Every attempt gets a fresh question set, generated against what this learner
+    has already been asked and what their past mistakes point to. Only an
+    issued-but-ungraded quiz is handed back, which is a learner resuming mid-
+    attempt rather than retrying. Answers are stripped — grading is server-side.
     """
     user_id = current_user["uid"]
     roadmap = await fetch_roadmap(body.roadmapId, user_id)
@@ -817,20 +898,78 @@ async def start_checkpoint(
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found.")
 
+    # A failed attempt owes one round of revision before the next one. Without
+    # this, "retry" is re-rolling the same questions until they land by accident
+    # — and since a retry deliberately reuses the same question set, that's a
+    # short walk.
+    if revision_outstanding(topic):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "Go over the revision tips for this topic first — "
+                    "they're written from the questions you missed."
+                ),
+                "blocked_reason": "needs_revision",
+                "topicId": topicId,
+                "weak_points": topic.get("weak_points") or [],
+            },
+        )
+
     is_review = topic.get("progress_status") == "completed"
+
+    # Retry limits. Checked before anything is generated: refusing after paying
+    # for an LLM call would burn the call and still refuse.
+    attempts = await recent_attempts(
+        user_id, body.roadmapId, topicId, kinds=("checkpoint", "review")
+    )
+    blocked = retry_block(attempts)
+    if blocked:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": (
+                    "That's today's attempts on this topic — come back tomorrow "
+                    "with fresh eyes."
+                    if blocked["reason"] == "daily_limit"
+                    else "Take a few minutes with the material before trying again."
+                ),
+                "blocked_reason": blocked["reason"],
+                **blocked,
+            },
+        )
+
+    # An issued-but-unsubmitted quiz is resumed — that's the learner reopening
+    # the app mid-attempt, not a retry. Once it has been graded it is never
+    # handed out again: re-issuing a set they've already seen tests whether they
+    # remember being caught on it, and combined with any answer disclosure it
+    # would make a retry pure transcription.
     existing = None
     if not body.regenerate and not is_review:
-        existing = await get_db()["quizzes"].find_one(
+        candidate = await get_db()["quizzes"].find_one(
             {"user_id": user_id, "roadmapId": body.roadmapId, "topicId": topicId},
             sort=[("_id", -1)],
         )
+        if candidate and not any(
+            a.get("quizId") == str(candidate["_id"]) for a in attempts
+        ):
+            existing = candidate
 
     if existing:
         quizId, questions = str(existing["_id"]), existing.get("questions", [])
     else:
         memory = await get_profile(user_id, LEARNING_NS)
+        # Both cached reads — the misconception analysis runs in the background
+        # after each graded attempt, so issuing a checkpoint stays one LLM call.
+        analysis = await get_misconceptions(user_id, body.roadmapId, topicId)
+        already_asked = await asked_questions(user_id, body.roadmapId, topicId)
         generated = await build_checkpoint(
-            topic, (roadmap or {}).get("title", ""), memory, is_review
+            topic,
+            (roadmap or {}).get("title", ""),
+            memory,
+            is_review,
+            misconceptions=(analysis or {}).get("patterns"),
+            asked=already_asked,
         )
         questions = [q.model_dump() for q in generated.quiz]
         res = await get_db()["quizzes"].insert_one(
@@ -845,6 +984,7 @@ async def start_checkpoint(
         )
         quizId = str(res.inserted_id)
 
+    today = [a for a in attempts if _within_a_day(a.get("createdAt"))]
     return {
         "status": "done",
         "result": {
@@ -853,12 +993,25 @@ async def start_checkpoint(
             "title": topic.get("title"),
             "is_review": is_review,
             "pass_score": CHECKPOINT_PASS_SCORE,
+            # So the learner knows what a failure costs before they answer,
+            # rather than discovering the limit by hitting it.
+            "attempts_today": len(today),
+            "attempt_limit": CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
             "questions": [
                 {"question": q.get("question"), "options": q.get("options")}
                 for q in questions
             ],
         },
     }
+
+
+def _within_a_day(stamp: Optional[str]) -> bool:
+    try:
+        return datetime.fromisoformat(stamp) >= datetime.now(timezone.utc) - timedelta(
+            days=1
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class CheckpointSubmission(BaseModel):
@@ -869,35 +1022,92 @@ class CheckpointSubmission(BaseModel):
 @router.post("/checkpoint/submit")
 async def submit_checkpoint(
     body: CheckpointSubmission,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Grade a checkpoint and let the result drive the topic's state: passing is
-    what completes it, and either way the next review gets scheduled."""
+    what completes it, and either way the next review gets scheduled.
+
+    A failure comes back with the hint and the outcome behind each missed
+    question, never the answer. The learner has to know what to go back over;
+    they must not be able to write the right box down and re-enter it.
+    """
     user_id = current_user["uid"]
     quiz = await fetch_quiz(user_id, body.quizId)
     # A quiz raised in chat without a roadmap has nothing to attach a result to.
     if not quiz or not quiz.get("topicId") or not quiz.get("roadmapId"):
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
 
-    graded = grade_quiz(
-        quiz.get("questions", []), {a.question: a.answer for a in body.answers}
-    )
+    questions = quiz.get("questions", [])
+    graded = grade_quiz(questions, {a.question: a.answer for a in body.answers})
     await record_quiz_attempt(
-        user_id, body.quizId, quiz.get("roadmapId"), quiz.get("topicId"), graded
+        user_id,
+        body.quizId,
+        quiz.get("roadmapId"),
+        quiz.get("topicId"),
+        graded,
+        questions=questions,
+        kind=quiz.get("kind") or "checkpoint",
     )
 
+    # The text of what they got wrong, not just the indices `graded["review"]`
+    # carries — the revision digest is written against these, and question
+    # numbers from a quiz it never sees would tell it nothing.
+    missed = [
+        questions[r["question"]].get("question", "")
+        for r in graded["review"]
+        if 0 <= r["question"] < len(questions)
+    ]
+
     outcome = await apply_checkpoint(
-        quiz["roadmapId"], quiz["topicId"], user_id, graded["score"]
+        quiz["roadmapId"], quiz["topicId"], user_id, graded["score"], missed=missed
     )
     if outcome is None:
         raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
 
+    # Re-read the history off the request path: the analysis is an LLM call, and
+    # nothing on this response depends on it. It lands before the next checkpoint
+    # is issued, which is the only thing that reads it.
+    roadmap = await fetch_roadmap(quiz["roadmapId"], user_id)
+    topic = find_topic(roadmap, quiz["topicId"])
+    background_tasks.add_task(
+        refresh_misconceptions,
+        user_id,
+        quiz["roadmapId"],
+        quiz["topicId"],
+        (topic or {}).get("title", ""),
+    )
+
     return {
         "status": "done",
         "result": CheckpointOutcome(
-            **graded, **outcome, pass_score=CHECKPOINT_PASS_SCORE
+            **redact_review(graded, outcome["passed"], questions),
+            **outcome,
+            pass_score=CHECKPOINT_PASS_SCORE,
         ).model_dump(),
     }
+
+
+@router.get("/misconceptions")
+async def get_misconception_report(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    roadmapId: Optional[str] = None,
+):
+    """What the learner keeps getting wrong, and why it looks that way.
+
+    Derived from their wrong answers across digest checks, checkpoints and
+    reviews. Read-only and cached — the analysis runs in the background after
+    each graded attempt, never on this request.
+
+    `probe` is omitted: it's the instruction for writing a question that catches
+    this misunderstanding, and a learner who reads it knows what's coming.
+    """
+    report = await list_misconceptions(current_user["uid"], roadmapId)
+    for entry in report:
+        entry["patterns"] = [
+            {k: v for k, v in p.items() if k != "probe"} for p in entry["patterns"]
+        ]
+    return {"status": "done", "result": report}
 
 
 @router.get("/reviews")

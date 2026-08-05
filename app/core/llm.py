@@ -14,6 +14,7 @@ from app.core.config import LLM_MODEL, FAST_LLM_MODEL
 from app.core.llm_capture import build_capture_callbacks
 from app.core.metrics import build_metrics_callbacks
 from langchain.chat_models import init_chat_model
+from typing import Any, Literal
 
 # temperature=0 → deterministic, grounded answers (you almost always want this
 # for RAG; creativity here just means more hallucination).
@@ -51,6 +52,22 @@ fast_llm = ChatOpenAI(
 #     temperature=0,
 #     # other params...
 # )
+
+
+def get_llm(
+    model_provider: Literal["openai"] = "openai",
+    model: Literal["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-3.5"] = "gpt-4o-mini",
+    temperature: float = 0.0,
+):
+
+    return init_chat_model(
+        model,
+        model_provider=model_provider,
+        temperature=temperature,
+        callbacks=_callbacks or None,
+        stream_usage=True,
+    )
+
 
 # Prompts now live in core/prompts.py (versioned registry). The RAG answer prompt
 # is prompts.RAG_ANSWER — it carries the citation + refusal-sentinel rules that
