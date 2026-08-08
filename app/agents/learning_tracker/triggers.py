@@ -73,12 +73,11 @@ async def build_digest(
     Returns None when there's nothing to send:
       * no topic is `in_progress` — nothing has been picked up yet;
       * DIGEST_MAX_UNREAD digests for it are already waiting;
-      * the previous recall check hasn't been passed (see `digest_quiz_gate`).
+      * the previous recall check hasn't been passed (see `digest_quiz_gate`);
+      * the tips already sent cover the topic — the checkpoint comes next.
 
     Every other digest — #2, #4, #6 — carries a short recall check over the ones
-    since the last check, and every digest re-asks whether the topic has now been
-    covered end to end, at which point the drip-feed stops and the checkpoint
-    takes over.
+    since the last check.
     """
     topic = in_progress_topic(roadmap)
     if not topic:
@@ -113,8 +112,41 @@ async def build_digest(
         return None
 
     prior_bullets = [b for d in prior for b in d.get("bullets") or []]
-
     topic_title = topic.get("title", "")
+
+    # Coverage is decided BEFORE anything is generated, not after. Asking
+    # afterwards means the answer arrives once a search and a tips call have
+    # already been spent on a digest the topic didn't need — and the learner
+    # receives it, so the drip-feed always overshoots by one.
+    #
+    # The last digest carries the verdict already, and it was computed over
+    # exactly these bullets — `prior(1..N-1) + new(N)` is `prior(1..N)` — so it is
+    # reused rather than re-derived, either way it fell. That keeps the steady
+    # state at one coverage call per digest while still deciding before the spend,
+    # and it catches a topic left `in_progress` after coverage completed, which is
+    # the one way a covered topic keeps receiving digests. Only a digest written
+    # before the field existed needs the check run here.
+    if prior_bullets:
+        stored = prior[-1].get("coverage_complete")
+        if stored is None:
+            try:
+                stored = (await check_coverage(topic, prior_bullets)).covered
+            except Exception as e:
+                # Unknown coverage must not stop the drip-feed: a topic that goes
+                # quiet because a check failed is worse than one extra digest.
+                logger.error(
+                    "pre-generation coverage check failed topic=%s: %s", topic_id, e
+                )
+                stored = False
+        if stored:
+            await set_topic_progress(roadmap_id, topic_id, "needs_review", user_id)
+            logger.info(
+                "digest #%s not generated, topic=%s already covered — checkpoint next",
+                sequence,
+                topic_id,
+            )
+            return None
+
     results = []
     try:
         # Search the SUBJECT, not the marketplace around it. Asking for "best
@@ -185,6 +217,11 @@ async def build_digest(
             # recall check, so a generation failure degrades to no quiz.
             logger.error("digest quiz generation failed topic=%s: %s", topic_id, e)
 
+    # Re-asked now that this digest's bullets exist. This is what the gate above
+    # reads on the next call, and it's stored on the digest so the client can
+    # offer the checkpoint on the one that completed the topic rather than a call
+    # later. The topic still moves now — this digest is worth reading, but no
+    # further one is worth generating.
     coverage = CoverageOutput(covered=False, missing=[])
     try:
         coverage = await check_coverage(topic, prior_bullets + list(tips.bullets))

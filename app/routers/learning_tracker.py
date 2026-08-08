@@ -16,7 +16,11 @@ from app.dependencies import get_current_user
 from app.database import get_db
 from app.agents.approval_store import get_pending
 from app.agents.memory_store import MEMORIES, get_profile, save_profile
-from app.core.config import CHECKPOINT_PASS_SCORE, DIGEST_QUIZ_PASS_SCORE
+from app.core.config import (
+    CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
+    CHECKPOINT_PASS_SCORE,
+    DIGEST_QUIZ_PASS_SCORE,
+)
 from app.agents.learning_tracker.service import build_checkpoint, refresh_misconceptions
 from app.agents.learning_tracker.triggers import build_digest, build_revision_digest
 from app.agents.learning_tracker.repository import (
@@ -678,10 +682,24 @@ async def acknowledge_digest(
         roadmap = await fetch_roadmap(digest.get("roadmapId"), user_id)
         if roadmap:
             try:
+                # Declines on its own if the tips already cover the topic — the
+                # coverage check runs before any generation, so asking for the
+                # next digest on a finished topic costs nothing and returns None.
                 generated = await build_digest(user_id, roadmap, None, notify=False)
             except Exception as e:
                 # Marking already succeeded; a generation failure must not undo it.
                 logger.error("digest generate-after-mark failed: %s", e)
+
+    # Re-read after generating: `build_digest` moves the topic to `needs_review`
+    # the moment coverage settles, and that transition is the answer to "why is
+    # there no next digest?". Taking it off the digest that was just marked would
+    # report the state from before this request.
+    topic_status = None
+    if digest.get("roadmapId"):
+        fresh = await fetch_roadmap(digest.get("roadmapId"), user_id)
+        topic_status = (find_topic(fresh, digest.get("topicId")) or {}).get(
+            "progress_status"
+        )
 
     remaining = await list_digests(user_id, status="unread", active_only=True, limit=50)
     return {
@@ -695,6 +713,10 @@ async def acknowledge_digest(
             # Once the tips have covered the topic, the checkpoint is what comes
             # next — not another digest.
             "coverage_complete": bool(digest.get("coverage_complete")),
+            # Where the topic stands now. `needs_review` with no `generated` is
+            # the drip-feed having ended, not a failure to produce one — it's what
+            # lets the client offer the checkpoint instead of "nothing new to send".
+            "topic_status": topic_status,
             # The retry is now unblocked: send them to the checkpoint.
             "revision_cleared": revision_cleared,
             "topicId": digest.get("topicId"),

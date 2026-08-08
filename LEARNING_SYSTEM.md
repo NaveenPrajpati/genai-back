@@ -147,9 +147,11 @@ run_triggers (hourly)
   └─ for each user whose local schedule_hour matches now
        └─ for each ACTIVE roadmap
             └─ build_digest(current in_progress topic)
-                 ├─ nothing in progress?           → skip
-                 ├─ DIGEST_MAX_UNREAD already?     → skip   ┐ both before spending
-                 ├─ last recall check unpassed?    → skip   ┘ a search + an LLM call
+                 ├─ nothing in progress?           → skip   ┐
+                 ├─ DIGEST_MAX_UNREAD already?     → skip   │ all before spending
+                 ├─ last recall check unpassed?    → skip   │ a search + an LLM call
+                 ├─ tips already cover the topic?  → skip,  ┘
+                 │     topic → needs_review, checkpoint next
                  ├─ web search + LLM               → bullets, steered away from
                  │                                    what earlier digests covered
                  ├─ even-numbered digest           → recall check over the digests
@@ -159,12 +161,24 @@ run_triggers (hourly)
                  └─ store + push notification
 ```
 
-Three guards keep the inbox honest:
+**Coverage decides before generation, not after.** Asking afterwards means the answer
+arrives once a search and a tips call have already been spent on a digest the topic
+didn't need — and the learner receives it, so the drip-feed always overshoots by one.
+The gate reads the previous digest's stored verdict rather than re-deriving it: that
+verdict was computed over `prior(1..N-1) + new(N)`, which is exactly the `prior(1..N)` the
+gate is asking about, so the steady state stays at one coverage call per digest. Only a
+digest written before the field existed needs the check run at the gate.
+
+It doubles as the recovery path for a topic left `in_progress` after coverage completed —
+the one way a covered topic keeps receiving digests.
+
+Four guards keep the inbox honest:
 
 - **`DIGEST_MAX_UNREAD`** (default 3) — a stack of unread nudges is just noise, and each
   one costs a web search and an LLM call. The backlog read fails *closed*: if it can't
   tell how many are waiting, it doesn't add another.
 - **The recall gate** — see below.
+- **Coverage** — see above.
 - **Only `in_progress` topics** — drip-feeding tips about something nobody has opened is
   how an inbox fills with things nobody asked for.
 
