@@ -113,6 +113,17 @@ MISCONCEPTION_MIN_EVIDENCE = _int_env("MISCONCEPTION_MIN_EVIDENCE", 3)
 # being probed on a belief they corrected ten attempts ago.
 MISCONCEPTION_EVIDENCE_WINDOW = _int_env("MISCONCEPTION_EVIDENCE_WINDOW", 40)
 MISCONCEPTION_MAX_PATTERNS = _int_env("MISCONCEPTION_MAX_PATTERNS", 4)
+# How long a misconception goes quiet after something has addressed it. Two
+# clocks, one per surface: a digest that teaches against a confusion and a
+# checkpoint that then probes it are a good pairing, so teaching must not
+# suppress the test.
+#
+# Without a decay, every checkpoint chases the same belief forever and every
+# digest re-teaches the same correction. With one, a freshly seen confusion is
+# addressed at once, goes quiet, and comes back later — which is the only way to
+# tell a correction that stuck from one that was papered over for a session.
+MISCONCEPTION_REPROBE_DAYS = _int_env("MISCONCEPTION_REPROBE_DAYS", 7)
+MISCONCEPTION_RETEACH_DAYS = _int_env("MISCONCEPTION_RETEACH_DAYS", 5)
 
 # --- Learning roadmaps ---
 # How many roadmaps a learner may have `active` at once. Active is what the
@@ -140,6 +151,11 @@ DIGEST_QUIZ_EVERY = _int_env("DIGEST_QUIZ_EVERY", 2)
 # there is enough material that "say it in your own words" is worth the keystroke,
 # and a sentence shows how someone is thinking in a way four options cannot.
 DIGEST_ONELINER_FROM = _int_env("DIGEST_ONELINER_FROM", 4)
+# Failed attempts at one digest's recall check before the agent concludes the
+# teaching is at fault rather than the reader, and re-explains the material a
+# different way. Two, not one: everybody misreads a question occasionally, and
+# escalating on a single slip would spend an LLM call on a typo.
+DIGEST_RETEACH_AFTER = _int_env("DIGEST_RETEACH_AFTER", 2)
 
 # --- Feynman checkpoint (explain it in your own words) ---
 # An optional free-text explanation offered alongside the closed-form checkpoint.

@@ -1396,13 +1396,38 @@ async def save_misconceptions(
 
     `misses_analyzed` is the watermark that keeps the analysis from re-running on
     unchanged history — the whole point of caching an LLM call.
+
+    Re-analysis rewrites the patterns wholesale, so the "when was this last
+    addressed" stamps are carried across by label. Losing them would reset every
+    decay clock on each new piece of evidence, and a learner who keeps making
+    mistakes would be the one whose misconceptions got hammered hardest.
     """
     try:
+        previous = await get_misconceptions(user_id, roadmapId, topicId) or {}
+        stamps = {
+            p.get("label"): p
+            for p in previous.get("patterns") or []
+            if p.get("label")
+        }
+        carried = []
+        for p in patterns:
+            was = stamps.get(p.get("label")) or {}
+            carried.append(
+                {
+                    **p,
+                    **{
+                        k: was[k]
+                        for k in ("last_probed_at", "last_taught_at")
+                        if was.get(k)
+                    },
+                }
+            )
+
         await get_db()[MISCONCEPTIONS].update_one(
             {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
             {
                 "$set": {
-                    "patterns": patterns,
+                    "patterns": carried,
                     "misses_analyzed": misses_analyzed,
                     "updatedAt": datetime.now(timezone.utc).isoformat(),
                 }
@@ -1411,6 +1436,65 @@ async def save_misconceptions(
         )
     except Exception as e:
         logger.error("save_misconceptions error user=%s: %s", user_id, e)
+
+
+def due_misconceptions(
+    patterns: Optional[list[dict]],
+    field: str,
+    quiet_days: int,
+    now: Optional[datetime] = None,
+) -> list[dict]:
+    """The patterns worth acting on right now.
+
+    A misconception nobody has addressed yet is always due. One that was
+    addressed recently is not: re-teaching the same correction in consecutive
+    digests is nagging, and re-probing the same belief in consecutive checkpoints
+    measures whether they remember last week's question rather than whether they
+    now understand.
+
+    Once the quiet period is up it becomes due again — which is the point. A
+    single right answer is not a corrected belief, and the only way to tell the
+    difference is to come back to it later.
+    """
+    now = now or datetime.now(timezone.utc)
+    due = []
+    for p in patterns or []:
+        age = _age_days(p.get(field), now)
+        if age is None or age >= quiet_days:
+            due.append(p)
+    return due
+
+
+async def mark_misconceptions_addressed(
+    user_id: str, roadmapId: str, topicId: str, labels: list[str], field: str
+) -> None:
+    """Start the quiet clock on the patterns something just aimed at.
+
+    Best-effort: the digest or checkpoint has already been generated, and losing
+    the stamp costs a little repetition, not correctness.
+    """
+    if not labels:
+        return
+    try:
+        stored = await get_misconceptions(user_id, roadmapId, topicId)
+        if not stored:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        patterns = [
+            {**p, field: now} if p.get("label") in set(labels) else p
+            for p in stored.get("patterns") or []
+        ]
+        await get_db()[MISCONCEPTIONS].update_one(
+            {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
+            {"$set": {"patterns": patterns}},
+        )
+    except Exception as e:
+        logger.error(
+            "mark_misconceptions_addressed error user=%s topic=%s: %s",
+            user_id,
+            topicId,
+            e,
+        )
 
 
 async def list_misconceptions(
@@ -1471,6 +1555,60 @@ def redact_review(result: dict, reveal: bool, questions: list[dict]) -> dict:
             }
         )
     return {**result, "review": redacted, "answers_revealed": False}
+
+
+async def failed_attempts(
+    user_id: str, roadmapId: str, topicId: Optional[str], quizId: str, pass_score: int
+) -> int:
+    """How many times this learner has come up short on one specific check.
+
+    Counted from the attempt log rather than a counter on the digest, so it
+    survives regeneration and stays consistent with everything else the tracker
+    reads.
+    """
+    try:
+        rows = await (
+            get_db()["quiz_attempts"]
+            .find(
+                {
+                    "user_id": user_id,
+                    "roadmapId": roadmapId,
+                    "topicId": topicId,
+                    "quizId": quizId,
+                },
+                projection={"score": 1},
+            )
+            .to_list(None)
+        )
+    except Exception as e:
+        logger.error("failed_attempts error user=%s quiz=%s: %s", user_id, quizId, e)
+        # Fail closed on the escalation, not on the learner: an unknown history
+        # means no re-teach is triggered, and they simply try again.
+        return 0
+    return sum(1 for r in rows if (r.get("score") or 0) < pass_score)
+
+
+async def replace_quiz_questions(quizId: str, user_id: str, questions: list[dict]) -> bool:
+    """Swap a stored check's questions, keeping its id.
+
+    The digest points at this quiz by id, so rewriting in place is what lets a
+    re-explanation come with questions answerable from it — without orphaning the
+    digest or handing the learner a second gate to clear.
+    """
+    try:
+        res = await get_db()["quizzes"].update_one(
+            {"_id": ObjectId(quizId), "user_id": user_id},
+            {
+                "$set": {
+                    "questions": questions,
+                    "regeneratedAt": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("replace_quiz_questions error id=%s: %s", quizId, e)
+        return False
 
 
 async def asked_questions(

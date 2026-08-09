@@ -679,6 +679,12 @@ async def test_marking_a_digest_is_user_scoped_and_stamps_when(monkeypatch):
     assert update["$set"]["updatedAt"]
 
 
+def _tips_output(bullets):
+    from app.agents.learning_tracker.state import TopicTipsOutput
+
+    return TopicTipsOutput(bullets=list(bullets))
+
+
 def _started(**over) -> dict:
     return {"id": "t1", "title": "A", "order": 1, "progress_status": "in_progress", **over}
 
@@ -2568,3 +2574,335 @@ async def test_an_empty_recall_check_is_never_attached(monkeypatch):
 
     out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
     assert out is not None and out["quizId"] is None
+
+
+# --------------------------------------------------------------------------- #
+# misconceptions steer generation, not just reporting
+#
+# The tracker is only worth its LLM calls if something consumes it. These assert
+# the loop is closed at both ends — teaching aimed at what the learner gets
+# wrong, and checkpoints that come back to it later.
+# --------------------------------------------------------------------------- #
+_PATTERN = {
+    "label": "Confuses move with copy",
+    "detail": "Believes assignment copies; it transfers ownership.",
+    "probe": "ask what the original binding can do afterwards",
+}
+
+
+def _days_ago(days):
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _tips_capture(monkeypatch, trig):
+    """Swap the tips prompt for something that records what it was rendered with."""
+    seen = {}
+
+    class _Chain:
+        def __or__(self, _other):
+            return self
+
+        async def ainvoke(self, variables, *a, **k):
+            seen.update(variables)
+            return _tips_output(["a new bullet"])
+
+    monkeypatch.setattr(trig, "_TIPS_PROMPT", _Chain())
+    return seen
+
+
+async def test_a_digest_teaches_against_what_the_learner_gets_wrong(monkeypatch):
+    """Teaching that ignores what someone already believes is teaching into a
+    headwind — the misconception is what the new bullet has to displace."""
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["b1"], "coverage_complete": False}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    monkeypatch.setattr(
+        trig, "get_misconceptions", AsyncMock(return_value={"patterns": [_PATTERN]})
+    )
+    monkeypatch.setattr(trig, "mark_misconceptions_addressed", AsyncMock())
+    seen = _tips_capture(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert "Confuses move with copy" in seen["misconceptions"]
+    assert "transfers ownership" in seen["misconceptions"]
+
+
+async def test_a_learner_with_no_recorded_confusions_gets_an_unchanged_prompt(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["b1"], "coverage_complete": False}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    monkeypatch.setattr(trig, "get_misconceptions", AsyncMock(return_value=None))
+    marked = AsyncMock()
+    monkeypatch.setattr(trig, "mark_misconceptions_addressed", marked)
+    seen = _tips_capture(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert seen["misconceptions"] == ""
+    marked.assert_not_awaited()
+
+
+async def test_the_same_correction_is_not_re_taught_in_the_next_digest(monkeypatch):
+    """Repeating it every digest is nagging, and crowds out the material the
+    drip-feed is supposed to be advancing through."""
+    from app.core.config import MISCONCEPTION_RETEACH_DAYS as QUIET
+
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["b1"], "coverage_complete": False}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    monkeypatch.setattr(
+        trig,
+        "get_misconceptions",
+        AsyncMock(return_value={"patterns": [{**_PATTERN, "last_taught_at": _days_ago(1)}]}),
+    )
+    monkeypatch.setattr(trig, "mark_misconceptions_addressed", AsyncMock())
+    seen = _tips_capture(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert seen["misconceptions"] == ""
+    assert QUIET > 1  # the window this test is exercising
+
+
+async def test_a_confusion_comes_back_once_the_quiet_period_is_up(monkeypatch):
+    """A single right answer is not a corrected belief. Coming back to it later
+    is the only way to tell one that stuck from one papered over for a session."""
+    from app.core.config import MISCONCEPTION_RETEACH_DAYS as QUIET
+
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["b1"], "coverage_complete": False}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    monkeypatch.setattr(
+        trig,
+        "get_misconceptions",
+        AsyncMock(
+            return_value={"patterns": [{**_PATTERN, "last_taught_at": _days_ago(QUIET + 2)}]}
+        ),
+    )
+    monkeypatch.setattr(trig, "mark_misconceptions_addressed", AsyncMock())
+    seen = _tips_capture(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+    assert "Confuses move with copy" in seen["misconceptions"]
+
+
+async def test_teaching_against_a_confusion_starts_its_own_clock(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["b1"], "coverage_complete": False}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    monkeypatch.setattr(
+        trig, "get_misconceptions", AsyncMock(return_value={"patterns": [_PATTERN]})
+    )
+    marked = AsyncMock()
+    monkeypatch.setattr(trig, "mark_misconceptions_addressed", marked)
+    _tips_capture(monkeypatch, trig)
+
+    await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert marked.await_args.args[3] == ["Confuses move with copy"]
+    assert marked.await_args.args[4] == "last_taught_at"
+
+
+def test_teaching_a_confusion_does_not_suppress_testing_it():
+    """Teach then test is the good pairing — one clock per surface, or a digest
+    that explains the confusion would cancel the checkpoint that checks it."""
+    from app.core.config import (
+        MISCONCEPTION_REPROBE_DAYS as PROBE,
+        MISCONCEPTION_RETEACH_DAYS as TEACH,
+    )
+
+    just_taught = [{**_PATTERN, "last_taught_at": _days_ago(0)}]
+
+    assert repo.due_misconceptions(just_taught, "last_taught_at", TEACH) == []
+    assert len(repo.due_misconceptions(just_taught, "last_probed_at", PROBE)) == 1
+
+
+def test_a_confusion_nobody_has_addressed_is_always_due():
+    assert len(repo.due_misconceptions([_PATTERN], "last_probed_at", 7)) == 1
+
+
+def test_an_unparseable_stamp_does_not_silence_a_confusion_forever():
+    """Failing open: the cost is one repetition, where failing closed would hide
+    a real misconception permanently."""
+    broken = [{**_PATTERN, "last_probed_at": "not-a-date"}]
+    assert len(repo.due_misconceptions(broken, "last_probed_at", 7)) == 1
+
+
+async def test_re_analysis_does_not_reset_the_decay_clocks(monkeypatch):
+    """Patterns are rewritten wholesale on each new piece of evidence. Losing
+    the stamps would mean the learner who keeps making mistakes is the one whose
+    misconceptions get hammered hardest."""
+    # Captured once: _days_ago() is wall-clock, so calling it twice differs.
+    yesterday = _days_ago(1)
+    stored = {
+        "patterns": [
+            {**_PATTERN, "last_probed_at": yesterday},
+            {"label": "dropped", "last_probed_at": yesterday},
+        ]
+    }
+    col = _collection()
+    monkeypatch.setattr(repo, "get_db", lambda: {repo.MISCONCEPTIONS: col})
+    monkeypatch.setattr(repo, "get_misconceptions", AsyncMock(return_value=stored))
+
+    await repo.save_misconceptions(
+        "userA", "r1", "t1", [dict(_PATTERN), {"label": "new", "detail": "d"}], 9
+    )
+
+    written = {
+        p["label"]: p for p in col.update_one.await_args.args[1]["$set"]["patterns"]
+    }
+    assert written["Confuses move with copy"]["last_probed_at"] == yesterday
+    assert "last_probed_at" not in written["new"]  # never addressed, so due now
+    assert "dropped" not in written  # gone from the analysis, gone from the store
+
+
+# --------------------------------------------------------------------------- #
+# "explain differently" escalation
+#
+# Two failures on one set of tips is a fact about the tips. Fail-closed on the
+# learner's side — they still have to pass — adaptive on the agent's.
+# --------------------------------------------------------------------------- #
+def test_a_failed_recall_check_is_counted(monkeypatch):
+    from app.core.config import DIGEST_QUIZ_PASS_SCORE as PASS
+
+    rows = [{"score": 100}, {"score": 50}, {"score": 0}]
+    assert sum(1 for r in rows if r["score"] < PASS) == 2  # the shape counted
+
+
+async def test_only_sub_pass_attempts_count_towards_escalation(monkeypatch):
+    from app.core.config import DIGEST_QUIZ_PASS_SCORE as PASS
+
+    col = _collection()
+    col.find.return_value.to_list = AsyncMock(
+        return_value=[{"score": 100}, {"score": 50}, {"score": 0}]
+    )
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    assert await repo.failed_attempts("userA", "r1", "t1", "Q2", PASS) == 2
+    assert col.find.call_args.args[0]["quizId"] == "Q2"
+    assert col.find.call_args.args[0]["user_id"] == "userA"
+
+
+async def test_an_unreadable_history_does_not_escalate(monkeypatch):
+    """Better to let them try again than to spend an LLM call on a guess."""
+    col = _collection()
+    col.find = MagicMock(side_effect=RuntimeError("mongo down"))
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    assert await repo.failed_attempts("userA", "r1", "t1", "Q2", 100) == 0
+
+
+def _reteach_env(monkeypatch, style=None, digests=None):
+    import app.agents.learning_tracker.triggers as trig
+    from app.agents.learning_tracker.state import Question, QuizOutput
+
+    monkeypatch.setattr(
+        trig,
+        "topic_digests",
+        AsyncMock(
+            return_value=digests
+            if digests is not None
+            else [
+                {"sequence": 1, "bullets": ["old bullet 1"], "quizId": None},
+                {"sequence": 2, "bullets": ["old bullet 2"], "quizId": "Q2"},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        trig,
+        "fetch_roadmap",
+        AsyncMock(return_value={"topics": [{"id": "t1", "title": "Ownership"}]}),
+    )
+    monkeypatch.setattr(
+        trig, "get_profile", AsyncMock(return_value={"preferred_explanation_style": style})
+    )
+    monkeypatch.setattr(
+        trig,
+        "build_digest_quiz",
+        AsyncMock(
+            return_value=QuizOutput(
+                quiz=[Question(question="new q", options=["a", "b"], answer=0)]
+            )
+        ),
+    )
+    monkeypatch.setattr(trig, "replace_quiz_questions", AsyncMock(return_value=True))
+    col = _collection()
+    monkeypatch.setattr(trig, "get_db", lambda: {trig.DIGESTS: col, "quizzes": col})
+    monkeypatch.setattr(trig, "send_push_notification", AsyncMock())
+
+    seen = {}
+
+    async def _reteach(topic, bullets, style=None, missed=None):
+        seen.update(topic=topic, bullets=list(bullets), style=style, missed=list(missed or []))
+        return _tips_output(["a different angle"])
+
+    monkeypatch.setattr(trig, "build_reteach", _reteach)
+    return trig, seen, col
+
+
+async def test_re_teaching_covers_the_material_the_failed_check_was_built_from(monkeypatch):
+    """Not the whole topic. Anything extra makes a topic they are already stuck
+    on bigger."""
+    trig, seen, _ = _reteach_env(monkeypatch)
+
+    await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
+
+    assert seen["bullets"] == ["old bullet 1"]
+
+
+async def test_re_teaching_uses_the_style_the_learner_asked_for(monkeypatch):
+    """The one moment where "how do you like things explained" has something
+    concrete to change."""
+    trig, seen, _ = _reteach_env(monkeypatch, style="examples_first")
+    await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
+    assert seen["style"] == "examples_first"
+
+
+async def test_re_teaching_is_aimed_at_the_questions_they_missed(monkeypatch):
+    trig, seen, _ = _reteach_env(monkeypatch)
+    await trig.escalate_to_reteach(
+        "userA", _OID, "t1", "Q2", missed=["what does move do?"]
+    )
+    assert seen["missed"] == ["what does move do?"]
+
+
+async def test_the_re_teach_digest_stays_outside_the_drip_feed(monkeypatch):
+    """It covers ground already sent, so counting it would shift where the
+    recall-check cadence falls for everything after."""
+    trig, _, col = _reteach_env(monkeypatch)
+
+    out = await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
+
+    assert out["kind"] == "reteach"
+    assert out["sequence"] is None
+    assert out["quizId"] is None  # the gate is the check it re-explains
+
+
+async def test_the_learner_still_has_to_pass_the_same_check(monkeypatch):
+    """Fail-closed: escalation rewrites the questions in place rather than
+    dropping the gate or adding a second one."""
+    trig, _, _ = _reteach_env(monkeypatch)
+
+    await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
+
+    assert trig.replace_quiz_questions.await_args.args[0] == "Q2"
+    rebuilt_from = trig.build_digest_quiz.await_args.args[1]
+    # Over old material AND new, so it tests the same ideas while becoming
+    # answerable from the new explanation.
+    assert "old bullet 1" in rebuilt_from
+    assert "a different angle" in rebuilt_from
+
+
+async def test_nothing_to_re_explain_is_a_no_op(monkeypatch):
+    trig, _, col = _reteach_env(monkeypatch, digests=[])
+    assert await trig.escalate_to_reteach("userA", _OID, "t1", "Q2") is None
+    col.insert_one.assert_not_awaited()
+
+
+async def test_a_failed_quiz_rebuild_still_ships_the_new_explanation(monkeypatch):
+    """The re-explanation is the valuable half; keeping the old questions is
+    survivable, losing the new teaching is not."""
+    trig, _, col = _reteach_env(monkeypatch)
+    monkeypatch.setattr(
+        trig, "build_digest_quiz", AsyncMock(side_effect=RuntimeError("boom"))
+    )
+
+    out = await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
+    assert out is not None and out["bullets"] == ["a different angle"]

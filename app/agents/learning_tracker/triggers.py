@@ -6,19 +6,35 @@ from typing import Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import DIGEST_MAX_UNREAD, DIGEST_ONELINER_FROM
+from app.core.config import (
+    DIGEST_MAX_UNREAD,
+    DIGEST_ONELINER_FROM,
+    MISCONCEPTION_RETEACH_DAYS,
+)
 from app.core.llm import llm
 from app.database import get_db
 from app.agents.trigger_store import due_triggers, mark_ran
 from app.services.push_service import send_push_notification
-from .service import build_digest_quiz, build_oneliner, check_coverage
+from app.agents.memory_store import get_profile
+from .service import (
+    build_digest_quiz,
+    build_oneliner,
+    build_reteach,
+    check_coverage,
+)
 from .state import CoverageOutput, TopicTipsOutput
 from .repository import (
     DIGESTS,
+    LEARNING_NS,
+    fetch_roadmap,
+    replace_quiz_questions,
     digest_carries_quiz,
     digest_quiz_gate,
     digest_quiz_window,
+    due_misconceptions,
     find_topic,
+    get_misconceptions,
+    mark_misconceptions_addressed,
     in_progress_topic,
     revision_outstanding,
     set_topic_progress,
@@ -27,6 +43,20 @@ from .repository import (
 from .tools import tavily_search_tool
 
 logger = logging.getLogger(__name__)
+
+# Injected into the tips prompt when this learner's own wrong answers point at a
+# specific confusion. Teaching that ignores what someone already believes is
+# teaching into a headwind: the misconception is what the new bullet has to
+# displace, and naming it is what turns a general explanation into one aimed at
+# this learner.
+_MISCONCEPTION_BLOCK = (
+    "This learner's own answers show they are getting these wrong:\n{patterns}\n"
+    "Write at least one bullet that takes the confusion head-on — say plainly "
+    "what is actually the case and why the other reading is tempting but wrong. "
+    "Do NOT mention their mistakes, quiz scores or history; write it as teaching, "
+    "not as a correction notice. A bullet that says 'you may have thought…' "
+    "reads as an accusation and teaches nothing extra.\n"
+)
 
 _TIPS_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -50,6 +80,7 @@ _TIPS_PROMPT = ChatPromptTemplate.from_messages(
             "Aim at these outcomes, in order, and go deep enough that a learner "
             # "could actually do them:\n{outstanding}\n"
             "Do not repeat what has already been sent:\n{covered}\n"
+            "{misconceptions}"
             "Keep each bullet to one or two sentences.",
         ),
         (
@@ -167,6 +198,15 @@ async def build_digest(
     except Exception as e:
         logger.error("tavily digest search error: %s", e)
 
+    # What this learner is getting wrong, so the tips can displace it rather than
+    # explain past it. A cached read — the analysis runs in the background after
+    # each graded attempt — and filtered by the re-teach clock, so a correction
+    # already made recently isn't repeated in the next digest.
+    analysis = await get_misconceptions(user_id, roadmap_id, topic_id)
+    confusions = due_misconceptions(
+        (analysis or {}).get("patterns"), "last_taught_at", MISCONCEPTION_RETEACH_DAYS
+    )
+
     chain = _TIPS_PROMPT | llm.with_structured_output(TopicTipsOutput)
     tips: TopicTipsOutput = await chain.ainvoke(
         {
@@ -176,8 +216,32 @@ async def build_digest(
             # Steer each digest at what the previous ones didn't reach, so the
             # drip-feed advances instead of restating the same introduction.
             "covered": "\n".join(f"- {b}" for b in prior_bullets) or "- (nothing yet)",
+            "misconceptions": (
+                _MISCONCEPTION_BLOCK.format(
+                    patterns="\n".join(
+                        f"- {c.get('label')}: {c.get('detail')}" for c in confusions
+                    )
+                )
+                if confusions
+                else ""
+            ),
         }
     )
+
+    if confusions:
+        await mark_misconceptions_addressed(
+            user_id,
+            roadmap_id,
+            topic_id,
+            [c.get("label") for c in confusions if c.get("label")],
+            "last_taught_at",
+        )
+        logger.info(
+            "digest #%s on topic=%s aimed at %s misconception(s)",
+            sequence,
+            topic_id,
+            len(confusions),
+        )
 
     # Every other digest, acknowledging requires recalling what came since the
     # last check. Built from earlier digests only — quizzing someone on the one
@@ -408,6 +472,117 @@ async def build_revision_digest(
             ),
             data={"type": "learning_revision", "topicId": topicId},
         )
+
+    doc["quiz"] = None
+    return {**doc, "_id": str(res.inserted_id)}
+
+
+async def escalate_to_reteach(
+    user_id: str,
+    roadmapId: str,
+    topicId: Optional[str],
+    quizId: str,
+    missed: Optional[list] = None,
+) -> Optional[dict]:
+    """Re-explain the material behind a recall check the learner keeps failing.
+
+    Triggered when the same check has been failed DIGEST_RETEACH_AFTER times.
+    Two failures on one set of tips is a fact about the tips: the learner has
+    read them twice and still can't answer, so sending them back to re-read the
+    same words a third time is the one thing certain not to work.
+
+    Adaptive on this side, fail-closed on theirs. The learner is not let through
+    — the check still has to be passed. What changes is that its questions are
+    rewritten against a fresh explanation, so passing is possible on the strength
+    of teaching that might actually land, rather than on persistence.
+
+    Returns the re-teach digest, or None if there was nothing to re-explain.
+    """
+    digests = await topic_digests(user_id, roadmapId, topicId)
+    # The material the failed check covers: the window it was built from.
+    blocked = next((d for d in digests if d.get("quizId") == quizId), None)
+    window = digest_quiz_window(
+        [d for d in digests if (d.get("sequence") or 0) < (blocked or {}).get("sequence", 0)]
+        if blocked
+        else digests
+    )
+    bullets = [b for d in window for b in d.get("bullets") or []]
+    if not bullets:
+        logger.info("no material to re-teach for quiz=%s", quizId)
+        return None
+
+    topic = find_topic(await fetch_roadmap(roadmapId, user_id), topicId) or {}
+    topic_title = topic.get("title") or (blocked or {}).get("topicTitle") or ""
+
+    # Their stated preference decides the angle — this is the one moment where
+    # "how do you like things explained" has something concrete to change.
+    style = None
+    try:
+        profile = await get_profile(user_id, LEARNING_NS)
+        style = (profile or {}).get("preferred_explanation_style")
+    except Exception as e:
+        logger.error("reteach profile fetch failed user=%s: %s", user_id, e)
+
+    try:
+        retaught = await build_reteach(topic_title, bullets, style, missed)
+    except Exception as e:
+        logger.error("reteach generation failed quiz=%s: %s", quizId, e)
+        return None
+    if not retaught.bullets:
+        return None
+
+    # The check is rewritten against old material AND new, so it stays a test of
+    # the same ideas while becoming answerable from the new explanation.
+    try:
+        rebuilt = await build_digest_quiz(topic_title, bullets + list(retaught.bullets))
+        if rebuilt.quiz:
+            await replace_quiz_questions(
+                quizId, user_id, [q.model_dump() for q in rebuilt.quiz]
+            )
+    except Exception as e:
+        # The re-explanation is the valuable half; keeping the old questions is
+        # survivable, where losing the new teaching is not.
+        logger.error("reteach quiz rebuild failed quiz=%s: %s", quizId, e)
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "user_id": user_id,
+        "roadmapId": roadmapId,
+        "topicId": topicId,
+        "topicTitle": topic_title,
+        # Outside the drip-feed: this covers ground already sent, so counting it
+        # would shift where the recall-check cadence falls for what comes after.
+        "sequence": None,
+        "kind": "reteach",
+        "style": style,
+        "bullets": retaught.bullets,
+        "resources": [],
+        # The gate is the check on the digest this re-explains, not a second one.
+        "quizId": None,
+        "coverage_complete": False,
+        "missing_outcomes": [],
+        "status": "unread",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    res = await get_db()[DIGESTS].insert_one(doc)
+    logger.info(
+        "re-teach digest created user=%s topic=%s style=%s",
+        user_id,
+        topic_title,
+        style or "analogy",
+    )
+
+    await send_push_notification(
+        user_id,
+        title=f"Another way to look at {topic_title}",
+        body=(
+            retaught.bullets[0]
+            if retaught.bullets
+            else "Let's come at this from a different angle."
+        ),
+        data={"type": "learning_reteach", "topicId": topicId},
+    )
 
     doc["quiz"] = None
     return {**doc, "_id": str(res.inserted_id)}

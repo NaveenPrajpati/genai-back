@@ -20,9 +20,11 @@ from app.core.config import (
     CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
     CHECKPOINT_PASS_SCORE,
     DIGEST_QUIZ_PASS_SCORE,
+    DIGEST_RETEACH_AFTER,
     FEYNMAN_LADDER_BONUS,
     FEYNMAN_MIN_WORDS,
     FEYNMAN_PASS_SCORE,
+    MISCONCEPTION_REPROBE_DAYS,
 )
 from app.agents.learning_tracker.service import (
     build_checkpoint,
@@ -30,7 +32,11 @@ from app.agents.learning_tracker.service import (
     judge_explanation,
     refresh_misconceptions,
 )
-from app.agents.learning_tracker.triggers import build_digest, build_revision_digest
+from app.agents.learning_tracker.triggers import (
+    build_digest,
+    build_revision_digest,
+    escalate_to_reteach,
+)
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
     ActiveRoadmapLimit,
@@ -41,7 +47,9 @@ from app.agents.learning_tracker.repository import (
     delete_note,
     delete_roadmap,
     digest_quiz_gate,
+    due_misconceptions,
     due_reviews,
+    failed_attempts,
     fetch_digest,
     fetch_quiz,
     fetch_roadmap,
@@ -56,6 +64,7 @@ from app.agents.learning_tracker.repository import (
     list_notes,
     list_roadmaps,
     mark_digest,
+    mark_misconceptions_addressed,
     note_counts,
     open_questions,
     profile_drift,
@@ -715,17 +724,12 @@ async def acknowledge_digest(
             graded = grade_quiz(
                 quiz.get("questions", []), {a.question: a.answer for a in body.answers}
             )
-            if graded["score"] < DIGEST_QUIZ_PASS_SCORE:
-
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "message": "Not quite — check the earlier tips and try again.",
-                        "quiz_result": graded,
-                        "pass_score": DIGEST_QUIZ_PASS_SCORE,
-                    },
-                )
-            quiz_result = graded
+            # Recorded before the refusal, not after. A failed recall check is
+            # the single most informative thing a digest produces, and raising
+            # first meant the only attempt ever written was the one that got
+            # everything right — which by definition carries no misses, so the
+            # digest check contributed nothing to the misconception tracker at
+            # all.
             await record_quiz_attempt(
                 user_id,
                 quiz_id,
@@ -735,6 +739,51 @@ async def acknowledge_digest(
                 questions=quiz.get("questions", []),
                 kind="digest",
             )
+
+            if graded["score"] < DIGEST_QUIZ_PASS_SCORE:
+                # Twice on one set of tips is a fact about the tips. The learner
+                # is still not let through — they read the new explanation and
+                # answer the rebuilt check — but sending them back to re-read the
+                # same words a third time is the one thing certain not to work.
+                failures = await failed_attempts(
+                    user_id,
+                    digest.get("roadmapId"),
+                    digest.get("topicId"),
+                    quiz_id,
+                    DIGEST_QUIZ_PASS_SCORE,
+                )
+                escalating = failures >= DIGEST_RETEACH_AFTER
+                if escalating:
+                    background_tasks.add_task(
+                        escalate_to_reteach,
+                        user_id,
+                        digest.get("roadmapId"),
+                        digest.get("topicId"),
+                        quiz_id,
+                        [
+                            quiz["questions"][r["question"]].get("question", "")
+                            for r in graded["review"]
+                            if 0 <= r["question"] < len(quiz.get("questions") or [])
+                        ],
+                    )
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": (
+                            "That's on us, not you — we'll explain this a "
+                            "different way. Check back in a moment."
+                            if escalating
+                            else "Not quite — check the earlier tips and try again."
+                        ),
+                        "quiz_result": graded,
+                        "pass_score": DIGEST_QUIZ_PASS_SCORE,
+                        # The client can stop saying "try again" and start saying
+                        # "a new explanation is coming".
+                        "reteaching": escalating,
+                        "attempts": failures,
+                    },
+                )
+            quiz_result = graded
 
         # The typed sentence, handled outside the gate above: it is evidence, not
         # a pass mark, and it still has to be collected on a set that happens to
@@ -1081,15 +1130,32 @@ async def start_checkpoint(
         # Both cached reads — the misconception analysis runs in the background
         # after each graded attempt, so issuing a checkpoint stays one LLM call.
         analysis = await get_misconceptions(user_id, body.roadmapId, topicId)
+        # Filtered by the re-probe clock. Probing the same belief in consecutive
+        # checkpoints measures whether they remember last week's question rather
+        # than whether they now understand; leaving it a while and coming back is
+        # what tells a correction that stuck from one that was papered over.
+        confusions = due_misconceptions(
+            (analysis or {}).get("patterns"),
+            "last_probed_at",
+            MISCONCEPTION_REPROBE_DAYS,
+        )
         already_asked = await asked_questions(user_id, body.roadmapId, topicId)
         generated = await build_checkpoint(
             topic,
             (roadmap or {}).get("title", ""),
             memory,
             is_review,
-            misconceptions=(analysis or {}).get("patterns"),
+            misconceptions=confusions,
             asked=already_asked,
         )
+        if confusions:
+            await mark_misconceptions_addressed(
+                user_id,
+                body.roadmapId,
+                topicId,
+                [c.get("label") for c in confusions if c.get("label")],
+                "last_probed_at",
+            )
         questions = [q.model_dump() for q in generated.quiz]
         res = await get_db()["quizzes"].insert_one(
             {

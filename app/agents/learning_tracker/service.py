@@ -35,6 +35,7 @@ from .state import (
     QuizOutput,
     RoadmapDraft,
     RoadmapOutput,
+    TopicTipsOutput,
 )
 from .repository import (
     get_misconceptions,
@@ -323,6 +324,84 @@ async def grade_oneliner(
             "question": question,
             "expected": expected or "(not recorded — judge against the question)",
             "answer": answer,
+        }
+    )
+
+
+# How to come at a topic differently. Keyed to `preferred_explanation_style` in
+# the learner profile, with a fallback for a learner who never expressed one.
+_APPROACHES = {
+    "examples_first": (
+        "Lead with a concrete worked example and let the rule fall out of it. "
+        "Show the thing happening before naming what it is."
+    ),
+    "step_by_step": (
+        "Break it into numbered steps in the order someone would actually do "
+        "them, and say what changes after each one."
+    ),
+    "visual": (
+        "Describe what it looks like — the shape of the data, what moves where, "
+        "what the before and after picture is. Lean on spatial language."
+    ),
+    "socratic": (
+        "Pose the question the idea answers, then walk to the answer. Start from "
+        "what goes wrong without it."
+    ),
+    "concise": (
+        "Strip it to the shortest true statement of the idea, then one example "
+        "that makes it concrete. No preamble."
+    ),
+    None: (
+        "Use a plain-language analogy from everyday life, then connect each part "
+        "of the analogy back to the real thing."
+    ),
+}
+
+_RETEACH_SYSTEM = (
+    "A learner has now failed the recall check on this material twice. Assume "
+    "the explanation is at fault, not the reader.\n"
+    "Re-teach the SAME material below from scratch, a different way. Do not "
+    "restate the earlier bullets in new words — they have read those twice and "
+    "still could not answer, so the wording is not the problem. Change the angle "
+    "of attack.\n"
+    "How to come at it: {approach}\n"
+    "Cover exactly what the earlier bullets covered — no more, no less. Anything "
+    "extra makes a topic they are already stuck on bigger.\n"
+    "Write 3-5 bullets. Never mention their attempts, their score, or that this "
+    "is a second try; write it as the explanation that should have come first.\n"
+    "{missed}"
+    "Topic: {topic}\n"
+    "What they were told before, and could not answer on:\n{bullets}"
+)
+
+
+async def build_reteach(
+    topic_title: str,
+    bullets: List[str],
+    style: Optional[str] = None,
+    missed: Optional[List[str]] = None,
+) -> TopicTipsOutput:
+    """Re-explain material a learner has failed a recall check on twice.
+
+    A different angle rather than a rewrite: the same explanation in fresh
+    wording is the same explanation, and it already didn't land.
+    """
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _RETEACH_SYSTEM), ("human", "Teach it again, differently.")]
+    ) | llm.with_structured_output(TopicTipsOutput)
+    return await chain.ainvoke(
+        {
+            "topic": topic_title,
+            "approach": _APPROACHES.get(style) or _APPROACHES[None],
+            "bullets": "\n".join(f"- {b}" for b in bullets) or "- (nothing recorded)",
+            "missed": (
+                "They got these questions wrong — make sure the new explanation "
+                "makes each answerable:\n"
+                + "\n".join(f"- {m}" for m in missed)
+                + "\n"
+                if missed
+                else ""
+            ),
         }
     )
 
