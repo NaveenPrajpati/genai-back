@@ -20,8 +20,16 @@ from app.core.config import (
     CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
     CHECKPOINT_PASS_SCORE,
     DIGEST_QUIZ_PASS_SCORE,
+    FEYNMAN_LADDER_BONUS,
+    FEYNMAN_MIN_WORDS,
+    FEYNMAN_PASS_SCORE,
 )
-from app.agents.learning_tracker.service import build_checkpoint, refresh_misconceptions
+from app.agents.learning_tracker.service import (
+    build_checkpoint,
+    grade_oneliner,
+    judge_explanation,
+    refresh_misconceptions,
+)
 from app.agents.learning_tracker.triggers import build_digest, build_revision_digest
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
@@ -49,9 +57,11 @@ from app.agents.learning_tracker.repository import (
     list_roadmaps,
     mark_digest,
     note_counts,
+    open_questions,
     profile_drift,
     profile_snapshot,
     recent_attempts,
+    record_explanation,
     record_quiz_attempt,
     record_revision,
     redact_review,
@@ -606,10 +616,62 @@ async def get_digests(
     }
 
 
+async def _record_written_answer(
+    user_id: str,
+    roadmapId: str,
+    topicId: str,
+    topicTitle: str,
+    question: dict,
+    answer: str,
+) -> None:
+    """Grade one typed sentence and file what it reveals.
+
+    Runs off the request path: the learner has already been let through on the
+    tap questions, so nothing they are waiting for depends on this. Failing here
+    costs a piece of evidence, never an acknowledgement.
+    """
+    try:
+        judged = await grade_oneliner(
+            question.get("question", ""), question.get("expected"), answer
+        )
+    except Exception as e:
+        logger.error("one-liner grading failed topic=%s: %s", topicId, e)
+        return
+
+    correct = judged.score >= 50
+    await record_quiz_attempt(
+        user_id,
+        None,
+        roadmapId,
+        topicId,
+        {"total": 1, "correct": 1 if correct else 0, "score": judged.score, "review": []},
+        kind="written",
+        # Their sentence next to what the question wanted — the shape of evidence
+        # the tracker reads, and richer than any distractor index.
+        misses=(
+            []
+            if correct
+            else [
+                {
+                    "question": question.get("question", ""),
+                    "chosen": answer,
+                    "correct": question.get("expected"),
+                }
+            ]
+        ),
+    )
+    if not correct:
+        await refresh_misconceptions(user_id, roadmapId, topicId, topicTitle)
+
+
 class DigestMark(BaseModel):
     # Required when the digest carries a recall check (every digest after the
     # first on a topic).
     answers: list[Answer] = Field(default_factory=list)
+    # Typed answers to the open question, keyed by its position in the set. From
+    # the fourth digest on, one question is answered in a sentence rather than
+    # tapped.
+    written: dict[int, str] = Field(default_factory=dict)
     # Generate the next digest for this topic straight after marking.
     generate_next: bool = False
 
@@ -618,6 +680,7 @@ class DigestMark(BaseModel):
 async def acknowledge_digest(
     digestId: str,
     body: DigestMark,
+    background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Acknowledge a digest, optionally pulling the next one in the same step.
@@ -625,6 +688,12 @@ async def acknowledge_digest(
     A digest carrying a recall check can only be marked by passing it — that's
     what makes acknowledgement mean "I read this" rather than "I dismissed this".
     The check covers earlier digests only, so it's always answerable.
+
+    From the fourth digest the check also asks for one typed sentence. It has to
+    be attempted, but being *wrong* doesn't block the mark: the tap questions are
+    the gate, and putting an LLM's opinion of a sentence in front of a nudge
+    would make the cheapest interaction in the system the most brittle. What it's
+    really for is the diagnosis — it goes to the misconception tracker either way.
     """
     user_id = current_user["uid"]
     digest = await fetch_digest(digestId, user_id)
@@ -635,12 +704,14 @@ async def acknowledge_digest(
     quiz_id = digest.get("quizId")
     if quiz_id and digest.get("status") != "marked":
         quiz = await fetch_quiz(user_id, quiz_id)
-        # A check with no questions scores 0 against a pass mark of 100, so
-        # gating on it would make the digest permanently unmarkable — and an
-        # unmarkable digest holds a slot under DIGEST_MAX_UNREAD forever, which
-        # stops the topic getting any further digests at all. Nothing to answer
-        # means nothing to gate on.
-        if quiz and quiz.get("questions"):
+        # Gated on the CLOSED questions, not on there being questions at all. A
+        # set with nothing to tap scores 0 against a pass mark of 100, so it would
+        # make the digest permanently unmarkable — and an unmarkable digest holds
+        # a slot under DIGEST_MAX_UNREAD forever, stopping the topic getting any
+        # further digests. A written answer is evidence, never the gate.
+        all_questions = (quiz or {}).get("questions") or []
+        gating = [q for q in all_questions if q.get("kind") != "open"]
+        if quiz and gating:
             graded = grade_quiz(
                 quiz.get("questions", []), {a.question: a.answer for a in body.answers}
             )
@@ -663,6 +734,32 @@ async def acknowledge_digest(
                 graded,
                 questions=quiz.get("questions", []),
                 kind="digest",
+            )
+
+        # The typed sentence, handled outside the gate above: it is evidence, not
+        # a pass mark, and it still has to be collected on a set that happens to
+        # have nothing to tap. It has to be attempted — a blank is noise in the
+        # tracker rather than a reading of how someone thinks — but whether it is
+        # *right* never blocks the acknowledgement.
+        for idx, q in open_questions(all_questions):
+            answer = (body.written.get(idx) or "").strip()
+            if not answer:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": "Answer the written question in a sentence.",
+                        "question": idx,
+                        "blocked_reason": "written_answer_required",
+                    },
+                )
+            background_tasks.add_task(
+                _record_written_answer,
+                user_id,
+                digest.get("roadmapId"),
+                digest.get("topicId"),
+                digest.get("topicTitle", ""),
+                q,
+                answer,
             )
 
     if not await mark_digest(digestId, user_id):
@@ -1107,6 +1204,127 @@ async def submit_checkpoint(
             **outcome,
             pass_score=CHECKPOINT_PASS_SCORE,
         ).model_dump(),
+    }
+
+
+class ExplanationSubmission(BaseModel):
+    roadmapId: str
+    text: str = Field(min_length=1, max_length=8_000)
+    # Where the words came from. Dictated answers ramble, restart and lose their
+    # punctuation; the judge is told to ignore all of that, and knowing which
+    # mode produced the text is what lets that instruction be honest rather than
+    # a guess about everyone.
+    source: Literal["text", "voice"] = "text"
+
+
+@router.post("/topics/{topicId}/explain")
+async def explain_topic(
+    topicId: str,
+    body: ExplanationSubmission,
+    background_tasks: BackgroundTasks,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """The Feynman checkpoint: explain this topic in your own words.
+
+    Optional, and never a gate — a poor explanation costs nothing and can be
+    retried, because an exercise that can lose you progress is one nobody
+    volunteers for. It pays out through the review ladder instead: a passing
+    explanation puts the topic an extra rung along at its next checkpoint, so
+    someone who can say it plainly sees it again later than someone who only
+    recognised the right option.
+
+    Its real value is the diagnosis. A wrong multiple-choice answer says which
+    of four options someone tapped; a flawed explanation shows how they are
+    thinking, and that goes into the misconception tracker through the same path
+    every other attempt does.
+    """
+    user_id = current_user["uid"]
+    roadmap = await fetch_roadmap(body.roadmapId, user_id)
+    topic = find_topic(roadmap, topicId)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found.")
+
+    words = len(body.text.split())
+    if words < FEYNMAN_MIN_WORDS:
+        # Graded, this would produce a confident verdict about nothing, and store
+        # it as evidence — so it's refused rather than scored badly.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"Give it a few more words — around {FEYNMAN_MIN_WORDS} is "
+                    "enough to work with. Say it as you would to a friend."
+                ),
+                "words": words,
+                "min_words": FEYNMAN_MIN_WORDS,
+            },
+        )
+
+    try:
+        judged = await judge_explanation(topic, body.text)
+    except Exception as e:
+        logger.error("explanation judging failed topic=%s: %s", topicId, e)
+        raise HTTPException(
+            status_code=503, detail="Couldn't read that just now — try again shortly."
+        )
+
+    passed = judged.score >= FEYNMAN_PASS_SCORE
+    verdict = judged.model_dump()
+    await record_explanation(
+        body.roadmapId, topicId, user_id, verdict, body.text, passed
+    )
+
+    # Recorded as an attempt so the existing analysis picks it up. The misses are
+    # the outcomes the explanation got wrong, carrying the learner's own words —
+    # far better evidence than a distractor index, and it reaches the tracker
+    # through the same path as everything else rather than a second pipeline that
+    # would have to be kept in step with the first.
+    #
+    # An outcome merely left out is NOT a miss: silence is a gap, and treating it
+    # as a wrong belief would have the tracker chase something never said.
+    misses = [
+        {
+            "question": o.outcome,
+            "chosen": o.evidence or "(said, but incorrectly)",
+            "correct": None,
+        }
+        for o in judged.outcomes
+        if o.verdict == "wrong"
+    ] + [
+        {"question": m.label, "chosen": m.detail, "correct": None}
+        for m in judged.misconceptions
+    ]
+    await record_quiz_attempt(
+        user_id,
+        None,
+        body.roadmapId,
+        topicId,
+        {
+            "total": len(judged.outcomes) or 1,
+            "correct": sum(1 for o in judged.outcomes if o.verdict == "solid"),
+            "score": judged.score,
+            "review": [],
+        },
+        kind="explain",
+        misses=misses,
+    )
+
+    background_tasks.add_task(
+        refresh_misconceptions, user_id, body.roadmapId, topicId, topic.get("title", "")
+    )
+
+    return {
+        "status": "done",
+        "result": {
+            "passed": passed,
+            "pass_score": FEYNMAN_PASS_SCORE,
+            **verdict,
+            # What passing bought, stated plainly — an incentive nobody is told
+            # about doesn't incentivise anything.
+            "ladder_bonus": FEYNMAN_LADDER_BONUS if passed else 0,
+            "topicId": topicId,
+            "roadmapId": body.roadmapId,
+        },
     }
 
 

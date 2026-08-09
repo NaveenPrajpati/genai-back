@@ -29,7 +29,9 @@ from app.agents.personal_assistant.service import (
 )
 from .state import (
     CoverageOutput,
+    ExplanationJudgement,
     MisconceptionOutput,
+    Question,
     QuizOutput,
     RoadmapDraft,
     RoadmapOutput,
@@ -205,6 +207,122 @@ async def build_checkpoint(
             "outcomes": outcomes or "- (none given)",
             "roadmap_title": roadmap_title or "general",
             "memory": memory or "none",
+        }
+    )
+
+
+_FEYNMAN_SYSTEM = (
+    "You are judging whether a learner understands a topic, from how they "
+    "explain it in their own words. This is the Feynman test: someone who has "
+    "understood something can say it plainly.\n"
+    "Grade against the learning outcomes below and nothing else. For each "
+    "outcome say whether their explanation is `solid`, `partial`, `missing` "
+    "(never addressed) or `wrong` (addressed incorrectly), quoting the words that "
+    "led you there.\n"
+    "Judge the understanding, not the performance. Rambling, informal phrasing, "
+    "false starts, filler and bad grammar are irrelevant — this may have been "
+    "spoken aloud. An analogy that carries the idea is worth more than textbook "
+    "vocabulary used without meaning. Do not reward someone for reciting the "
+    "outcome back at you: parroting a phrase they were given is the thing this "
+    "test exists to see through.\n"
+    "`score` is the proportion of the outcomes genuinely conveyed, weighted by "
+    "how central each is to the topic.\n"
+    "Fill `misconceptions` with beliefs the explanation shows to be wrong — the "
+    "reason this is worth grading at all. Only what they actually said supports; "
+    "an outcome they simply skipped is a gap, not a misconception, and inventing "
+    "one from silence would put a future checkpoint on the trail of a problem "
+    "they may not have.\n"
+    "Write `feedback` to the learner in the second person, two sentences at most: "
+    "the strongest thing they showed, then the one thing to shore up.\n"
+    "Topic: {topic}\n"
+    "Description: {description}\n"
+    "Learning outcomes:\n{outcomes}\n"
+    "Their explanation:\n{explanation}"
+)
+
+
+async def judge_explanation(
+    topic: dict, explanation: str
+) -> ExplanationJudgement:
+    """Grade a learner's own-words explanation of a topic against its outcomes.
+
+    The counterpart to the multiple-choice checkpoint, and the only place the
+    system sees a learner's actual reasoning. Everything else it knows about
+    someone's understanding is inferred from which of four options they tapped.
+    """
+    outcomes = "\n".join(f"- {o}" for o in topic.get("learning_outcomes") or [])
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _FEYNMAN_SYSTEM), ("human", "Judge the explanation.")]
+    ) | llm.with_structured_output(ExplanationJudgement)
+    return await chain.ainvoke(
+        {
+            "topic": topic.get("title", ""),
+            "description": topic.get("description", ""),
+            "outcomes": outcomes or "- (none given)",
+            "explanation": explanation,
+        }
+    )
+
+
+_ONELINER_SYSTEM = (
+    "Write ONE open question about the study tips below. The learner answers it "
+    "in a single typed sentence, so it must be answerable in one — ask for a "
+    "definition in their own words, the reason something is done, or when they "
+    "would reach for it.\n"
+    "It must be answerable from the tips alone. Do not ask them to recall a name, "
+    "a number, or exact wording: this exists to show how they are thinking, and a "
+    "fact they either remember or don't shows nothing.\n"
+    "Set `expected` to what a correct one-sentence answer has to convey — the "
+    "idea, not a form of words. The learner never sees it.\n"
+    "Set `kind` to \"open\", leave `options` empty, and set `outcome` to what the "
+    "question checks.\n"
+    "Topic: {topic}\n"
+    "Tips already sent:\n{bullets}"
+)
+
+
+async def build_oneliner(topic_title: str, bullets: List[str]) -> Question:
+    """The single free-text question that rides along on later digest checks."""
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _ONELINER_SYSTEM), ("human", "Write the question.")]
+    ) | fast_llm.with_structured_output(Question)
+    q = await chain.ainvoke({"topic": topic_title, "bullets": "\n".join(f"- {b}" for b in bullets)})
+    # The model is asked for these but structured output will happily return a
+    # `choice` with options; force the shape the grader depends on.
+    q.kind = "open"
+    q.options = []
+    return q
+
+
+_ONELINER_GRADE_SYSTEM = (
+    "A learner answered one open question about study tips they were sent, in a "
+    "single sentence. Decide whether their answer conveys what it needed to.\n"
+    "Be generous about form and strict about meaning. Spelling, grammar, brevity "
+    "and informality do not matter; whether they have the idea does. Accept a "
+    "correct answer phrased differently from the expected one. Reject an answer "
+    "that restates the question, says nothing specific, or is obviously a "
+    "placeholder.\n"
+    "If it is wrong, `misconceptions` should say what they appear to believe — "
+    "that is the point of asking in prose rather than offering four options.\n"
+    "Question: {question}\n"
+    "What a correct answer must convey: {expected}\n"
+    "Their answer: {answer}"
+)
+
+
+async def grade_oneliner(
+    question: str, expected: Optional[str], answer: str
+) -> ExplanationJudgement:
+    """Grade one free-text sentence. Same shape as the Feynman judgement so both
+    feed the misconception tracker through one path."""
+    chain = ChatPromptTemplate.from_messages(
+        [("system", _ONELINER_GRADE_SYSTEM), ("human", "Grade it.")]
+    ) | fast_llm.with_structured_output(ExplanationJudgement)
+    return await chain.ainvoke(
+        {
+            "question": question,
+            "expected": expected or "(not recorded — judge against the question)",
+            "answer": answer,
         }
     )
 

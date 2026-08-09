@@ -135,6 +135,24 @@ DIGEST_QUIZ_QUESTIONS = _int_env("DIGEST_QUIZ_QUESTIONS", 2)
 # every digest past the first turns a nudge into homework — this is a "did you
 # read it" tap on the shoulder, and the topic checkpoint is the real assessment.
 DIGEST_QUIZ_EVERY = _int_env("DIGEST_QUIZ_EVERY", 2)
+# From this digest on, the recall check also asks for one typed sentence. Early
+# checks stay tap-only so the habit forms with no friction; by the fourth digest
+# there is enough material that "say it in your own words" is worth the keystroke,
+# and a sentence shows how someone is thinking in a way four options cannot.
+DIGEST_ONELINER_FROM = _int_env("DIGEST_ONELINER_FROM", 4)
+
+# --- Feynman checkpoint (explain it in your own words) ---
+# An optional free-text explanation offered alongside the closed-form checkpoint.
+# It never gates completion — the point is a low-friction moment at the highest-
+# stakes step, not a second exam. It is paid for out of the review ladder: a
+# strong explanation starts the topic further along it, so the learner who can
+# explain the thing sees it again later than the learner who only recognised the
+# right option.
+FEYNMAN_PASS_SCORE = _int_env("FEYNMAN_PASS_SCORE", 70)
+FEYNMAN_LADDER_BONUS = _int_env("FEYNMAN_LADDER_BONUS", 1)
+# Below this, there is nothing to judge — a two-word answer is a shrug, and
+# grading it produces a confident verdict about nothing.
+FEYNMAN_MIN_WORDS = _int_env("FEYNMAN_MIN_WORDS", 20)
 DIGEST_QUIZ_PASS_SCORE = _int_env("DIGEST_QUIZ_PASS_SCORE", 100)
 
 # --- MCP (meal planner published over Model Context Protocol) ---

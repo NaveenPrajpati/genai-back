@@ -29,6 +29,7 @@ from app.core.config import (
     CHECKPOINT_RETRY_COOLDOWN_MINUTES,
     DIGEST_MAX_UNREAD,
     DIGEST_QUIZ_EVERY,
+    FEYNMAN_LADDER_BONUS,
     MAX_ACTIVE_ROADMAPS,
     MISCONCEPTION_EVIDENCE_WINDOW,
 )
@@ -284,6 +285,10 @@ def merge_roadmap(
         topic.checkpoint_attempts = int(prior.get("checkpoint_attempts") or 0)
         topic.revisions_done = int(prior.get("revisions_done") or 0)
         topic.weak_points = list(prior.get("weak_points") or [])
+        topic.feynman_passed = bool(prior.get("feynman_passed"))
+        topic.feynman_score = prior.get("feynman_score")
+        topic.feynman_at = prior.get("feynman_at")
+        topic.feynman_text = prior.get("feynman_text")
 
     # An edit can drop the topic that was underway, or carry two across; either
     # way the roadmap comes out with exactly one.
@@ -962,6 +967,17 @@ async def apply_checkpoint(
     passed = score >= CHECKPOINT_PASS_SCORE
     was_completed = topic.get("progress_status") == "completed"
     review_count = (int(topic.get("review_count") or 0) + 1) if passed else 0
+
+    # The reward for explaining the topic in your own words, and the only thing
+    # that makes an optional exercise worth doing: a passed Feynman explanation
+    # starts the topic further up the review ladder, so someone who can say it
+    # plainly sees it again later than someone who only recognised the right
+    # option. Spent on use, not banked — the next review has to earn its own.
+    feynman_bonus = 0
+    if passed and topic.get("feynman_passed"):
+        feynman_bonus = FEYNMAN_LADDER_BONUS
+        review_count += feynman_bonus
+
     status = "completed" if (passed or was_completed) else "needs_review"
 
     now = datetime.now(timezone.utc).isoformat()
@@ -978,6 +994,10 @@ async def apply_checkpoint(
         updates["topics.$.next_review_at"] = next_review_at(review_count)
         if not topic.get("completed_at"):
             updates["topics.$.completed_at"] = now
+        if feynman_bonus:
+            # Cleared as it's spent, so the bonus applies to the review it was
+            # earned for rather than to every review from here on.
+            updates["topics.$.feynman_passed"] = False
     else:
         # A failed first attempt owes one round of revision before the next try.
         updates["topics.$.checkpoint_attempts"] = (
@@ -1028,7 +1048,45 @@ async def apply_checkpoint(
         # learner to revise rather than straight back to the same questions.
         "needs_revision": not passed and not was_completed,
         "weak_points": [] if passed else (missed or []),
+        # Rungs granted for having explained the topic in your own words, so the
+        # client can show the reward landing rather than an unexplained date.
+        "feynman_bonus": feynman_bonus,
     }
+
+
+async def record_explanation(
+    roadmapId: str,
+    topicId: str,
+    user_id: str,
+    judgement: dict,
+    explanation: str,
+    passed: bool,
+) -> bool:
+    """Store a Feynman attempt on the topic.
+
+    `feynman_passed` is the ladder credit the next checkpoint spends. The
+    explanation itself is kept because it's the only record of how this learner
+    actually talks about the topic — worth more on a later read than the score.
+    """
+    try:
+        res = await get_db()["roadmaps"].update_one(
+            {"_id": ObjectId(roadmapId), "user_id": user_id, "topics.id": topicId},
+            {
+                "$set": {
+                    # Never cleared by a poor attempt: the exercise is optional and
+                    # trying again must not cost the learner credit they've earned.
+                    **({"topics.$.feynman_passed": True} if passed else {}),
+                    "topics.$.feynman_score": judgement.get("score"),
+                    "topics.$.feynman_at": datetime.now(timezone.utc).isoformat(),
+                    "topics.$.feynman_text": explanation,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("record_explanation error id=%s topic=%s: %s", roadmapId, topicId, e)
+        return False
 
 
 def revision_outstanding(topic: Optional[dict]) -> bool:
@@ -1127,13 +1185,26 @@ async def set_topic_resources(
 
 
 # ── quizzes ──────────────────────────────────────────────────────────────────
+def open_questions(questions: list[dict]) -> list[tuple[int, dict]]:
+    """The free-text questions in a set, with their positions."""
+    return [(i, q) for i, q in enumerate(questions) if q.get("kind") == "open"]
+
+
 def grade_quiz(questions: list[dict], selected: dict[int, int]) -> dict:
     """Score a submission against the stored questions. Shared by the chat path
     and POST /submit-quiz so the two can't grade the same answers differently.
-    `review` carries only what the learner got wrong, unanswered included."""
+    `review` carries only what the learner got wrong, unanswered included.
+
+    Open questions are skipped entirely — they have no options to have chosen
+    between, and an index-based grader would score every one of them wrong.
+    They're judged by an LLM alongside this, and their totals are kept apart so
+    a machine-graded sentence can't silently move a tap-graded pass mark.
+    """
     correct = 0
     review = []
     for idx, q in enumerate(questions):
+        if q.get("kind") == "open":
+            continue
         chosen = selected.get(idx)
         answer = q.get("answer")
         if chosen is not None and chosen == answer:
@@ -1153,10 +1224,14 @@ def grade_quiz(questions: list[dict], selected: dict[int, int]) -> dict:
             }
         )
 
+    # Over the closed questions only. Counting an open one in the denominator
+    # would score a flawless tap round at 2/3 — and against an all-or-nothing
+    # pass mark that makes the digest unmarkable, which jams the whole topic.
+    scored = sum(1 for q in questions if q.get("kind") != "open")
     return {
-        "total": len(questions),
+        "total": scored,
         "correct": correct,
-        "score": round(correct / len(questions) * 100) if questions else 0,
+        "score": round(correct / scored * 100) if scored else 0,
         "review": review,
     }
 
@@ -1214,6 +1289,7 @@ async def record_quiz_attempt(
     result: dict,
     questions: Optional[list[dict]] = None,
     kind: Optional[str] = None,
+    misses: Optional[list[dict]] = None,
 ) -> None:
     """Persist one graded attempt, including what was got wrong and why it was
     being asked.
@@ -1222,6 +1298,10 @@ async def record_quiz_attempt(
     stream of "62%" says a learner is struggling, but not at what — and "wrong on
     a digest recall check" means something different from "wrong on a
     spaced-repetition review of a topic they completed months ago".
+
+    Pass `misses` directly when there are no options to have chosen between — a
+    free-text answer or a whole explanation. Same shape either way, so one
+    analysis reads all of it.
     """
     try:
         await get_db()["quiz_attempts"].insert_one(
@@ -1235,7 +1315,11 @@ async def record_quiz_attempt(
                 "total": result.get("total"),
                 "correct": result.get("correct"),
                 "score": result.get("score"),
-                "misses": attempt_misses(questions or [], result),
+                "misses": (
+                    misses
+                    if misses is not None
+                    else attempt_misses(questions or [], result)
+                ),
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
         )

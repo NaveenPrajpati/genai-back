@@ -32,7 +32,10 @@ from app.agents.meal_planner import (
 from app.agents.supervisor import graph as supervisor_graph
 from app.mcp.meal_planner import mcp as meal_mcp
 from app.mcp.mount import guarded_app, session_lifespan
-from app.services.user_service import deactivate_expired_guests
+from app.services.user_service import (
+    deactivate_expired_guests,
+    drop_legacy_guest_ttl_index,
+)
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -57,10 +60,10 @@ async def lifespan(app: FastAPI):
     # 1. Initialize MongoDB
     try:
         await connect_db()
-        # NOTE: guests are now *deactivated* at expiry (not deleted), so we no
-        # longer create a TTL index on users.expires_at. If a previous deploy
-        # created one, drop it by hand or it will keep hard-deleting guests:
-        #   db.users.dropIndex("expires_at_1")
+        # Guests are *deactivated* at expiry (not deleted), so we no longer create
+        # a TTL index on users.expires_at — and we drop one left behind by an older
+        # deploy, since it would keep hard-deleting guests behind the sweep's back.
+        await drop_legacy_guest_ttl_index()
     except Exception as e:
         print(f"MongoDB connection failed (non-fatal): {e}")
 

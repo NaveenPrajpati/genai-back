@@ -6,12 +6,12 @@ from typing import Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from app.core.config import DIGEST_MAX_UNREAD
+from app.core.config import DIGEST_MAX_UNREAD, DIGEST_ONELINER_FROM
 from app.core.llm import llm
 from app.database import get_db
 from app.agents.trigger_store import due_triggers, mark_ran
 from app.services.push_service import send_push_notification
-from .service import build_digest_quiz, check_coverage
+from .service import build_digest_quiz, build_oneliner, check_coverage
 from .state import CoverageOutput, TopicTipsOutput
 from .repository import (
     DIGESTS,
@@ -188,6 +188,18 @@ async def build_digest(
     if digest_carries_quiz(sequence) and checked:
         try:
             built = await build_digest_quiz(topic_title, checked)
+            # From DIGEST_ONELINER_FROM on, one of the questions is answered in
+            # prose instead of tapped. Late rather than from the start: the habit
+            # forms on tap-only checks, and by the fourth digest there is enough
+            # material that a sentence is worth the keystroke. It's appended, so
+            # the tap questions keep their positions and their grading.
+            if sequence >= DIGEST_ONELINER_FROM:
+                try:
+                    built.quiz.append(await build_oneliner(topic_title, checked))
+                except Exception as e:
+                    # The tap questions are the gate; losing the sentence costs
+                    # signal, not the learner's ability to acknowledge the digest.
+                    logger.error("one-liner generation failed topic=%s: %s", topic_id, e)
             # An empty set is a legitimate outcome — the generator is told to
             # write nothing rather than ask about the provenance of a tip that
             # only points at a resource. It must not be attached: a digest whose

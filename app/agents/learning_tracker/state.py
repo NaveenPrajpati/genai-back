@@ -132,6 +132,14 @@ class TopicNode(BaseModel):
     # failure asks for a second round instead of being absorbed by the first.
     checkpoint_attempts: int = 0
     revisions_done: int = 0
+    # The optional "explain it in your own words" pass. `feynman_passed` is
+    # credit the next checkpoint spends on an extra rung of the review ladder;
+    # the text is kept because it is the only record of how this learner
+    # actually talks about the topic.
+    feynman_passed: bool = False
+    feynman_score: Optional[int] = Field(default=None, ge=0, le=100)
+    feynman_at: Optional[str] = None
+    feynman_text: Optional[str] = None
     # The questions missed on the most recent failed attempt, verbatim. What the
     # revision digest is written against — "re-teach this topic" would just
     # restate what the learner has already been sent and failed on.
@@ -163,8 +171,17 @@ class RoadmapOutput(BaseModel):
 
 class Question(BaseModel):
     question: str
-    options: list[str]
-    answer: int
+    # Empty on an `open` question: there is nothing to pick from. `answer` is
+    # then the reference response a judge grades against, not an index.
+    options: list[str] = Field(default_factory=list)
+    answer: int = 0
+    kind: Literal["choice", "open"] = "choice"
+    # What a good short answer contains. Only set on `open` questions — the
+    # grader reads it, the learner never does.
+    expected: Optional[str] = Field(
+        default=None,
+        description="For an open question: what a correct one-sentence answer must say",
+    )
     # What this question tests, and a nudge toward it. These are what a learner
     # sees when they get it wrong — the answer itself is never sent back on a
     # failure, or a retry is just transcription. Written at generation time so
@@ -220,6 +237,37 @@ class Misconception(BaseModel):
 
 class MisconceptionOutput(BaseModel):
     patterns: list[Misconception] = Field(default_factory=list)
+
+
+class OutcomeVerdict(BaseModel):
+    """How one learning outcome fared in a learner's own explanation."""
+
+    outcome: str
+    verdict: Literal["solid", "partial", "missing", "wrong"]
+    # What in their words supports this — quoted or closely paraphrased, so the
+    # judgement can be checked rather than taken on trust.
+    evidence: Optional[str] = None
+
+
+class ExplanationJudgement(BaseModel):
+    """An LLM's read of a learner explaining a topic in their own words.
+
+    The score is secondary. What this is really for is `misconceptions`: a wrong
+    multiple-choice answer says which of four options someone picked, while a
+    flawed explanation shows how they are thinking — the difference between
+    "chose B" and "believes a DataFrame copies on assignment".
+    """
+
+    score: int = Field(ge=0, le=100, description="How well the outcomes were covered")
+    outcomes: list[OutcomeVerdict] = Field(default_factory=list)
+    # Named back to the learner. Kept short and specific: this is the payoff for
+    # having typed or spoken something, and vague praise is no payoff.
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    # Beliefs the explanation reveals as wrong — the rich signal an MCQ can't give.
+    misconceptions: list[Misconception] = Field(default_factory=list)
+    # One or two sentences addressed to the learner.
+    feedback: str = ""
 
 
 class CheckpointOutcome(BaseModel):

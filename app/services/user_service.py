@@ -123,8 +123,8 @@ def _issue_tokens(
     user_id: str, is_guest: bool = False, token_version: int = 0
 ) -> tuple[str, str | None]:
     """Return (access_token, refresh_token). Guests get no refresh token — their
-    account is deleted after GUEST_TTL_HOURS, so a 30-day refresh token would
-    outlive it and is pointless."""
+    account is deactivated after GUEST_TTL_HOURS, so a 30-day refresh token would
+    outlive the usable account and is pointless."""
     access = create_access_token(user_id, is_guest=is_guest, token_version=token_version)
     refresh = None if is_guest else create_refresh_token(user_id, token_version)
     return access, refresh
@@ -498,6 +498,36 @@ async def update_expo_push_token(user_id: str, expo_push_token: str) -> dict | N
     if result.matched_count == 0:
         return None
     return await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
+
+
+async def drop_legacy_guest_ttl_index() -> str | None:
+    """Drop a leftover TTL index on users.expires_at, if one exists.
+
+    Guests used to be hard-deleted by a Mongo TTL index; they are now soft-expired
+    by deactivate_expired_guests. An index created by an older deploy survives the
+    code change and would keep deleting guest documents (and orphaning their data)
+    at the 24h mark, so remove it at startup. Only indexes that actually expire
+    documents are dropped — a plain index on expires_at is harmless and speeds up
+    the sweep query. Returns the dropped index name, or None if there was nothing
+    to drop. Best-effort: failures are logged, never fatal."""
+    col = _collection()
+    try:
+        async for index in col.list_indexes():
+            if index.get("key", {}).get("expires_at") is None:
+                continue
+            if "expireAfterSeconds" not in index:
+                continue
+            name = index["name"]
+            await col.drop_index(name)
+            logger.warning(
+                "dropped legacy TTL index %r on users.expires_at — guests are "
+                "soft-expired now, not deleted",
+                name,
+            )
+            return name
+    except Exception:
+        logger.exception("failed to check/drop legacy guest TTL index")
+    return None
 
 
 async def deactivate_expired_guests() -> int:
