@@ -64,6 +64,17 @@ def _patch_db(monkeypatch, col):
     return col
 
 
+def _cursor(docs=()):
+    """A cursor double answering every chain the reads use: `.find(...)` straight
+    to `to_list`, and through any of sort / skip / limit."""
+    cur = MagicMock()
+    cur.to_list = AsyncMock(return_value=[dict(d) for d in docs])
+    cur.sort.return_value = cur
+    cur.limit.return_value = cur
+    cur.skip.return_value = cur
+    return cur
+
+
 _OID = "507f1f77bcf86cd799439011"
 
 
@@ -1061,8 +1072,11 @@ async def test_passing_a_review_does_not_move_the_slot(monkeypatch):
 
 
 async def test_full_coverage_sends_the_topic_to_needs_review(monkeypatch):
-    """The drip-feed is done; the checkpoint is what completes it now."""
-    trig, _ = _digest_gen(monkeypatch)
+    """The drip-feed is done; the checkpoint is what completes it now.
+
+    From the second digest: the first is held by the floor so that every topic
+    carries at least one recall check — see `coverage_may_end`."""
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["already sent"]}])
     monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(True)))
     _fake_tips(monkeypatch, trig)
 
@@ -1187,7 +1201,7 @@ async def test_a_failed_quiz_generation_still_ships_the_digest(monkeypatch):
 
 # ── coverage ────────────────────────────────────────────────────────────────
 async def test_coverage_is_recorded_on_every_digest(monkeypatch):
-    trig, _ = _digest_gen(monkeypatch)
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["already sent"]}])
     monkeypatch.setattr(
         trig, "check_coverage", AsyncMock(return_value=repo_coverage(True, ["x"]))
     )
@@ -2305,7 +2319,8 @@ async def test_a_covered_topic_costs_nothing_to_decline(monkeypatch):
     tips call have been spent, and the learner receives a digest the topic
     didn't need — the drip-feed always overshoots by one."""
     trig, search = _digest_gen(
-        monkeypatch, prior=[{"bullets": ["a"], "coverage_complete": True}]
+        monkeypatch,
+        prior=[{"bullets": ["a"]}, {"bullets": ["b"], "coverage_complete": True}],
     )
     tips = AsyncMock()
     monkeypatch.setattr(trig, "check_coverage", tips)
@@ -2336,12 +2351,16 @@ async def test_a_stored_not_covered_verdict_is_trusted_too(monkeypatch):
 
 
 async def test_a_digest_written_before_the_field_existed_is_re_checked(monkeypatch):
-    trig, search = _digest_gen(monkeypatch, prior=[{"bullets": ["a"]}])
-    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(True)))
+    trig, search = _digest_gen(
+        monkeypatch, prior=[{"bullets": ["a"]}, {"bullets": ["b"]}]
+    )
+    coverage = AsyncMock(return_value=repo_coverage(True))
+    monkeypatch.setattr(trig, "check_coverage", coverage)
 
     out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
 
     assert out is None
+    coverage.assert_awaited()  # re-derived rather than trusted
     search.ainvoke.assert_not_awaited()
 
 
@@ -2906,3 +2925,936 @@ async def test_a_failed_quiz_rebuild_still_ships_the_new_explanation(monkeypatch
 
     out = await trig.escalate_to_reteach("userA", _OID, "t1", "Q2")
     assert out is not None and out["bullets"] == ["a different angle"]
+
+
+# --------------------------------------------------------------------------- #
+# what a question looks like on the way out
+# --------------------------------------------------------------------------- #
+def test_a_question_leaves_without_its_answer_but_with_its_kind():
+    """`kind` is not decoration: an `open` question has no options, and a client
+    that can't tell the two apart waits for a tap that has nowhere to land — the
+    digest then can't be marked, and an unmarkable digest jams the topic."""
+    out = repo.public_question(
+        {
+            "question": "Why?",
+            "options": [],
+            "kind": "open",
+            "answer": 0,
+            "expected": "because …",
+            "hint": "re-read the second tip",
+            "outcome": "explains why",
+        }
+    )
+    assert out == {"question": "Why?", "options": [], "kind": "open"}
+
+
+def test_a_question_with_no_kind_reads_as_multiple_choice():
+    assert repo.public_question({"question": "q", "options": ["a", "b"]})["kind"] == "choice"
+
+
+async def test_the_check_on_a_listed_digest_keeps_its_kind(monkeypatch):
+    """The read path is how a digest is answered after a reload, so a written
+    question that arrives looking like a tap question can never be completed."""
+    digest_col, quiz_col = _collection(), _collection()
+    digest_col.find = MagicMock(
+        return_value=MagicMock(
+            sort=lambda *_: MagicMock(
+                limit=lambda *_: MagicMock(
+                    to_list=AsyncMock(
+                        return_value=[{"_id": _OID, "roadmapId": "r1", "quizId": _OID}]
+                    )
+                )
+            )
+        )
+    )
+    quiz_col.find = MagicMock(
+        return_value=MagicMock(
+            to_list=AsyncMock(
+                return_value=[
+                    {
+                        "_id": ObjectId(_OID),
+                        "questions": [
+                            {"question": "tap", "options": ["a", "b"], "answer": 1},
+                            {
+                                "question": "say why",
+                                "options": [],
+                                "kind": "open",
+                                "expected": "because …",
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+    )
+    roadmap_col = _collection()
+    roadmap_col.find = MagicMock(return_value=MagicMock(to_list=AsyncMock(return_value=[])))
+    monkeypatch.setattr(
+        repo,
+        "get_db",
+        lambda: {repo.DIGESTS: digest_col, "quizzes": quiz_col, "roadmaps": roadmap_col},
+    )
+
+    quiz = (await repo.list_digests("userA"))[0]["quiz"]
+
+    assert [q["kind"] for q in quiz] == ["choice", "open"]
+    # And nothing that would let the learner answer without reading.
+    assert not any("answer" in q or "expected" in q for q in quiz)
+
+
+async def test_a_freshly_generated_digest_does_not_ship_the_answer_key(monkeypatch):
+    """POST /digests/generate skips the read projection, so the check used to be
+    issued and given away in the same response."""
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["earlier"]}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+    monkeypatch.setattr(trig, "build_digest_quiz", AsyncMock(return_value=_quiz_output()))
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out["quiz"] and all(
+        set(q) == {"question", "options", "kind"} for q in out["quiz"]
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the drip-feed's own numbering
+# --------------------------------------------------------------------------- #
+def test_revision_and_reteach_sit_outside_the_sequence():
+    history = [
+        {"sequence": 1},
+        {"sequence": 2},
+        {"kind": "reteach", "sequence": None},
+        {"kind": "revision", "sequence": None},
+    ]
+    assert [d["sequence"] for d in repo.teaching_digests(history)] == [1, 2]
+
+
+async def test_a_reteach_does_not_take_the_next_digests_number(monkeypatch):
+    """It re-explains ground already sent. Counting it would move where the
+    recall checks fall for everything after it — the cadence the whole gate is
+    indexed on."""
+    trig, _ = _digest_gen(
+        monkeypatch,
+        prior=[
+            {"sequence": 1, "bullets": ["one"]},
+            {"kind": "reteach", "sequence": None, "bullets": ["said differently"]},
+        ],
+    )
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False)))
+    _fake_tips(monkeypatch, trig)
+    monkeypatch.setattr(trig, "build_digest_quiz", AsyncMock(return_value=_quiz_output()))
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out["sequence"] == 2
+
+
+def test_the_gate_points_at_the_check_that_is_actually_outstanding():
+    """With a re-teach in the history, counting positions instead of the
+    drip-feed asked about the wrong digest — or let #4 through unchecked."""
+    history = [
+        {"sequence": 1, "status": "marked"},
+        {"sequence": 2, "status": "unread"},  # carries the check
+        {"kind": "reteach", "sequence": None, "status": "marked"},
+        {"sequence": 3, "status": "marked"},
+    ]
+    assert repo.digest_quiz_gate(history) == 2
+
+    history[1]["status"] = "marked"
+    assert repo.digest_quiz_gate(history) is None
+
+
+# --------------------------------------------------------------------------- #
+# a checkpoint set is sat once
+# --------------------------------------------------------------------------- #
+async def test_a_graded_set_is_recognised(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    col.count_documents = AsyncMock(return_value=1)
+
+    assert await repo.quiz_graded("userA", _OID) is True
+    # Scoped to the caller, or one learner's attempt would close another's quiz.
+    assert col.count_documents.await_args.args[0]["user_id"] == "userA"
+
+
+async def test_an_ungraded_set_can_still_be_sat(monkeypatch):
+    col = _patch_db(monkeypatch, _collection())
+    col.count_documents = AsyncMock(return_value=0)
+    assert await repo.quiz_graded("userA", _OID) is False
+
+
+async def test_an_unreadable_history_refuses_the_re_grade(monkeypatch):
+    """Fails closed: the alternative is a free re-run of a set whose misses the
+    learner has already been shown, which is the completion gate opened from the
+    outside."""
+    col = _patch_db(monkeypatch, _collection())
+    col.count_documents = AsyncMock(side_effect=RuntimeError("mongo down"))
+    assert await repo.quiz_graded("userA", _OID) is True
+
+
+# --------------------------------------------------------------------------- #
+# what a roadmap owed revision offers
+# --------------------------------------------------------------------------- #
+_OWED = {"id": "t1", "order": 1, "title": "Ownership", "progress_status": "needs_review",
+         "checkpoint_attempts": 1, "revisions_done": 0}
+
+
+async def test_a_leftover_teaching_digest_is_not_the_revision_they_are_owed(monkeypatch):
+    """`can_generate` has to say what pressing the button would actually do —
+    and what it produces here is the revision digest, which doesn't exist yet."""
+    _focus_db(
+        monkeypatch,
+        roadmap={"_id": _OID, "title": "Rust", "topics": [_OWED]},
+        trigger=_ENABLED_TRIGGER,
+        digests=[{"status": "unread", "sequence": 3}],
+    )
+    focus = await _focus_one()
+
+    assert focus["blocked_reason"] == "needs_revision"
+    assert focus["can_generate"] is True
+
+
+async def test_revision_tips_already_waiting_are_not_generated_twice(monkeypatch):
+    _focus_db(
+        monkeypatch,
+        roadmap={"_id": _OID, "title": "Rust", "topics": [_OWED]},
+        trigger=_ENABLED_TRIGGER,
+        digests=[{"status": "unread", "kind": "revision"}],
+    )
+    assert (await _focus_one())["can_generate"] is False
+
+
+# --------------------------------------------------------------------------- #
+# the written answer, end to end
+#
+# Until the read projection carried `kind`, no client could tell an open question
+# from a tap one, so `written` was never sent and this whole path — the gate, the
+# grader, the attempt it files — had never executed. These drive it through the
+# real route, with only Mongo and the judge faked.
+# --------------------------------------------------------------------------- #
+def _mark_client(monkeypatch, *, questions, judgement=None, digest=None):
+    """POST /learning/digests/{id}/mark against the real router.
+
+    TestClient runs background tasks before returning, so `_record_written_answer`
+    actually executes here rather than being asserted at second hand.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_current_user
+    from app.routers import learning_tracker as route
+
+    _chain = _cursor
+    digests, quizzes, attempts, roadmaps = (_collection() for _ in range(4))
+    digests.find_one = AsyncMock(
+        return_value={
+            "_id": ObjectId(_OID),
+            "user_id": "u1",
+            "roadmapId": _OID,
+            "topicId": "t1",
+            "topicTitle": "Ownership",
+            "quizId": _OID,
+            "sequence": 4,
+            "status": "unread",
+            **(digest or {}),
+        }
+    )
+    digests.find = MagicMock(return_value=_chain([]))
+    quizzes.find_one = AsyncMock(
+        return_value={"_id": ObjectId(_OID), "user_id": "u1", "questions": questions}
+    )
+    roadmaps.find_one = AsyncMock(
+        return_value={"_id": ObjectId(_OID), "topics": [_started()]}
+    )
+    roadmaps.find = MagicMock(return_value=_chain([]))
+    monkeypatch.setattr(
+        repo,
+        "get_db",
+        lambda: {
+            repo.DIGESTS: digests,
+            "quizzes": quizzes,
+            "quiz_attempts": attempts,
+            "roadmaps": roadmaps,
+        },
+    )
+
+    from app.agents.learning_tracker.state import ExplanationJudgement
+
+    graded = AsyncMock(
+        return_value=judgement or ExplanationJudgement(score=20, feedback="not quite")
+    )
+    monkeypatch.setattr(route, "grade_oneliner", graded)
+    refreshed = AsyncMock()
+    monkeypatch.setattr(route, "refresh_misconceptions", refreshed)
+
+    app = FastAPI()
+    app.include_router(route.router)
+    app.dependency_overrides[get_current_user] = lambda: {"uid": "u1"}
+    return TestClient(app), {
+        "graded": graded,
+        "refreshed": refreshed,
+        "attempts": attempts,
+        "digests": digests,
+    }
+
+
+_TAP = {"question": "Which is it?", "options": ["a", "b"], "answer": 1, "kind": "choice"}
+_OPEN = {
+    "question": "Say why in your own words",
+    "options": [],
+    "kind": "open",
+    "answer": 0,
+    "expected": "because the value moves",
+}
+
+
+def test_a_written_answer_reaches_the_grader_with_what_it_should_convey(monkeypatch):
+    """`expected` never leaves the server, so the grader has to be handed it here
+    — without it the judge marks a sentence against nothing."""
+    client, spy = _mark_client(monkeypatch, questions=[_TAP, _OPEN])
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        # Keyed by position, as JSON — which makes the keys strings on the wire.
+        json={"answers": [{"question": 0, "answer": 1}], "written": {"1": "it moves"}},
+    )
+
+    assert res.status_code == 200
+    question, expected, answer = spy["graded"].await_args.args
+    assert question == "Say why in your own words"
+    assert expected == "because the value moves"
+    assert answer == "it moves"
+
+
+def test_a_wrong_sentence_is_filed_as_evidence_not_as_a_refusal(monkeypatch):
+    """The taps are the gate. A wrong sentence still marks the digest — and still
+    reaches the misconception tracker, which is the reason for asking."""
+    client, spy = _mark_client(monkeypatch, questions=[_TAP, _OPEN])
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        json={"answers": [{"question": 0, "answer": 1}], "written": {"1": "no idea"}},
+    )
+
+    assert res.status_code == 200
+    spy["digests"].update_one.assert_awaited()  # marked despite the wrong answer
+
+    attempt = spy["attempts"].insert_one.await_args.args[0]
+    assert attempt["kind"] == "written"
+    assert attempt["score"] == 20
+    assert attempt["correct"] == 0
+    # Their sentence next to what the question wanted — richer evidence than any
+    # distractor index, which is the whole point of asking in prose.
+    assert attempt["misses"] == [
+        {
+            "question": "Say why in your own words",
+            "chosen": "no idea",
+            "correct": "because the value moves",
+        }
+    ]
+    spy["refreshed"].assert_awaited()
+
+
+def test_a_good_sentence_files_no_miss(monkeypatch):
+    from app.agents.learning_tracker.state import ExplanationJudgement
+
+    client, spy = _mark_client(
+        monkeypatch,
+        questions=[_TAP, _OPEN],
+        judgement=ExplanationJudgement(score=90, feedback="yes"),
+    )
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        json={
+            "answers": [{"question": 0, "answer": 1}],
+            "written": {"1": "because the value moves"},
+        },
+    )
+
+    assert res.status_code == 200
+    attempt = spy["attempts"].insert_one.await_args.args[0]
+    assert attempt["correct"] == 1 and attempt["misses"] == []
+    spy["refreshed"].assert_not_awaited()  # nothing to diagnose
+
+
+def test_a_blank_sentence_is_refused_and_the_digest_stays_unread(monkeypatch):
+    """A blank is noise in the tracker rather than a reading of how someone
+    thinks, so it has to be attempted — and the mark can't slip through anyway."""
+    client, spy = _mark_client(monkeypatch, questions=[_TAP, _OPEN])
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        json={"answers": [{"question": 0, "answer": 1}], "written": {"1": "   "}},
+    )
+
+    assert res.status_code == 422
+    assert res.json()["detail"]["blocked_reason"] == "written_answer_required"
+    spy["digests"].update_one.assert_not_awaited()
+    spy["graded"].assert_not_awaited()
+
+
+def test_failing_the_taps_stops_before_the_sentence_is_read(monkeypatch):
+    """The recall check is the gate; grading a sentence for a learner who is
+    being sent back anyway spends a model call on nothing."""
+    client, spy = _mark_client(monkeypatch, questions=[_TAP, _OPEN])
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        json={"answers": [{"question": 0, "answer": 0}], "written": {"1": "it moves"}},
+    )
+
+    assert res.status_code == 422
+    assert res.json()["detail"]["quiz_result"]["score"] == 0
+    spy["graded"].assert_not_awaited()
+    spy["digests"].update_one.assert_not_awaited()
+
+
+def test_a_check_with_nothing_to_tap_still_collects_the_sentence(monkeypatch):
+    """An all-open set scores 0 against a pass mark of 100, so it can't be gated
+    on — but the sentence is evidence and still has to be asked for."""
+    client, spy = _mark_client(monkeypatch, questions=[_OPEN])
+
+    blank = client.post(
+        f"/learning/digests/{_OID}/mark", json={"answers": [], "written": {}}
+    )
+    assert blank.status_code == 422
+
+    res = client.post(
+        f"/learning/digests/{_OID}/mark",
+        json={"answers": [], "written": {"0": "it moves"}},
+    )
+    assert res.status_code == 200
+    assert res.json()["result"]["quiz_result"] is None  # nothing was gated on
+    spy["graded"].assert_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# the HTTP surface
+#
+# Everything above tests the repository and the agent. These go through the
+# router itself, because that is where the refusals live: the gates on issuing
+# and grading a checkpoint, the ownership checks on resuming a paused run, and
+# the shape of what leaves the server. A gate that is correct in the repository
+# and unreachable — or bypassable — through the route is not a gate.
+# --------------------------------------------------------------------------- #
+class _DB(dict):
+    """A database double. A collection nobody set up answers empty rather than
+    raising, so a test only has to describe the state it actually cares about."""
+
+    def __missing__(self, name):
+        col = _collection()
+        col.find = MagicMock(return_value=_cursor())
+        col.count_documents = AsyncMock(return_value=0)
+        self[name] = col
+        return col
+
+
+def _api(monkeypatch, db=None, user="u1", agent=None):
+    """The learning router, wired to a fake database and an authenticated caller.
+
+    Both `get_db`s are patched: the repository reads through its own, and the
+    router reaches for quizzes and triggers through the one imported into it.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_current_user
+    from app.routers import learning_tracker as route
+
+    db = db if db is not None else _DB()
+    monkeypatch.setattr(repo, "get_db", lambda: db)
+    monkeypatch.setattr(route, "get_db", lambda: db)
+
+    app = FastAPI()
+    app.include_router(route.router)
+    app.state.learning_agent = agent or MagicMock()
+    app.dependency_overrides[get_current_user] = lambda: {"uid": user}
+    return TestClient(app), db, route
+
+
+def _quizzes(*docs):
+    """A quizzes collection that honours the filters the router actually sends —
+    `_id` and `kind` — so "which set comes back" is answered by the query rather
+    than by the double."""
+    col = _collection()
+
+    async def find_one(filt, *a, **kw):
+        for d in docs:
+            kinds = (filt.get("kind") or {}).get("$in") if isinstance(filt.get("kind"), dict) else None
+            if kinds and d.get("kind") not in kinds:
+                continue
+            if "_id" in filt and str(d["_id"]) != str(filt["_id"]):
+                continue
+            return dict(d)
+        return None
+
+    col.find_one = AsyncMock(side_effect=find_one)
+    col.find = MagicMock(return_value=_cursor(docs))
+    col.insert_one = AsyncMock(return_value=MagicMock(inserted_id=ObjectId(_OID)))
+    return col
+
+
+_Q = {"question": "Which is it?", "options": ["a", "b"], "answer": 1,
+      "kind": "choice", "outcome": "tells them apart", "hint": "re-read the second tip"}
+
+
+def _roadmap_doc(topic=None, **over):
+    return {
+        "_id": ObjectId(_OID),
+        "user_id": "u1",
+        "title": "Rust",
+        "status": "active",
+        "topics": [topic or {"id": "t1", "order": 1, "title": "Ownership",
+                             "description": "…", "learning_outcomes": ["moves"],
+                             "progress_status": "needs_review"}],
+        **over,
+    }
+
+
+def _issue_env(monkeypatch, *, quizzes, topic=None, attempts=(), generated=None):
+    from app.agents.learning_tracker.state import Question, QuizOutput
+
+    db = _DB()
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc(topic))
+    db["quizzes"] = quizzes
+    db["quiz_attempts"].find = MagicMock(return_value=_cursor(attempts))
+    client, db, route = _api(monkeypatch, db)
+    monkeypatch.setattr(route, "get_profile", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        route,
+        "build_checkpoint",
+        AsyncMock(
+            return_value=generated
+            or QuizOutput(quiz=[Question(question="fresh one", options=["a", "b"], answer=0)])
+        ),
+    )
+    return client, db, route
+
+
+def _checkpoint(topicId="t1"):
+    return {"_id": ObjectId(_OID), "user_id": "u1", "roadmapId": _OID,
+            "topicId": topicId, "kind": "checkpoint", "questions": [_Q]}
+
+
+# ── issuing a checkpoint ────────────────────────────────────────────────────
+def test_a_digest_check_is_never_handed_back_as_the_checkpoint(monkeypatch):
+    """The newest quiz on a topic is just as often the digest's recall check —
+    two questions about last week's tips. Completing a topic with it would make
+    the gate meaningless."""
+    digest_check = {"_id": ObjectId(_OID), "user_id": "u1", "roadmapId": _OID,
+                    "topicId": "t1", "kind": "digest", "questions": [_Q]}
+    client, _, route = _issue_env(monkeypatch, quizzes=_quizzes(digest_check))
+
+    res = client.post(f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID})
+
+    assert res.status_code == 200
+    # A fresh set was generated instead of the digest's being reused.
+    route.build_checkpoint.assert_awaited()
+    assert [q["question"] for q in res.json()["result"]["questions"]] == ["fresh one"]
+
+
+def test_a_chat_quiz_is_not_a_checkpoint_either(monkeypatch):
+    """`tutor_agent` stamps quizzes raised in chat with the topic underway and no
+    kind at all."""
+    chat_quiz = {"_id": ObjectId(_OID), "user_id": "u1", "roadmapId": _OID,
+                 "topicId": "t1", "questions": [_Q]}
+    client, _, route = _issue_env(monkeypatch, quizzes=_quizzes(chat_quiz))
+
+    res = client.post(f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID})
+
+    assert res.status_code == 200
+    route.build_checkpoint.assert_awaited()
+
+
+def test_an_unfinished_checkpoint_is_resumed_rather_than_regenerated(monkeypatch):
+    """Reopening the app mid-attempt is not a retry, and regenerating would cost
+    an LLM call to replace a set they were halfway through."""
+    client, _, route = _issue_env(monkeypatch, quizzes=_quizzes(_checkpoint()))
+
+    res = client.post(f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID})
+
+    assert res.status_code == 200
+    route.build_checkpoint.assert_not_awaited()
+    assert res.json()["result"]["quizId"] == _OID
+
+
+def test_an_issued_set_leaves_without_its_answers(monkeypatch):
+    """Grading is server-side; a set that ships its own key grades itself."""
+    client, _, _ = _issue_env(monkeypatch, quizzes=_quizzes(_checkpoint()))
+
+    questions = client.post(
+        f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID}
+    ).json()["result"]["questions"]
+
+    assert questions and all(set(q) == {"question", "options"} for q in questions)
+
+
+def test_a_topic_owed_revision_is_refused_a_retry(monkeypatch):
+    """Without this, "retry" is re-rolling the same questions until they land by
+    accident."""
+    owed = {"id": "t1", "order": 1, "title": "Ownership", "description": "…",
+            "progress_status": "needs_review", "checkpoint_attempts": 1,
+            "revisions_done": 0, "weak_points": ["what moves on assignment"]}
+    client, _, route = _issue_env(monkeypatch, quizzes=_quizzes(), topic=owed)
+
+    res = client.post(f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID})
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["blocked_reason"] == "needs_revision"
+    # Named, so "go and revise" is something the learner can act on.
+    assert detail["weak_points"] == ["what moves on assignment"]
+    route.build_checkpoint.assert_not_awaited()  # refused before any spend
+
+
+def test_the_daily_cap_is_refused_before_anything_is_generated(monkeypatch):
+    from datetime import datetime, timezone
+
+    from app.core.config import CHECKPOINT_MAX_ATTEMPTS_PER_DAY as CAP
+
+    now = datetime.now(timezone.utc).isoformat()
+    client, _, route = _issue_env(
+        monkeypatch,
+        quizzes=_quizzes(),
+        attempts=[{"createdAt": now, "score": 10, "quizId": "old"} for _ in range(CAP)],
+    )
+
+    res = client.post(f"/learning/topics/t1/checkpoint", json={"roadmapId": _OID})
+
+    assert res.status_code == 429
+    detail = res.json()["detail"]
+    assert detail["blocked_reason"] == "daily_limit"
+    assert detail["retry_at"] and detail["limit"] == CAP
+    # Refusing after paying for the call would burn it and still refuse.
+    route.build_checkpoint.assert_not_awaited()
+
+
+def test_a_missing_topic_is_a_404(monkeypatch):
+    client, _, _ = _issue_env(monkeypatch, quizzes=_quizzes())
+    res = client.post("/learning/topics/nope/checkpoint", json={"roadmapId": _OID})
+    assert res.status_code == 404
+
+
+# ── grading a checkpoint ────────────────────────────────────────────────────
+def _submit_env(monkeypatch, *, already_graded=False, topic=None):
+    db = _DB()
+    db["quizzes"] = _quizzes(_checkpoint())
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc(topic))
+    db["quiz_attempts"].count_documents = AsyncMock(return_value=1 if already_graded else 0)
+    client, db, route = _api(monkeypatch, db)
+    monkeypatch.setattr(route, "refresh_misconceptions", AsyncMock())
+    return client, db, route
+
+
+def test_a_set_cannot_be_graded_twice(monkeypatch):
+    """The cooldown and the daily cap are enforced where a set is issued. Without
+    this the learner re-posts the same quizId with the misses they were just
+    shown, and walks past both — and past the revision a failure owes."""
+    client, db, _ = _submit_env(monkeypatch, already_graded=True)
+
+    res = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    )
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["blocked_reason"] == "already_graded"
+    db["quiz_attempts"].insert_one.assert_not_awaited()
+    db["roadmaps"].update_one.assert_not_awaited()  # nothing was applied
+
+
+def test_a_failure_returns_the_hint_and_never_the_answer(monkeypatch):
+    """Handing back `correctOption` on a failure turns the retry into
+    transcription, which is exactly what a completion gate must not allow."""
+    client, _, _ = _submit_env(monkeypatch)
+
+    result = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 0}]},
+    ).json()["result"]
+
+    assert result["passed"] is False
+    assert result["answers_revealed"] is False
+    miss = result["review"][0]
+    assert "correctAnswer" not in miss and "correctOption" not in miss
+    assert miss["hint"] == "re-read the second tip"
+    assert miss["outcome"] == "tells them apart"
+    # The failure opened a revision debt, and says so — the client needs it to
+    # stop offering a retry the server will refuse.
+    assert result["needs_revision"] is True
+    assert result["weak_points"] == ["Which is it?"]
+
+
+def test_passing_completes_the_topic_and_returns_the_answers(monkeypatch):
+    client, _, _ = _submit_env(monkeypatch)
+
+    result = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    ).json()["result"]
+
+    assert result["passed"] is True
+    assert result["progress_status"] == "completed"
+    assert result["answers_revealed"] is True
+    assert result["next_review_at"]
+
+
+def test_a_chat_quiz_cannot_be_submitted_as_a_checkpoint(monkeypatch):
+    """It has no topic to attach a result to."""
+    db = _DB()
+    db["quizzes"] = _quizzes({"_id": ObjectId(_OID), "user_id": "u1", "questions": [_Q]})
+    client, _, _ = _api(monkeypatch, db)
+
+    res = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    )
+    assert res.status_code == 404
+
+
+# ── resuming someone else's paused run ──────────────────────────────────────
+def _snapshot(user_id="u1", nxt=("roadmap_agent",)):
+    snap = MagicMock()
+    snap.next = nxt
+    snap.values = {"user_id": user_id}
+    return snap
+
+
+def test_an_approval_cannot_be_resolved_by_another_learner(monkeypatch):
+    """thread_ids are guessable; approving on someone else's thread would save a
+    roadmap into their account — or reject one out of it."""
+    agent = MagicMock()
+    agent.aget_state = AsyncMock(return_value=_snapshot())
+    agent.ainvoke = AsyncMock(return_value={})
+    client, _, route = _api(monkeypatch, agent=agent)
+    monkeypatch.setattr(
+        route, "get_pending", AsyncMock(return_value={"user_id": "someone-else"})
+    )
+
+    res = client.post(
+        "/learning/approvals", json={"thread_id": "t", "decision": "approved"}
+    )
+
+    assert res.status_code == 403
+    agent.ainvoke.assert_not_awaited()
+
+
+def test_an_approval_that_no_longer_exists_is_a_404(monkeypatch):
+    client, _, route = _api(monkeypatch)
+    monkeypatch.setattr(route, "get_pending", AsyncMock(return_value=None))
+
+    res = client.post(
+        "/learning/approvals", json={"thread_id": "t", "decision": "approved"}
+    )
+    assert res.status_code == 404
+
+
+def test_onboarding_answers_cannot_be_posted_into_another_learners_thread(monkeypatch):
+    """Onboarding raises no approval row, so the checkpointed user_id is the only
+    identity the graph actually ran under."""
+    agent = MagicMock()
+    agent.aget_state = AsyncMock(return_value=_snapshot(user_id="someone-else"))
+    agent.ainvoke = AsyncMock(return_value={})
+    client, _, _ = _api(monkeypatch, agent=agent)
+
+    res = client.post(
+        "/learning/onboarding", json={"thread_id": "t", "answers": {"skill_level": "advanced"}}
+    )
+
+    assert res.status_code == 403
+    agent.ainvoke.assert_not_awaited()
+
+
+def test_nothing_waiting_on_a_thread_is_a_404(monkeypatch):
+    agent = MagicMock()
+    agent.aget_state = AsyncMock(return_value=_snapshot(nxt=()))
+    client, _, _ = _api(monkeypatch, agent=agent)
+
+    res = client.post("/learning/onboarding", json={"thread_id": "t", "answers": None})
+    assert res.status_code == 404
+
+
+# ── what else the routes refuse, and what they hand back ────────────────────
+def test_a_topic_cannot_be_completed_by_asserting_it(monkeypatch):
+    """Completion is earned by passing the checkpoint, or a finished roadmap means
+    something was tapped rather than recalled."""
+    client, db, _ = _api(monkeypatch)
+
+    res = client.post(
+        "/learning/progress",
+        json={"roadmapId": _OID, "topicId": "t1", "status": "completed"},
+    )
+
+    assert res.status_code == 409
+    db["roadmaps"].update_one.assert_not_awaited()
+
+
+def test_reopening_a_topic_stays_free(monkeypatch):
+    """The gate is on claiming knowledge, not on retracting it."""
+    db = _DB()
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc())
+    client, _, _ = _api(monkeypatch, db)
+
+    res = client.post(
+        "/learning/progress",
+        json={"roadmapId": _OID, "topicId": "t1", "status": "not_started"},
+    )
+    assert res.status_code == 200 and res.json()["progress_status"] == "not_started"
+
+
+def test_the_misconception_report_withholds_how_it_will_be_probed(monkeypatch):
+    """A learner who reads `probe` knows what the next question is coming for."""
+    db = _DB()
+    db[repo.MISCONCEPTIONS].find = MagicMock(
+        return_value=_cursor(
+            [{"roadmapId": _OID, "topicId": "t1", "misses_analyzed": 4,
+              "patterns": [{"label": "moves vs copies", "detail": "…",
+                            "probe": "ask what the old binding holds"}]}]
+        )
+    )
+    client, _, _ = _api(monkeypatch, db)
+
+    patterns = client.get("/learning/misconceptions").json()["result"][0]["patterns"]
+
+    assert patterns[0]["label"] == "moves vs copies"
+    assert "probe" not in patterns[0]
+
+
+def test_an_explanation_withholds_the_probe_too(monkeypatch):
+    """Same rule on the way out of the Feynman judge, which returns the same
+    Misconception shape."""
+    from app.agents.learning_tracker.state import ExplanationJudgement, Misconception
+
+    db = _DB()
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc())
+    client, _, route = _api(monkeypatch, db)
+    monkeypatch.setattr(route, "refresh_misconceptions", AsyncMock())
+    monkeypatch.setattr(
+        route,
+        "judge_explanation",
+        AsyncMock(
+            return_value=ExplanationJudgement(
+                score=80,
+                feedback="clear",
+                misconceptions=[
+                    Misconception(label="moves vs copies", detail="…",
+                                  probe="ask what the old binding holds")
+                ],
+            )
+        ),
+    )
+
+    result = client.post(
+        f"/learning/topics/t1/explain",
+        json={"roadmapId": _OID, "text": " ".join(["word"] * 40)},
+    ).json()["result"]
+
+    assert result["passed"] is True and result["ladder_bonus"]
+    assert "probe" not in result["misconceptions"][0]
+
+
+def test_too_few_words_are_refused_rather_than_scored(monkeypatch):
+    """Graded, this would produce a confident verdict about nothing and store it
+    as evidence."""
+    from app.core.config import FEYNMAN_MIN_WORDS
+
+    db = _DB()
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc())
+    client, _, route = _api(monkeypatch, db)
+    monkeypatch.setattr(route, "judge_explanation", AsyncMock())
+
+    res = client.post(
+        f"/learning/topics/t1/explain", json={"roadmapId": _OID, "text": "it moves"}
+    )
+
+    assert res.status_code == 422
+    assert res.json()["detail"]["min_words"] == FEYNMAN_MIN_WORDS
+    route.judge_explanation.assert_not_awaited()
+
+
+def test_resuming_past_the_cap_names_what_is_holding_the_slots(monkeypatch):
+    """The learner has to park one, and it isn't the server's call which."""
+    from app.core.config import MAX_ACTIVE_ROADMAPS as CAP
+
+    db = _DB()
+    # Distinct ids: activating an already-active roadmap excludes itself from the
+    # count, so holders sharing the id under test would read as a free slot.
+    db["roadmaps"].find = MagicMock(
+        return_value=_cursor(
+            [{"_id": ObjectId(), "title": f"Running {i}"} for i in range(CAP)]
+        )
+    )
+    client, _, _ = _api(monkeypatch, db)
+
+    res = client.patch(f"/learning/roadmaps/{_OID}", json={"status": "active"})
+
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["limit"] == CAP
+    assert [r["title"] for r in detail["active"]] == [f"Running {i}" for i in range(CAP)]
+
+
+# --------------------------------------------------------------------------- #
+# the floor under the drip-feed
+#
+# A live run turned this up: a two-outcome topic was declared covered by its very
+# first digest, so the topic went straight to the checkpoint — and the recall
+# check rides the SECOND digest, which meant it never had one. Acknowledging that
+# topic's only digest meant "dismissed", not "read", and neither the written
+# question nor the re-teach path could ever fire.
+# --------------------------------------------------------------------------- #
+def test_coverage_cannot_end_the_feed_before_the_first_check():
+    from app.core.config import DIGEST_MIN_BEFORE_CHECKPOINT as FLOOR
+
+    assert repo.coverage_may_end(FLOOR - 1) is False
+    assert repo.coverage_may_end(FLOOR) is True
+    # The guarantee the floor exists for: it is never below the check cadence, or
+    # a topic could still reach the checkpoint without one.
+    from app.core.config import DIGEST_QUIZ_EVERY
+
+    assert FLOOR >= DIGEST_QUIZ_EVERY
+
+
+async def test_a_narrow_topic_still_gets_its_recall_check(monkeypatch):
+    """Covered on the first digest is a correct answer to the wrong question."""
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(True)))
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out is not None and out["sequence"] == 1
+    # Held, not lost: the topic stays underway so the next digest — the one that
+    # carries the check — can still be generated.
+    trig.set_topic_progress.assert_not_awaited()
+    # And the card must not offer the checkpoint while the server intends to send
+    # one more, or the two disagree on screen.
+    assert out["coverage_complete"] is False
+
+
+async def test_the_floor_lets_go_once_the_check_has_been_sent(monkeypatch):
+    trig, _ = _digest_gen(monkeypatch, prior=[{"bullets": ["the first digest"]}])
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(True)))
+    _fake_tips(monkeypatch, trig)
+    monkeypatch.setattr(trig, "build_digest_quiz", AsyncMock(return_value=_quiz_output()))
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out["sequence"] == 2
+    assert out["quizId"]  # the check the floor was bought for
+    assert out["coverage_complete"] is True
+    assert trig.set_topic_progress.await_args.args[2] == "needs_review"
+
+
+async def test_the_floor_does_not_hold_a_topic_that_is_still_being_taught(monkeypatch):
+    """It delays the handover; it never invents extra digests once coverage is
+    genuinely incomplete — that path is unchanged."""
+    trig, _ = _digest_gen(monkeypatch)
+    monkeypatch.setattr(trig, "check_coverage", AsyncMock(return_value=repo_coverage(False, ["x"])))
+    _fake_tips(monkeypatch, trig)
+
+    out = await trig.build_digest("userA", {"_id": _OID, "topics": [_started()]}, notify=False)
+
+    assert out["coverage_complete"] is False and out["missing_outcomes"] == ["x"]
+    trig.set_topic_progress.assert_not_awaited()

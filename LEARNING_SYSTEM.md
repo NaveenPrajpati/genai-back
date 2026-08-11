@@ -35,6 +35,7 @@ app/agents/learning_tracker/
 | **Reading is checked** | Every other digest carries a recall check over the ones since the last | `digest_carries_quiz` |
 | **Can't run ahead** | The next check-bearing digest waits until the last check was passed | `digest_quiz_gate` |
 | **Knows when to stop** | Once the tips have covered the topic, digests stop and the checkpoint takes over | `check_coverage` |
+| **Never stops before it has checked** | A topic gets at least `DIGEST_MIN_BEFORE_CHECKPOINT` digests, so every one carries a recall check | `coverage_may_end` |
 | **Completion is earned** | A topic completes by passing a checkpoint, not by ticking a box | `apply_checkpoint` |
 | **Failing sends you back to revise** | A failed checkpoint owes a revision digest written from the missed questions before the retry | `revision_outstanding` |
 | **Failing tells you what, not which** | A missed question comes back with what it tested and a hint — never the answer | `redact_review` |
@@ -157,7 +158,8 @@ run_triggers (hourly)
                  ├─ even-numbered digest           → recall check over the digests
                  │                                    since the last check
                  ├─ check_coverage                 → topic fully taught?
-                 │      └─ yes: topic → needs_review, drip-feed stops
+                 │      └─ yes, and ≥ the floor: topic → needs_review, feed stops
+                 │      └─ yes, but below it:    verdict held, one more digest
                  └─ store + push notification
 ```
 
@@ -227,6 +229,17 @@ with the grading attached, and the digest stays unread.
 
 **Coverage complete** flips the topic to `needs_review`: no further digests are generated
 for it (`in_progress_topic` no longer matches), and the checkpoint is what comes next.
+
+**With a floor under it.** A narrow topic — two learning outcomes, five good bullets — is
+genuinely covered by its *first* digest, and acting on that immediately is a correct
+answer to the wrong question: the recall check rides the second digest, so a topic that
+ends at the first never has one, and acknowledging its only digest means "dismissed"
+rather than "read". `coverage_may_end` holds the handover until
+`DIGEST_MIN_BEFORE_CHECKPOINT` digests have been sent — defaulting to `DIGEST_QUIZ_EVERY`,
+which makes the guarantee exact: one check per topic, minimum. The verdict is not
+discarded, only deferred, and the digest stores the *effective* decision rather than the
+raw verdict — a card that offers the checkpoint while the server intends to send one more
+is the two of them disagreeing on screen.
 
 **Scheduling** is one trigger per user, not per roadmap — `schedule_hour` in their
 timezone, optionally narrowed to one weekday. `next_run_at` reads the same rules forward,
@@ -487,7 +500,6 @@ rather than reading across.
 | `PATCH /roadmaps/{id}` | Park, resume, archive. **409** past the active cap |
 | `GET /stats` | Aggregate across all roadmaps, incl. `active` / `paused` / `max_active` |
 | `GET /focus` | See §6 |
-| `GET /current-state` | The active roadmap and its progress, no id needed |
 | `POST /progress` | Set a topic's progress directly |
 
 **Digests**
@@ -506,7 +518,7 @@ rather than reading across.
 | `GET /reviews` | Completed topics whose review is due |
 | `POST /submit-quiz` | Grade a chat-issued quiz |
 | `GET/POST/PATCH/DELETE /notes` | Notes, snippets, links, questions |
-| `GET/PUT/DELETE /memory` | The learning profile (`/state` is a deprecated alias) |
+| `GET/PUT/DELETE /memory` | The learning profile |
 | `GET /triggers`, `POST /toggle-trigger`, `PATCH /trigger-settings` | Digest schedule |
 
 `GET /digests` filters in the Mongo query rather than client-side, so `limit` means "the

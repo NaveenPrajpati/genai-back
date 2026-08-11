@@ -359,7 +359,9 @@ async def progress_agent(state: LearningState):
     # it: completion is earned by passing the checkpoint. Letting chat mark
     # things done would be a trivial way around the gate, which would make the
     # gate — and the mastery scores behind it — meaningless.
-    updated = await set_topic_progress(roadmapId, result.topicId, "in_progress", user_id)
+    updated = await set_topic_progress(
+        roadmapId, result.topicId, "in_progress", user_id
+    )
     if updated:
         matched["progress_status"] = "in_progress"
 
@@ -554,9 +556,8 @@ def build_graph() -> StateGraph:
     graph.add_node("quiz_grader_agent", quiz_grader_agent)
     graph.add_node("research_agent", research_agent)
     graph.add_node("fallback_agent", fallback_agent)
+
     graph.add_edge(START, "load_memory")
-    # Conditional only — a second static load_memory → classify_intent edge would
-    # run classification alongside onboarding and then again after it.
     graph.add_conditional_edges(
         "load_memory", decide_onboarding, ["onboard", "classify_intent"]
     )

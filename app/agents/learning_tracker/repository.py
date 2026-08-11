@@ -28,6 +28,7 @@ from app.core.config import (
     CHECKPOINT_PASS_SCORE,
     CHECKPOINT_RETRY_COOLDOWN_MINUTES,
     DIGEST_MAX_UNREAD,
+    DIGEST_MIN_BEFORE_CHECKPOINT,
     DIGEST_QUIZ_EVERY,
     FEYNMAN_LADDER_BONUS,
     MAX_ACTIVE_ROADMAPS,
@@ -1185,6 +1186,25 @@ async def set_topic_resources(
 
 
 # ── quizzes ──────────────────────────────────────────────────────────────────
+def public_question(question: dict) -> dict:
+    """One question as the learner may see it: the wording, the options, and how
+    it is answered.
+
+    A whitelist, and the only shape a question should ever leave the server in.
+    `answer` and `expected` are the key, and `hint`/`outcome` are the feedback a
+    failure earns — none of them belong in a set the learner is about to sit.
+
+    `kind` has to be here: an `open` question has no options, and a client that
+    can't tell it apart from a multiple-choice one waits forever for a tap that
+    has nowhere to land.
+    """
+    return {
+        "question": question.get("question"),
+        "options": question.get("options") or [],
+        "kind": question.get("kind") or "choice",
+    }
+
+
 def open_questions(questions: list[dict]) -> list[tuple[int, dict]]:
     """The free-text questions in a set, with their positions."""
     return [(i, q) for i, q in enumerate(questions) if q.get("kind") == "open"]
@@ -1652,6 +1672,30 @@ async def asked_questions(
     return seen[:limit]
 
 
+async def quiz_graded(user_id: str, quizId: str) -> bool:
+    """Whether this quiz has already been through grading.
+
+    A checkpoint set is sat exactly once. The retry limits in `retry_block` are
+    enforced where a set is *issued*, so without this a learner who fails can
+    re-post the same quizId with the three answers they were just told were
+    wrong — no cooldown, no daily cap, and no revision in between. That is the
+    completion gate opened from the outside.
+
+    Fails closed: an unreadable history refuses the grading rather than handing
+    out a free re-run.
+    """
+    try:
+        return (
+            await get_db()["quiz_attempts"].count_documents(
+                {"user_id": user_id, "quizId": quizId}, limit=1
+            )
+            > 0
+        )
+    except Exception as e:
+        logger.error("quiz_graded error user=%s quiz=%s: %s", user_id, quizId, e)
+        return True
+
+
 async def recent_attempts(
     user_id: str, roadmapId: str, topicId: str, kinds: tuple[str, ...] = ()
 ) -> list[dict]:
@@ -1834,6 +1878,40 @@ def digest_carries_quiz(sequence: int) -> bool:
     return sequence % DIGEST_QUIZ_EVERY == 0
 
 
+# Digests that are not part of the drip-feed. Both cover ground already sent —
+# revision after a failed checkpoint, a re-teach after a failed recall check —
+# and both store `sequence: None` to say so.
+OFF_SEQUENCE_KINDS: frozenset[str] = frozenset({"revision", "reteach"})
+
+
+def coverage_may_end(sequence: int) -> bool:
+    """Whether a topic that has had `sequence` teaching digests may hand over to
+    the checkpoint.
+
+    Coverage answers "has this been taught?", which on a narrow topic is true
+    after one digest. That is a correct answer to the wrong question: the recall
+    check rides the second digest, so ending the feed at the first means the
+    topic never has one, and acknowledging its only digest means "dismissed"
+    rather than "read". The floor buys exactly one check per topic.
+
+    It delays the checkpoint; it never skips it. A topic held here is still
+    `in_progress`, and the digest it gets is written against what the last one
+    didn't reach.
+    """
+    return sequence >= DIGEST_MIN_BEFORE_CHECKPOINT
+
+
+def teaching_digests(digests: list[dict]) -> list[dict]:
+    """Just the drip-feed, in order, so position == sequence.
+
+    Everything that reasons about the cadence — what number the next digest is,
+    which check gates it, what a new check covers — has to count only these. A
+    re-teach landing mid-topic would otherwise take the next digest's number with
+    it, moving where the checks fall and breaking the positional lookup below.
+    """
+    return [d for d in digests if d.get("kind") not in OFF_SEQUENCE_KINDS]
+
+
 def digest_quiz_window(prior: list[dict]) -> list[dict]:
     """The digests a new check should cover: everything since the last one.
 
@@ -1842,7 +1920,8 @@ def digest_quiz_window(prior: list[dict]) -> list[dict]:
     covers #2 and #3, #6 covers #4 and #5. Re-asking about material an earlier
     check already cleared would make each check longer than the last for no gain.
     """
-    return prior[max(len(prior) + 1 - 3, 0) :]
+    teaching = teaching_digests(prior)
+    return teaching[max(len(teaching) + 1 - 3, 0) :]
 
 
 def digest_quiz_gate(prior: list[dict]) -> Optional[int]:
@@ -1856,29 +1935,32 @@ def digest_quiz_gate(prior: list[dict]) -> Optional[int]:
     while that check is still outstanding. That's what keeps the DIGEST_MAX_UNREAD
     buffer usable — the learner can read one ahead, just not indefinitely.
     """
-    nxt = len(prior) + 1
+    teaching = teaching_digests(prior)
+    nxt = len(teaching) + 1
     if not digest_carries_quiz(nxt) or nxt < 4:
         return None
     blocking = nxt - DIGEST_QUIZ_EVERY
-    return blocking if prior[blocking - 1].get("status") != "marked" else None
+    return blocking if teaching[blocking - 1].get("status") != "marked" else None
 
 
 async def topic_digest_states(
     user_id: str, roadmapId: str, topicId: Optional[str]
 ) -> list[dict]:
-    """Every digest for a topic as `{status}`, oldest first.
+    """Every digest for a topic as `{status, kind}`, oldest first.
 
-    A projection, not `topic_digests`: the two questions asked before spending a
-    web search and an LLM call — how many are unread, and is a check outstanding
-    — need nothing else. Position is the sequence, since digests are only ever
-    appended.
+    A projection, not `topic_digests`: the questions asked before spending a web
+    search and an LLM call — how many are unread, and is a check outstanding —
+    need nothing else. `kind` rides along because a revision or re-teach digest
+    sits outside the drip-feed, so the cadence has to be counted without them
+    (see `teaching_digests`); among the rest, position is the sequence, since
+    digests are only ever appended.
     """
     try:
         cursor = (
             get_db()[DIGESTS]
             .find(
                 {"user_id": user_id, "roadmapId": roadmapId, "topicId": topicId},
-                projection={"status": 1},
+                projection={"status": 1, "kind": 1},
             )
             .sort([("createdAt", 1), ("_id", 1)])
         )
@@ -1963,10 +2045,7 @@ async def list_digests(
                 .to_list(None)
             )
             quizzes = {
-                str(q["_id"]): [
-                    {"question": x.get("question"), "options": x.get("options")}
-                    for x in q.get("questions") or []
-                ]
+                str(q["_id"]): [public_question(x) for x in q.get("questions") or []]
                 for q in found
             }
         except Exception as e:
@@ -2027,6 +2106,9 @@ async def learning_focus(user_id: str) -> dict:
         owed = next((t for t in topics if revision_outstanding(t)), None)
 
         unread = 0
+        # Whether the one thing this roadmap is waiting on is already sitting in
+        # the queue. Only meaningful while revision is owed.
+        revision_waiting = False
         reason = None
         if owed:
             # A failed checkpoint takes precedence over everything else on this
@@ -2035,6 +2117,14 @@ async def learning_focus(user_id: str) -> dict:
                 user_id, str(roadmap["_id"]), owed.get("id")
             )
             unread = sum(1 for d in states if d.get("status") != "marked")
+            # Counted over revision digests alone, matching what generating would
+            # actually produce. A leftover teaching digest on the same topic is
+            # not the revision they're owed, and treating it as one reported
+            # "revision tips waiting" for tips that were never written.
+            revision_waiting = any(
+                d.get("kind") == "revision" and d.get("status") != "marked"
+                for d in states
+            )
             reason = "needs_revision"
         elif topic:
             # One projection answers both questions the generator asks, so the
@@ -2077,7 +2167,10 @@ async def learning_focus(user_id: str) -> dict:
                 # for one owed revision — where what it produces is the revision
                 # digest. Only when nothing the generator checks would refuse it.
                 "can_generate": (
-                    bool(owed) and unread == 0
+                    # The backlog still caps it, which is also what keeps this
+                    # failing closed: an unreadable history comes back as a full
+                    # queue of unread digests with no kind on them.
+                    not revision_waiting and unread < DIGEST_MAX_UNREAD
                     if owed
                     else bool(topic)
                     and reason not in ("cap_reached", "awaiting_quiz")

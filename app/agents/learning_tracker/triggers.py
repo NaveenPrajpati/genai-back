@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from app.core.config import (
     DIGEST_MAX_UNREAD,
+    DIGEST_MIN_BEFORE_CHECKPOINT,
     DIGEST_ONELINER_FROM,
     MISCONCEPTION_RETEACH_DAYS,
 )
@@ -26,6 +27,7 @@ from .state import CoverageOutput, TopicTipsOutput
 from .repository import (
     DIGESTS,
     LEARNING_NS,
+    coverage_may_end,
     fetch_roadmap,
     replace_quiz_questions,
     digest_carries_quiz,
@@ -36,8 +38,10 @@ from .repository import (
     get_misconceptions,
     mark_misconceptions_addressed,
     in_progress_topic,
+    public_question,
     revision_outstanding,
     set_topic_progress,
+    teaching_digests,
     topic_digests,
 )
 from .tools import tavily_search_tool
@@ -118,7 +122,11 @@ async def build_digest(
     topic_id = topic.get("id")
 
     prior = await topic_digests(user_id, roadmap_id, topic_id)
-    sequence = len(prior) + 1
+    # Counted over the drip-feed alone. A revision or re-teach digest covers
+    # ground already sent and stores `sequence: None` to say so — letting one
+    # take the next number would move where the recall checks fall for
+    # everything after it.
+    sequence = len(teaching_digests(prior)) + 1
 
     # Both guards run before the web search and the LLM call — a digest that
     # won't be stored shouldn't cost anything to decline.
@@ -169,7 +177,9 @@ async def build_digest(
                     "pre-generation coverage check failed topic=%s: %s", topic_id, e
                 )
                 stored = False
-        if stored:
+        # The floor is re-applied rather than trusted from the stored flag, which
+        # on a digest written before the floor existed is the raw verdict.
+        if stored and coverage_may_end(sequence - 1):
             await set_topic_progress(roadmap_id, topic_id, "needs_review", user_id)
             logger.info(
                 "digest #%s not generated, topic=%s already covered — checkpoint next",
@@ -304,7 +314,19 @@ async def build_digest(
     except Exception as e:
         logger.error("coverage check failed topic=%s: %s", topic_id, e)
 
-    if coverage.covered:
+    # A narrow topic is genuinely covered by its first digest — and ending there
+    # would mean it never carries a recall check, since those ride the second.
+    # The verdict stands; acting on it waits for the floor.
+    ends_here = coverage.covered and coverage_may_end(sequence)
+    if coverage.covered and not ends_here:
+        logger.info(
+            "topic %s covered at digest #%s — held for the recall check on #%s",
+            topic_id,
+            sequence,
+            DIGEST_MIN_BEFORE_CHECKPOINT,
+        )
+
+    if ends_here:
         # Everything worth drip-feeding has been sent, so the topic moves to
         # `needs_review`: the final checkpoint is what completes it now, and no
         # further digests are generated for it (in_progress_topic won't match).
@@ -328,7 +350,13 @@ async def build_digest(
         "quizId": quiz_id,
         # Set once the tips have taught the whole topic: the client then offers
         # the checkpoint instead of another digest.
-        "coverage_complete": coverage.covered,
+        #
+        # The effective decision, not the raw verdict — this is what the card
+        # reads, and a digest that says "take the checkpoint" while the server
+        # intends to send one more is the two of them disagreeing on screen. It
+        # is also what the next call's pre-generation guard consults, which is
+        # the same question: should the feed stop here?
+        "coverage_complete": ends_here,
         "missing_outcomes": coverage.missing,
         # Unread until the learner acknowledges it — that acknowledgement is the
         # only signal we have that a digest actually landed.
@@ -357,7 +385,13 @@ async def build_digest(
             data={"type": "learning_digest", "topicId": topic.get("id")},
         )
 
-    doc["quiz"] = quiz.quiz if quiz else None
+    # The same answer-free shape GET /digests hands back. Returning the models
+    # whole sent `answer`, `expected` and `hint` to the client on the one path
+    # that skips the read projection — the check is issued and given away in a
+    # single response.
+    doc["quiz"] = (
+        [public_question(q.model_dump()) for q in quiz.quiz] if quiz else None
+    )
     return {**doc, "_id": str(res.inserted_id)}
 
 

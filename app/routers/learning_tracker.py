@@ -24,8 +24,17 @@ from app.core.config import (
     FEYNMAN_LADDER_BONUS,
     FEYNMAN_MIN_WORDS,
     FEYNMAN_PASS_SCORE,
+    LEARNING_CHECKPOINT_RATE_LIMIT,
+    LEARNING_CHECKPOINT_RATE_WINDOW,
+    LEARNING_DIGEST_RATE_LIMIT,
+    LEARNING_DIGEST_RATE_WINDOW,
+    LEARNING_EXPLAIN_RATE_LIMIT,
+    LEARNING_EXPLAIN_RATE_WINDOW,
+    LEARNING_QUERY_RATE_LIMIT,
+    LEARNING_QUERY_RATE_WINDOW,
     MISCONCEPTION_REPROBE_DAYS,
 )
+from app.services import rate_limit
 from app.agents.learning_tracker.service import (
     build_checkpoint,
     grade_oneliner,
@@ -69,6 +78,7 @@ from app.agents.learning_tracker.repository import (
     open_questions,
     profile_drift,
     profile_snapshot,
+    quiz_graded,
     recent_attempts,
     record_explanation,
     record_quiz_attempt,
@@ -179,6 +189,14 @@ async def ask(
     background_tasks: BackgroundTasks,
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
+    # Every turn is at least an intent classification and an agent call, and a
+    # "build me a roadmap" turn is a good deal more. Capped before the graph runs.
+    await rate_limit.limit_user(
+        "learning_query",
+        current_user["uid"],
+        LEARNING_QUERY_RATE_LIMIT,
+        LEARNING_QUERY_RATE_WINDOW,
+    )
     agent = request.app.state.learning_agent
 
     thread_id = body.thread_id or str(uuid.uuid4())
@@ -219,6 +237,14 @@ async def ask_stream(
     """Streaming counterpart of /query. Streams the tutor agent's explanation
     token-by-token over SSE; for other intents (quiz, roadmap, …) no tokens are
     emitted and the final state arrives in the `done` event."""
+    # Same bucket as /query — it is the same turn, and splitting them would let a
+    # client double its allowance by alternating.
+    await rate_limit.limit_user(
+        "learning_query",
+        current_user["uid"],
+        LEARNING_QUERY_RATE_LIMIT,
+        LEARNING_QUERY_RATE_WINDOW,
+    )
     agent = request.app.state.learning_agent
 
     thread_id = body.thread_id or str(uuid.uuid4())
@@ -431,28 +457,6 @@ async def _roadmap_view(roadmap: dict, user_id: str) -> dict:
     }
 
 
-@router.get("/current-state")
-async def getCurrentState(current_user: Annotated[dict, Depends(get_current_user)]):
-    """What the learner is working on right now: their active roadmap, how far
-    along it is, and when their stated pace gets them to the end. The home
-    screen's one call — no roadmapId needed."""
-    user_id = current_user["uid"]
-    roadmapId = await resolve_roadmap_id(user_id)
-    roadmap = await fetch_roadmap(roadmapId, user_id)
-    if not roadmap:
-        return {
-            "status": "done",
-            "message": "What do you want to learn today?",
-            "result": None,
-        }
-
-    return {
-        "status": "done",
-        "message": "roadmap fetched",
-        "result": await _roadmap_view(roadmap, user_id),
-    }
-
-
 @router.get("/roadmaps")
 async def getPlans(
     current_user: Annotated[dict, Depends(get_current_user)],
@@ -558,12 +562,6 @@ async def get_memory(current_user: Annotated[dict, Depends(get_current_user)]):
         "status": "done",
         "result": await get_profile(current_user["uid"], LEARNING_NS),
     }
-
-
-@router.get("/state", deprecated=True)
-async def get_state(current_user: Annotated[dict, Depends(get_current_user)]):
-    """Deprecated alias of GET /memory — kept for shipped clients. Use /memory."""
-    return await get_memory(current_user)
 
 
 class MemoryUpdate(BaseModel):
@@ -898,6 +896,15 @@ async def generate_digest(
     them up or to skip a check.
     """
     user_id = current_user["uid"]
+    # The most expensive thing the learner can ask for: a web search and two or
+    # three model calls. `build_digest`'s guards are per topic, so this is the
+    # account-level backstop across topics and roadmaps.
+    await rate_limit.limit_user(
+        "learning_digest",
+        user_id,
+        LEARNING_DIGEST_RATE_LIMIT,
+        LEARNING_DIGEST_RATE_WINDOW,
+    )
     roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
     if not roadmap:
         raise HTTPException(status_code=404, detail="No active roadmap to digest.")
@@ -1061,6 +1068,14 @@ async def start_checkpoint(
     attempt rather than retrying. Answers are stripped — grading is server-side.
     """
     user_id = current_user["uid"]
+    # CHECKPOINT_MAX_ATTEMPTS_PER_DAY is per topic; a roadmap with twenty of them
+    # is bounded by nothing without this.
+    await rate_limit.limit_user(
+        "learning_checkpoint",
+        user_id,
+        LEARNING_CHECKPOINT_RATE_LIMIT,
+        LEARNING_CHECKPOINT_RATE_WINDOW,
+    )
     roadmap = await fetch_roadmap(body.roadmapId, user_id)
     topic = find_topic(roadmap, topicId)
     if not topic:
@@ -1112,10 +1127,20 @@ async def start_checkpoint(
     # handed out again: re-issuing a set they've already seen tests whether they
     # remember being caught on it, and combined with any answer disclosure it
     # would make a retry pure transcription.
+    #
+    # Restricted to checkpoint sets. The newest quiz on a topic is just as often
+    # a digest recall check or one raised in chat — both are stamped with the
+    # same topicId — and handing one of those back means the topic is completed
+    # by answering two questions about last week's tips.
     existing = None
     if not body.regenerate and not is_review:
         candidate = await get_db()["quizzes"].find_one(
-            {"user_id": user_id, "roadmapId": body.roadmapId, "topicId": topicId},
+            {
+                "user_id": user_id,
+                "roadmapId": body.roadmapId,
+                "topicId": topicId,
+                "kind": {"$in": ["checkpoint", "review"]},
+            },
             sort=[("_id", -1)],
         )
         if candidate and not any(
@@ -1223,6 +1248,22 @@ async def submit_checkpoint(
     if not quiz or not quiz.get("topicId") or not quiz.get("roadmapId"):
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
 
+    # One grading per set. The cooldown and the daily cap are enforced where a
+    # set is issued, so a second POST with the same quizId would walk straight
+    # past both — and past the revision a failure owes — using the misses the
+    # first attempt just reported back.
+    if await quiz_graded(user_id, body.quizId):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    "That checkpoint has already been graded. Start a new one "
+                    "when you're ready to try again."
+                ),
+                "blocked_reason": "already_graded",
+            },
+        )
+
     questions = quiz.get("questions", [])
     graded = grade_quiz(questions, {a.question: a.answer for a in body.answers})
     await record_quiz_attempt(
@@ -1305,6 +1346,14 @@ async def explain_topic(
     every other attempt does.
     """
     user_id = current_user["uid"]
+    # A model call per submission, and — being optional and never a gate — the
+    # one cost-bearing route with no domain limit of its own.
+    await rate_limit.limit_user(
+        "learning_explain",
+        user_id,
+        LEARNING_EXPLAIN_RATE_LIMIT,
+        LEARNING_EXPLAIN_RATE_WINDOW,
+    )
     roadmap = await fetch_roadmap(body.roadmapId, user_id)
     topic = find_topic(roadmap, topicId)
     if not topic:
@@ -1339,6 +1388,14 @@ async def explain_topic(
     await record_explanation(
         body.roadmapId, topicId, user_id, verdict, body.text, passed
     )
+
+    # Stored whole, returned without `probe` — it describes how a future question
+    # will come back at this belief, and a learner who reads it knows what's
+    # coming. GET /misconceptions strips it for the same reason.
+    verdict["misconceptions"] = [
+        {k: v for k, v in m.items() if k != "probe"}
+        for m in verdict.get("misconceptions") or []
+    ]
 
     # Recorded as an attempt so the existing analysis picks it up. The misses are
     # the outcomes the explanation got wrong, carrying the learner's own words —

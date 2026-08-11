@@ -258,7 +258,18 @@ class ExplanationJudgement(BaseModel):
     "chose B" and "believes a DataFrame copies on assignment".
     """
 
-    score: int = Field(ge=0, le=100, description="How well the outcomes were covered")
+    # 0-100, and the range has to be said out loud. "The proportion of the
+    # outcomes conveyed" was read as a count: a good explanation of a two-outcome
+    # topic came back as `2`, which against a pass mark of 70 failed every
+    # explanation that was actually right.
+    score: int = Field(
+        ge=0,
+        le=100,
+        description=(
+            "How well the outcomes were covered, as a percentage from 0 to 100. "
+            "100 means every outcome was conveyed; 0 means none was."
+        ),
+    )
     outcomes: list[OutcomeVerdict] = Field(default_factory=list)
     # Named back to the learner. Kept short and specific: this is the payoff for
     # having typed or spoken something, and vague praise is no payoff.
@@ -292,6 +303,16 @@ class CheckpointOutcome(BaseModel):
     advanced_to: Optional[dict] = None
     # A failed first attempt owes a round of revision before the retry.
     needs_revision: bool = False
+    # The questions that failed it, verbatim — what the revision digest is
+    # written against, and what the client names when it sends the learner to
+    # revise. Declared for the same reason as `advanced_to` above: pydantic drops
+    # kwargs with no matching field, so `apply_checkpoint` returning it silently
+    # went nowhere.
+    weak_points: list[str] = Field(default_factory=list)
+    # Rungs of the review ladder granted for having explained the topic in your
+    # own words. Also declared or dropped — and an incentive the learner is never
+    # shown incentivises nothing.
+    feynman_bonus: int = 0
     # False when the answers were withheld because the attempt didn't pass, so
     # the client can label the feedback rather than render blanks where the
     # answers used to be.

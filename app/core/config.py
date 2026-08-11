@@ -89,6 +89,29 @@ RAG_INGEST_RATE_WINDOW = _int_env("RAG_INGEST_RATE_WINDOW", 3600)
 RAG_DELETE_RATE_LIMIT = _int_env("RAG_DELETE_RATE_LIMIT", 30)
 RAG_DELETE_RATE_WINDOW = _int_env("RAG_DELETE_RATE_WINDOW", 3600)
 
+# --- Learning per-user rate limits ---
+# The same idea on the learning routes that spend money: a chat turn, a digest
+# (a web search plus two or three model calls — the most expensive thing here),
+# issuing a checkpoint, and judging a written explanation.
+#
+# The domain already limits some of this, but only within one topic:
+# CHECKPOINT_MAX_ATTEMPTS_PER_DAY is per topic, and DIGEST_MAX_UNREAD is per
+# topic. A learner with twenty topics is bounded by neither, and the Feynman
+# judge has no domain limit at all. These are the account-level backstop, and
+# they are what stops a guest account — 20 of which can be minted per IP per
+# hour — from being an open tap on the model budget.
+#
+# /query and /query/stream share one bucket ("learning_query"), as RAG's do.
+# Reads are not limited: they cost a Mongo query. Fails OPEN on a Redis outage.
+LEARNING_QUERY_RATE_LIMIT = _int_env("LEARNING_QUERY_RATE_LIMIT", 30)
+LEARNING_QUERY_RATE_WINDOW = _int_env("LEARNING_QUERY_RATE_WINDOW", 60)
+LEARNING_DIGEST_RATE_LIMIT = _int_env("LEARNING_DIGEST_RATE_LIMIT", 20)
+LEARNING_DIGEST_RATE_WINDOW = _int_env("LEARNING_DIGEST_RATE_WINDOW", 3600)
+LEARNING_CHECKPOINT_RATE_LIMIT = _int_env("LEARNING_CHECKPOINT_RATE_LIMIT", 30)
+LEARNING_CHECKPOINT_RATE_WINDOW = _int_env("LEARNING_CHECKPOINT_RATE_WINDOW", 3600)
+LEARNING_EXPLAIN_RATE_LIMIT = _int_env("LEARNING_EXPLAIN_RATE_LIMIT", 20)
+LEARNING_EXPLAIN_RATE_WINDOW = _int_env("LEARNING_EXPLAIN_RATE_WINDOW", 3600)
+
 # --- Learning checkpoints (active recall) ---
 # Percentage a learner must score on a topic's checkpoint before it counts as
 # completed. Also the bar a spaced-repetition review has to clear to push the
@@ -146,6 +169,20 @@ DIGEST_QUIZ_QUESTIONS = _int_env("DIGEST_QUIZ_QUESTIONS", 2)
 # every digest past the first turns a nudge into homework — this is a "did you
 # read it" tap on the shoulder, and the topic checkpoint is the real assessment.
 DIGEST_QUIZ_EVERY = _int_env("DIGEST_QUIZ_EVERY", 2)
+# The floor under the drip-feed: how many digests a topic gets before coverage is
+# allowed to end it and hand over to the checkpoint.
+#
+# Without one, a narrow topic — two learning outcomes, five good bullets — is
+# declared covered by the very first digest, and the topic goes straight to the
+# checkpoint. Correct, and it quietly disables everything downstream of it: the
+# recall check rides the SECOND digest, so a topic that never has one is a topic
+# whose acknowledgement means "dismissed" rather than "read", and neither the
+# written question nor the re-teach path can ever fire.
+#
+# Defaults to DIGEST_QUIZ_EVERY, which is what makes the guarantee exact: one
+# check per topic, minimum. A floor below the cadence guarantees nothing, so it
+# tracks that setting rather than being a second number to keep in step.
+DIGEST_MIN_BEFORE_CHECKPOINT = _int_env("DIGEST_MIN_BEFORE_CHECKPOINT", DIGEST_QUIZ_EVERY)
 # From this digest on, the recall check also asks for one typed sentence. Early
 # checks stay tap-only so the habit forms with no friction; by the fourth digest
 # there is enough material that "say it in your own words" is worth the keystroke,

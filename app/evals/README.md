@@ -120,3 +120,64 @@ Add task-specific metrics (e.g. quiz-answer correctness, plan diet-adherence) by
 registering a scorer in `CUSTOM_SCORERS` in `harness.py` — no core changes needed.
 
 Gate the model swap on these numbers per `call_site`, not on vibes.
+
+---
+
+# Learning-loop smoke test (`learning_loop.py`)
+
+The third harness here, and the odd one out: it grades nothing. `harness.py` scores
+structured output against a teacher and `rag_eval.py` scores RAG answers — this one
+walks **one topic through the entire learning tracker** and asserts that each step
+does what the design says it does.
+
+```
+chat turn → onboarding → roadmap approval → digests (recall checks, and a written
+answer from #4) → coverage → checkpoint → fail → revision gate → retry → pass →
+spaced review + Feynman → what the home, stats and misconception screens read
+```
+
+Everything the app does goes through the real HTTP routes, so the gates, the
+background tasks and the response shapes are the ones a client meets.
+
+**Why it exists.** `tests/test_learning_tracker.py` fakes Mongo and the models, and
+that is the right trade for 400-odd tests — but a fake answers whatever it was told
+to. Two bugs got through it and were caught by this on its first two runs:
+
+- the Feynman judge scored a *correct* explanation `2` against a pass mark of 70,
+  because "the proportion of the outcomes conveyed" was read as a count. Every
+  learner who explained a topic well failed, and the same schema backs
+  `grade_oneliner`, so every correct written digest answer was filed as a wrong one
+  in the misconception tracker;
+- coverage completed on the **first** digest of a narrow topic, so the recall check
+  — which rides the second — never fired, and neither did the written question nor
+  the re-teach path. The feature worked; nothing reached it.
+
+Neither is visible to a mock, because in both cases the code did exactly what it
+was written to do.
+
+```bash
+# the plan and an environment check — no connection, no spend
+.venv/bin/python -m app.evals.learning_loop --dry-run
+
+# the real walk
+.venv/bin/python -m app.evals.learning_loop
+
+# keep the data to poke at, under a name of your choosing
+.venv/bin/python -m app.evals.learning_loop --keep --db lt_scratch
+```
+
+**Cost and blast radius.** Roughly 35-45 model calls and one web search per digest.
+It runs against a *scratch* database on the same cluster, derived from `MONGO_URI`
+by rewriting the path segment. Two rails: it refuses to start if the scratch name
+is the database `MONGO_URI` already points at, and it refuses to start if that
+database is non-empty. It drops the database when it finishes (`--keep` opts out).
+
+**Not in CI.** It needs live keys, it spends real money, and an LLM in the loop
+makes it too flaky to block a merge on. Run it before a release, or after anything
+that touches the digest cadence, the checkpoint gates or a prompt. It exits
+non-zero on any failed check, so it gates by hand cleanly.
+
+One deliberate concession: the checkpoint retry **cooldown** is asserted (a retry
+straight after clearing the revision debt gets a 429), then stood down for the rest
+of the walk. It is wall-clock, and `CHECKPOINT_RETRY_COOLDOWN_MINUTES` cannot be set
+below one minute — `_int_env` floors it at 1. `retry_block`'s own rules are unit-tested.
