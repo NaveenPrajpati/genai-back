@@ -3858,3 +3858,184 @@ async def test_the_floor_does_not_hold_a_topic_that_is_still_being_taught(monkey
 
     assert out["coverage_complete"] is False and out["missing_outcomes"] == ["x"]
     trig.set_topic_progress.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------- #
+# indexes
+# --------------------------------------------------------------------------- #
+def test_every_declared_index_leads_with_the_owner():
+    """Each of these queries is scoped by user_id first. An index that doesn't
+    lead with it can't serve the query it was written for."""
+    from app.agents.learning_tracker import indexes
+
+    for collection, keys, name, why in indexes.INDEXES:
+        assert keys[0] == ("user_id", 1), f"{name} does not lead with user_id"
+        assert name.startswith("learning_"), f"{name} is not namespaced"
+        assert why, f"{name} has no stated purpose"
+
+
+def test_index_names_are_unique():
+    """They double as the idempotency key on a re-run."""
+    from app.agents.learning_tracker import indexes
+
+    names = [n for _, _, n, _ in indexes.INDEXES]
+    assert len(names) == len(set(names))
+
+
+async def test_a_failed_index_creation_does_not_stop_the_app(monkeypatch):
+    """This runs during startup. A missing index is a slow app, not a broken one,
+    and certainly not a reason to refuse to boot."""
+    from app.agents.learning_tracker import indexes
+
+    col = _collection()
+    col.create_index = AsyncMock(side_effect=RuntimeError("no permission"))
+    monkeypatch.setattr(indexes, "get_db", lambda: {c: col for c, *_ in indexes.INDEXES})
+
+    assert await indexes.ensure_indexes() == 0
+
+
+async def test_indexes_are_created_for_every_collection_the_feature_owns(monkeypatch):
+    from app.agents.learning_tracker import indexes
+
+    seen = []
+    col = _collection()
+
+    async def _create(keys, name=None, background=None):
+        seen.append(name)
+
+    col.create_index = AsyncMock(side_effect=_create)
+    monkeypatch.setattr(indexes, "get_db", lambda: {c: col for c, *_ in indexes.INDEXES})
+
+    created = await indexes.ensure_indexes()
+
+    assert created == len(indexes.INDEXES)
+    assert seen == [n for _, _, n, _ in indexes.INDEXES]
+
+
+async def test_a_digest_missing_its_body_does_not_blank_the_queue(monkeypatch):
+    """The card maps over bullets and resources without checking."""
+    _digest_db(
+        monkeypatch,
+        digests=[{"_id": _OID, "roadmapId": "r1"}],
+        roadmaps=[{"_id": "r1", "title": "Rust", "topics": []}],
+    )
+    d = (await repo.list_digests("userA"))[0]
+    assert d["bullets"] == [] and d["resources"] == []
+
+
+def test_every_explained_shape_has_an_index_that_could_serve_it():
+    """The two lists are written out separately on purpose — this is what notices
+    when a call site changes shape and drifts off the index built for it."""
+    from app.agents.learning_tracker import indexes
+
+    by_collection: dict[str, list[list]] = {}
+    for collection, keys, *_ in indexes.INDEXES:
+        by_collection.setdefault(collection, []).append([k for k, _ in keys])
+
+    for label, collection, query, _sort in indexes._SHAPES:
+        fields = set(query)
+        assert any(
+            fields.issubset(set(keys)) for keys in by_collection.get(collection, [])
+        ), f"{label}: no declared index covers {sorted(fields)} on {collection}"
+
+
+# --------------------------------------------------------------------------- #
+# what completing a topic does to its leftovers
+#
+# Digests are a nudge to study the topic you're on. Passing its checkpoint proves
+# the material by a harder route than the tips were softening, so anything still
+# waiting on that topic has nothing left to ask for. Left open they nagged from
+# the catch-up queue — and marking one late graded a recall check against a
+# completed topic, denting a mastery score already earned, and could escalate to
+# a re-teach digest for a topic nobody was studying any more.
+# --------------------------------------------------------------------------- #
+def _closing_db(monkeypatch, topic=None, closed=2):
+    """A roadmap that completes on a pass, and a digest collection that reports
+    how many were still waiting."""
+    roadmaps, digests = _collection(), _collection()
+    roadmaps.find_one = AsyncMock(
+        return_value={
+            "_id": _OID,
+            "status": "active",
+            "topics": [topic or _started(progress_status="needs_review")],
+        }
+    )
+    digests.update_many = AsyncMock(return_value=MagicMock(modified_count=closed))
+    monkeypatch.setattr(
+        repo, "get_db", lambda: {"roadmaps": roadmaps, repo.DIGESTS: digests}
+    )
+    return roadmaps, digests
+
+
+async def test_passing_closes_the_digests_still_waiting_on_that_topic(monkeypatch):
+    _, digests = _closing_db(monkeypatch)
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+
+    assert out["digests_closed"] == 2
+    filt, update = digests.update_many.await_args.args
+    # Scoped to the caller and to this topic — one learner completing a topic
+    # must not close another's queue, or their own other topics.
+    assert filt["user_id"] == "userA"
+    assert filt["topicId"] == "t1"
+    assert filt["status"] == {"$ne": "marked"}
+    assert update["$set"]["status"] == "marked"
+    # Marked, but not pretending it was read: `status: "marked"` is what
+    # `digest_quiz_gate` reads as "the check was passed", and these were closed
+    # by the checkpoint rather than answered.
+    assert update["$set"]["closed_by"] == "checkpoint"
+
+
+async def test_failing_leaves_the_queue_alone(monkeypatch):
+    """The topic is still being studied, and those tips are still the way through
+    it."""
+    _, digests = _closing_db(monkeypatch)
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 10)
+
+    assert out["digests_closed"] == 0
+    digests.update_many.assert_not_awaited()
+
+
+async def test_a_review_of_a_finished_topic_closes_nothing(monkeypatch):
+    """Only the transition closes the feed. A topic completed weeks ago has no
+    drip-feed left to close, and a spaced review isn't a second completion."""
+    _, digests = _closing_db(
+        monkeypatch, topic=_started(progress_status="completed", completed_at="x")
+    )
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+
+    assert out["was_review"] is True and out["digests_closed"] == 0
+    digests.update_many.assert_not_awaited()
+
+
+async def test_a_failed_tidy_up_does_not_undo_the_pass(monkeypatch):
+    """The checkpoint has already been applied. A queue that couldn't be tidied is
+    a stale nudge, not a topic that failed to complete."""
+    _, digests = _closing_db(monkeypatch)
+    digests.update_many = AsyncMock(side_effect=RuntimeError("mongo down"))
+
+    out = await repo.apply_checkpoint(_OID, "t1", "userA", 100)
+
+    assert out["passed"] is True and out["progress_status"] == "completed"
+    assert out["digests_closed"] == 0
+
+
+async def test_the_count_reaches_the_client(monkeypatch):
+    """Declared on CheckpointOutcome or pydantic drops it, and the queue would sit
+    there until something happened to refetch."""
+    db = _DB()
+    db["quizzes"] = _quizzes(_checkpoint())
+    db["roadmaps"].find_one = AsyncMock(return_value=_roadmap_doc())
+    db[repo.DIGESTS].update_many = AsyncMock(return_value=MagicMock(modified_count=3))
+    client, _, route = _api(monkeypatch, db)
+    monkeypatch.setattr(route, "refresh_misconceptions", AsyncMock())
+
+    result = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    ).json()["result"]
+
+    assert result["passed"] is True
+    assert result["digests_closed"] == 3

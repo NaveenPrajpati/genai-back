@@ -30,6 +30,7 @@ from app.agents.meal_planner import (
     run_triggers as run_meal_triggers,
 )
 from app.agents.supervisor import graph as supervisor_graph
+from app.agents.learning_tracker.indexes import ensure_indexes as ensure_learning_indexes
 from app.mcp.meal_planner import mcp as meal_mcp
 from app.mcp.mount import guarded_app, session_lifespan
 from app.services.user_service import (
@@ -64,6 +65,10 @@ async def lifespan(app: FastAPI):
         # a TTL index on users.expires_at — and we drop one left behind by an older
         # deploy, since it would keep hard-deleting guests behind the sweep's back.
         await drop_legacy_guest_ttl_index()
+        # The learning tracker's own indexes. Idempotent, and best-effort inside
+        # its own helper — every read there is scoped by user_id and then sorted,
+        # which without them is a collection scan per screen.
+        await ensure_learning_indexes()
     except Exception as e:
         print(f"MongoDB connection failed (non-fatal): {e}")
 

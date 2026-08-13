@@ -1021,7 +1021,12 @@ async def apply_checkpoint(
     # next one, so the learner always has exactly one topic in flight and its
     # digests start straight away.
     advanced = None
+    closed = 0
     if passed and not was_completed:
+        # The teaching for this topic is over, so nothing it sent is still
+        # waiting on an answer. Only on the transition: a review of a topic that
+        # was already complete has no drip-feed left to close.
+        closed = await close_topic_digests(roadmapId, topicId, user_id)
         ordered = sorted(roadmap.get("topics") or [], key=lambda t: t.get("order", 0))
         nxt = next(
             (
@@ -1045,6 +1050,10 @@ async def apply_checkpoint(
         "was_review": was_completed,
         # The topic that just picked up the baton, if any.
         "advanced_to": advanced,
+        # Digests that were still waiting on this topic and have been closed with
+        # it, so the client can drop them from the catch-up queue rather than
+        # leaving them there until something happens to refetch.
+        "digests_closed": closed,
         # Set when the failure opened a revision debt, so the client can send the
         # learner to revise rather than straight back to the same questions.
         "needs_revision": not passed and not was_completed,
@@ -1053,6 +1062,50 @@ async def apply_checkpoint(
         # client can show the reward landing rather than an unexplained date.
         "feynman_bonus": feynman_bonus,
     }
+
+
+async def close_topic_digests(roadmapId: str, topicId: str, user_id: str) -> int:
+    """Close whatever is still waiting on a topic the learner has just finished.
+
+    A digest is a nudge to read up on the topic you're working on. Once the
+    checkpoint is passed that nudge has nothing left to ask for — the learner
+    proved they know the material by a harder route than the one the tips were
+    softening. Left open they sit in the catch-up queue nagging about finished
+    work, and marking one late is worse than useless: its recall check is graded
+    against a *completed* topic, denting a mastery score that has since been
+    earned, and failing it twice sends a re-teach digest for a topic nobody is
+    studying any more.
+
+    `closed_by` keeps the record honest. `status: "marked"` normally means the
+    learner acknowledged it, and that distinction matters — it is what
+    `digest_quiz_gate` reads as "the check was passed". These were closed by the
+    checkpoint, not read, and the archive can say so.
+
+    Returns how many were closed. Best-effort: the checkpoint has already been
+    applied, and a tidy-up that fails must not report the pass as failed.
+    """
+    try:
+        res = await get_db()[DIGESTS].update_many(
+            {
+                "user_id": user_id,
+                "roadmapId": roadmapId,
+                "topicId": topicId,
+                "status": {"$ne": "marked"},
+            },
+            {
+                "$set": {
+                    "status": "marked",
+                    "closed_by": "checkpoint",
+                    "updatedAt": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+        return res.modified_count
+    except Exception as e:
+        logger.error(
+            "close_topic_digests error id=%s topic=%s: %s", roadmapId, topicId, e
+        )
+        return 0
 
 
 async def record_explanation(
@@ -2054,6 +2107,12 @@ async def list_digests(
     for d in docs:
         d["_id"] = str(d["_id"])
         d.setdefault("status", "unread")
+        # The card maps over both without checking. Every writer sets them, so a
+        # digest missing one is a hand-inserted or half-written document — and the
+        # cost of that reaching a client is a blank screen for the whole queue,
+        # not one odd-looking card.
+        d.setdefault("bullets", [])
+        d.setdefault("resources", [])
         d["roadmapTitle"] = (labels.get(d.get("roadmapId")) or {}).get("title")
         d["quiz"] = quizzes.get(d.get("quizId")) or []
     return docs

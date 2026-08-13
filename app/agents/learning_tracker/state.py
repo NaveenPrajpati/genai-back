@@ -313,6 +313,9 @@ class CheckpointOutcome(BaseModel):
     # own words. Also declared or dropped — and an incentive the learner is never
     # shown incentivises nothing.
     feynman_bonus: int = 0
+    # Unread digests on this topic, closed along with it: the tips were a nudge
+    # to study something the learner has now proved they know.
+    digests_closed: int = 0
     # False when the answers were withheld because the attempt didn't pass, so
     # the client can label the feedback rather than render blanks where the
     # answers used to be.
