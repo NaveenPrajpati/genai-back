@@ -500,6 +500,24 @@ async def update_expo_push_token(user_id: str, expo_push_token: str) -> dict | N
     return await col.find_one({"_id": ObjectId(user_id)}, {"password_hash": 0})
 
 
+async def ensure_user_indexes() -> None:
+    """Index the fields the users collection is looked up by other than `_id`.
+
+    `uid` is the id every agent collection is keyed by, so it is what the
+    schedulers hold — and get_expo_push_token resolves it on every notification
+    sent. `email` carries login and the signup uniqueness check. Neither is
+    declared unique: a duplicate would be a bug, but refusing to boot over one
+    that already exists is worse than the duplicate. Best-effort and idempotent,
+    like the learning indexes — a missing index is a slow app, not a broken one.
+    """
+    col = _collection()
+    for keys, name in ((("uid", 1), "users_by_uid"), (("email", 1), "users_by_email")):
+        try:
+            await col.create_index([keys], name=name, background=True)
+        except Exception as e:
+            logger.warning("index %s on users not created: %s", name, e)
+
+
 async def drop_legacy_guest_ttl_index() -> str | None:
     """Drop a leftover TTL index on users.expires_at, if one exists.
 

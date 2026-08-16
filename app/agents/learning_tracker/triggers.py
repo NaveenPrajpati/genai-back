@@ -382,7 +382,15 @@ async def build_digest(
                 if tips.bullets
                 else "Your daily learning digest is ready."
             ),
-            data={"type": "learning_digest", "topicId": topic.get("id")},
+            # Enough to open the digest itself, not just the topic it belongs
+            # to: every learning read is scoped by roadmap, so a payload without
+            # roadmapId can't be navigated from.
+            data={
+                "type": "learning_digest",
+                "roadmapId": roadmap_id,
+                "topicId": topic_id,
+                "digestId": str(res.inserted_id),
+            },
         )
 
     # The same answer-free shape GET /digests hands back. Returning the models
@@ -504,7 +512,12 @@ async def build_revision_digest(
                 if tips.bullets
                 else "A few things to go over before you retry."
             ),
-            data={"type": "learning_revision", "topicId": topicId},
+            data={
+                "type": "learning_revision",
+                "roadmapId": roadmap_id,
+                "topicId": topicId,
+                "digestId": str(res.inserted_id),
+            },
         )
 
     doc["quiz"] = None
@@ -615,7 +628,12 @@ async def escalate_to_reteach(
             if retaught.bullets
             else "Let's come at this from a different angle."
         ),
-        data={"type": "learning_reteach", "topicId": topicId},
+        data={
+            "type": "learning_reteach",
+            "roadmapId": roadmapId,
+            "topicId": topicId,
+            "digestId": str(res.inserted_id),
+        },
     )
 
     doc["quiz"] = None

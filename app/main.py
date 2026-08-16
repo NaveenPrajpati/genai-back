@@ -36,6 +36,7 @@ from app.mcp.mount import guarded_app, session_lifespan
 from app.services.user_service import (
     deactivate_expired_guests,
     drop_legacy_guest_ttl_index,
+    ensure_user_indexes,
 )
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import MemorySaver
@@ -65,6 +66,9 @@ async def lifespan(app: FastAPI):
         # a TTL index on users.expires_at — and we drop one left behind by an older
         # deploy, since it would keep hard-deleting guests behind the sweep's back.
         await drop_legacy_guest_ttl_index()
+        # users.uid backs every push-token lookup (one per notification sent)
+        # and users.email backs login; both were unindexed collection scans.
+        await ensure_user_indexes()
         # The learning tracker's own indexes. Idempotent, and best-effort inside
         # its own helper — every read there is scoped by user_id and then sorted,
         # which without them is a collection scan per screen.
