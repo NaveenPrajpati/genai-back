@@ -37,7 +37,7 @@ from app.core.config import (
 from app.database import get_db
 from app.agents.memory_store import extract_and_save
 from app.agents.personal_assistant.repository import TODOS
-from app.agents.trigger_store import next_run_at
+from app.agents.trigger_store import next_run_at, user_zone
 from .state import (
     DONE_STATUSES,
     LearnerMemory,
@@ -533,6 +533,40 @@ def mastery_summary(topics: list[dict]) -> dict:
     }
 
 
+def _local_day(stamp: Optional[str], zone) -> Optional[str]:
+    """The calendar day an ISO timestamp falls on, in `zone`. None if unusable.
+
+    Which day something happened on is a question about where the learner is, not
+    where the server is — see the note in `learning_stats`. Timestamps written
+    before these were stored tz-aware are read as UTC, which is what they were.
+    """
+    if not stamp:
+        return None
+    try:
+        at = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at.astimezone(zone).date().isoformat()
+
+
+def consecutive_days(days: set[str], today: date) -> int:
+    """How many days in a row, ending today, appear in `days`.
+
+    A quiet *today* doesn't break the run — it starts counting from yesterday
+    instead. Otherwise every streak would read 0 each morning until the learner
+    got round to that day's digest, which is the reading most likely to convince
+    someone they'd lost a run they still have.
+    """
+    day = today if today.isoformat() in days else today - timedelta(days=1)
+    streak = 0
+    while day.isoformat() in days:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
+
+
 async def learning_stats(user_id: str) -> dict:
     """Progress aggregated across ALL of a learner's roadmaps, for the landing
     screen.
@@ -542,6 +576,10 @@ async def learning_stats(user_id: str) -> dict:
     describes the page. This also spans `quiz_attempts`, which roadmaps don't
     touch. Two parallel requests beat one misleading response.
     """
+    # Every "which day did this happen on" below is answered in the learner's own
+    # timezone rather than the server's — see the streak note further down.
+    zone = await user_zone(user_id, "learning_digest")
+
     roadmaps = []
     try:
         cursor = get_db()["roadmaps"].find(
@@ -573,7 +611,7 @@ async def learning_stats(user_id: str) -> dict:
     }
     total_topics = 0
     reviews_due = 0
-    completed_days: list[str] = []  # ISO date per completed topic
+    completed_days: list[Optional[str]] = []  # local ISO date per completed topic
     stamp = datetime.now(timezone.utc).isoformat()
     for r in roadmaps:
         if r.get("status") == "active":
@@ -585,24 +623,52 @@ async def learning_stats(user_id: str) -> dict:
         for t in r.get("topics") or []:
             total_topics += 1
             if t.get("progress_status") == "completed":
-                # "" for a topic completed without a timestamp: it still counts
-                # towards the total, it just can't contribute to a streak.
-                completed_days.append((t.get("completed_at") or "")[:10])
+                # None for a topic completed without a timestamp: it still counts
+                # towards the total, it just can't be filed under a week.
+                completed_days.append(_local_day(t.get("completed_at"), zone))
                 due = t.get("next_review_at")
                 if due and due <= stamp:
                     reviews_due += 1
 
     completed_topics = len(completed_days)
-    dated = {d for d in completed_days if d}
 
-    # Consecutive days ending today. An empty today doesn't break the streak —
-    # it only breaks once a full day has been missed.
-    today = datetime.now(timezone.utc).date()
-    day = today if today.isoformat() in dated else today - timedelta(days=1)
-    streak = 0
-    while day.isoformat() in dated:
-        streak += 1
-        day -= timedelta(days=1)
+    # Days the learner showed up, which in this product means acknowledging a
+    # digest. It used to mean completing a topic, and that made the counter
+    # unreachable rather than merely wrong: a topic takes DIGEST_MIN_BEFORE_
+    # CHECKPOINT instalments plus a passed checkpoint, the drip-feed sends one a
+    # day, and at most MAX_ACTIVE_ROADMAPS run at once — so "completed a topic on
+    # each of two consecutive days" is something a normal learner essentially
+    # never does, and the tile read 🔥1 at best and — for everyone reading
+    # daily and finishing nothing that week — 0.
+    #
+    # Marking a digest is the daily act the whole feature is built around: it is
+    # gated behind the recall check, so it can't be tapped past, and it happens
+    # once a day by design. Digests closed by a passed checkpoint count too —
+    # they carry the same `marked` status, and passing a checkpoint is the
+    # strongest evidence of showing up there is.
+    zone = await user_zone(user_id, "learning_digest")
+    marked_days: set[str] = set()
+    try:
+        cursor = get_db()[DIGESTS].find(
+            {"user_id": user_id, "status": "marked"}, projection={"updatedAt": 1}
+        )
+        for d in await cursor.to_list(None):
+            # `updatedAt` is when it was acknowledged: marking is the only thing
+            # that ever updates a digest (see mark_digest).
+            local = _local_day(d.get("updatedAt"), zone)
+            if local:
+                marked_days.add(local)
+    except Exception as e:
+        # The streak is one tile. Losing it must not cost the caller the roadmap
+        # counts and mastery that share this response.
+        logger.error("learning_stats digest error user=%s: %s", user_id, e)
+
+    # In the learner's own timezone, not the server's. The digest arrives at an
+    # hour they chose in that zone, so their day has to end where they think it
+    # does — on UTC boundaries a learner in Asia/Kolkata reading after midnight
+    # has it credited to yesterday, which breaks the run they were building.
+    today = datetime.now(zone).date()
+    streak = consecutive_days(marked_days, today)
 
     week_start = (today - timedelta(days=6)).isoformat()
     this_week = sum(1 for d in completed_days if d and d >= week_start)

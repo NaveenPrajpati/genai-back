@@ -326,7 +326,9 @@ class SubmittedAnswer(BaseModel):
     """One answer parsed out of a free-text quiz submission."""
 
     question_index: int = Field(ge=0, description="0-based position of the question")
-    selected_index: int = Field(ge=0, description="0-based position of the chosen option")
+    selected_index: int = Field(
+        ge=0, description="0-based position of the chosen option"
+    )
 
 
 class QuizSubmission(BaseModel):
@@ -393,9 +395,7 @@ class LearningAvailability(BaseModel):
 
 
 class LearnerMemory(BaseModel):
-    # Stable learner preferences
     skill_level: Optional[Difficulty] = None
-
     preferred_resource_types: list[
         Literal["video", "article", "documentation", "interactive", "project", "book"]
     ] = Field(default_factory=list)
@@ -404,18 +404,15 @@ class LearnerMemory(BaseModel):
         Literal["concise", "step_by_step", "examples_first", "visual", "socratic"]
     ] = None
 
-    preferred_language: Optional[str] = None
-
     # Goals and learning context
     goals: list[str] = Field(default_factory=list)
     availability: Optional[LearningAvailability] = None
 
     # Knowledge the learner explicitly demonstrates or confirms
     known_topics: list[str] = Field(default_factory=list)
-    weak_topics: list[str] = Field(default_factory=list)
 
     # Behavioural learning preferences
-    wants_hints_before_answers: Optional[bool] = None
+
     preferred_quiz_difficulty: Optional[Literal["easy", "adaptive", "challenging"]] = (
         None
     )

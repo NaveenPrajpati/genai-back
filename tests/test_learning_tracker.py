@@ -17,6 +17,7 @@ from bson import ObjectId
 
 import app.agents.learning_tracker.repository as repo
 import app.agents.learning_tracker.workflow as lt
+import app.agents.trigger_store as trigger_store
 from app.agents.learning_tracker.state import (
     RoadmapDraft,
     ResourceDraft,
@@ -561,12 +562,14 @@ async def test_stats_count_the_same_written_topic(monkeypatch):
                 ],
             }
         ],
+        # Passing the checkpoint that completed the topic also closes its
+        # outstanding digests (see close_topic_digests), so a completion day is
+        # a marked day too — by that route rather than by being a completion.
+        marked=[{"updatedAt": written["topics.$.completed_at"]}],
     )
     stats = await repo.learning_stats("userA")
     assert stats["topics"]["completed"] == 1
     assert stats["topics"]["percent"] == 100
-    # Completing something today must move the streak off zero, or the counter
-    # reads as broken however correct the totals are.
     assert stats["streak_days"] == 1
     assert stats["completed_this_week"] == 1
 
@@ -1661,18 +1664,37 @@ async def test_progress_route_still_owns_every_other_transition(monkeypatch, sta
 # --------------------------------------------------------------------------- #
 # landing-screen stats
 # --------------------------------------------------------------------------- #
-def _stats_db(monkeypatch, roadmaps, attempts=()):
-    """Stub the two collections learning_stats reads."""
-    roadmap_col, quiz_col = MagicMock(), MagicMock()
+def _stats_db(monkeypatch, roadmaps, attempts=(), marked=(), tz="UTC"):
+    """Stub the three collections learning_stats reads, plus the trigger row it
+    takes the learner's timezone from.
+
+    `marked` is the acknowledged digests behind the streak; each is `{"updatedAt":
+    <iso>}`, which is when it was noticed.
+    """
+    roadmap_col, quiz_col, digest_col = MagicMock(), MagicMock(), MagicMock()
     roadmap_col.find = MagicMock(
         return_value=MagicMock(to_list=AsyncMock(return_value=list(roadmaps)))
     )
     quiz_col.find = MagicMock(
         return_value=MagicMock(to_list=AsyncMock(return_value=list(attempts)))
     )
-    monkeypatch.setattr(
-        repo, "get_db", lambda: {"roadmaps": roadmap_col, "quiz_attempts": quiz_col}
+    digest_col.find = MagicMock(
+        return_value=MagicMock(to_list=AsyncMock(return_value=list(marked)))
     )
+    monkeypatch.setattr(
+        repo,
+        "get_db",
+        lambda: {
+            "roadmaps": roadmap_col,
+            "quiz_attempts": quiz_col,
+            repo.DIGESTS: digest_col,
+        },
+    )
+    # user_zone reads through trigger_store's own get_db, not the repository's.
+    trigger_col = MagicMock()
+    trigger_col.find_one = AsyncMock(return_value={"timezone": tz})
+    monkeypatch.setattr(trigger_store, "get_db", lambda: {"triggers": trigger_col})
+    return digest_col
 
 
 def _day(offset: int) -> str:
@@ -1717,32 +1739,72 @@ async def test_streak_counts_consecutive_days_back_from_today(monkeypatch):
                 "status": "active",
                 "topics": [
                     {"progress_status": "completed", "completed_at": f"{_day(d)}T09:00:00+00:00"}
-                    for d in (0, 1, 2, 5)  # 3-day run, then a gap
+                    for d in (0, 1, 2, 5)
                 ],
             }
         ],
+        marked=[
+            {"updatedAt": f"{_day(d)}T09:00:00+00:00"} for d in (0, 1, 2, 5)
+        ],  # 3-day run, then a gap
     )
     stats = await repo.learning_stats("userA")
     assert stats["streak_days"] == 3
     assert stats["completed_this_week"] == 4
 
 
-async def test_a_quiet_today_does_not_break_the_streak(monkeypatch):
-    """The streak should only break once a full day has been missed — otherwise
-    it would read as 0 every morning until the learner studied."""
+async def test_the_streak_counts_digests_read_not_topics_finished(monkeypatch):
+    """The streak measures showing up, and showing up here means reading the
+    day's digest.
+
+    Keyed to topic completions it was unreachable rather than merely wrong: a
+    topic costs several instalments plus a passed checkpoint, the drip-feed sends
+    one a day, so finishing one on each of two consecutive days is not something
+    a learner does. Someone reading every day for a week saw 🔥1 at best.
+    """
     _stats_db(
         monkeypatch,
         [
             {
                 "status": "active",
+                # One topic finished, weeks ago — no help to a streak either way.
                 "topics": [
-                    {"progress_status": "completed", "completed_at": f"{_day(d)}T09:00:00+00:00"}
-                    for d in (1, 2)
+                    {"progress_status": "completed", "completed_at": f"{_day(30)}T09:00:00+00:00"}
                 ],
             }
         ],
+        marked=[{"updatedAt": f"{_day(d)}T20:00:00+00:00"} for d in range(5)],
+    )
+    stats = await repo.learning_stats("userA")
+    assert stats["streak_days"] == 5
+    # And the reverse: finishing a topic is not itself a day of showing up.
+    assert stats["completed_this_week"] == 0
+
+
+async def test_several_digests_read_in_one_day_are_still_one_day(monkeypatch):
+    """Catching up on a backlog is not a streak. Three digests marked this
+    afternoon is one day of showing up, not three."""
+    _stats_db(
+        monkeypatch,
+        [],
+        marked=[{"updatedAt": f"{_day(0)}T{h}:00:00+00:00"} for h in ("09", "14", "21")],
+    )
+    assert (await repo.learning_stats("userA"))["streak_days"] == 1
+
+
+async def test_a_quiet_today_does_not_break_the_streak(monkeypatch):
+    """The streak should only break once a full day has been missed — otherwise
+    it would read as 0 every morning until the learner opened that day's digest."""
+    _stats_db(
+        monkeypatch,
+        [],
+        marked=[{"updatedAt": f"{_day(d)}T09:00:00+00:00"} for d in (1, 2)],
     )
     assert (await repo.learning_stats("userA"))["streak_days"] == 2
+
+
+async def test_a_digest_with_no_timestamp_cannot_contribute_to_a_streak(monkeypatch):
+    _stats_db(monkeypatch, [], marked=[{}, {"updatedAt": None}, {"updatedAt": "nonsense"}])
+    assert (await repo.learning_stats("userA"))["streak_days"] == 0
 
 
 async def test_stats_on_an_empty_account_are_zeros_not_a_crash(monkeypatch):
@@ -1751,6 +1813,53 @@ async def test_stats_on_an_empty_account_are_zeros_not_a_crash(monkeypatch):
     assert stats["topics"]["percent"] == 0
     assert stats["streak_days"] == 0
     assert stats["quizzes"]["average_score"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# which day something happened on — the learner's, not the server's
+# --------------------------------------------------------------------------- #
+def test_a_day_is_the_learners_day_not_the_servers():
+    """Asia/Kolkata is UTC+5:30, so an evening in UTC is already tomorrow there.
+
+    On UTC boundaries a learner reading their digest after midnight local has it
+    filed under yesterday — and the run they were building breaks the next day
+    for no reason they can see.
+    """
+    from zoneinfo import ZoneInfo
+
+    stamp = "2026-08-17T19:00:00+00:00"  # 00:30 on the 18th in Kolkata
+    assert repo._local_day(stamp, ZoneInfo("UTC")) == "2026-08-17"
+    assert repo._local_day(stamp, ZoneInfo("Asia/Kolkata")) == "2026-08-18"
+    # And the other way: a Los Angeles morning is still the previous day there.
+    assert repo._local_day("2026-08-18T06:00:00+00:00", ZoneInfo("America/Los_Angeles")) == (
+        "2026-08-17"
+    )
+
+
+def test_a_timestamp_written_before_they_were_tz_aware_reads_as_utc():
+    from zoneinfo import ZoneInfo
+
+    assert repo._local_day("2026-08-17T19:00:00", ZoneInfo("Asia/Kolkata")) == "2026-08-18"
+
+
+@pytest.mark.parametrize("stamp", [None, "", "not a date", "2026-13-45"])
+def test_an_unusable_timestamp_is_dropped_rather_than_raising(stamp):
+    from zoneinfo import ZoneInfo
+
+    assert repo._local_day(stamp, ZoneInfo("UTC")) is None
+
+
+def test_consecutive_days_stops_at_the_first_gap():
+    from datetime import date
+
+    today = date(2026, 8, 17)
+    days = {"2026-08-17", "2026-08-16", "2026-08-15", "2026-08-13"}
+    assert repo.consecutive_days(days, today) == 3
+    # A quiet today counts back from yesterday instead of resetting to zero.
+    assert repo.consecutive_days(days - {"2026-08-17"}, today) == 2
+    # Two quiet days is a genuinely broken run.
+    assert repo.consecutive_days(days - {"2026-08-17", "2026-08-16"}, today) == 0
+    assert repo.consecutive_days(set(), today) == 0
 
 
 async def test_a_completed_topic_with_no_timestamp_still_counts(monkeypatch):

@@ -59,6 +59,15 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], str, str], ...] = (
         "a topic's digest history, and the archive",
     ),
     (
+        DIGESTS,
+        [("user_id", 1), ("status", 1), ("updatedAt", 1)],
+        "learning_digests_by_status",
+        # The streak in learning_stats, which reads every acknowledged digest the
+        # learner owns on each landing-screen load, and list_digests when the
+        # archive is filtered to unread without a roadmap.
+        "the streak, and the unread filter over the whole archive",
+    ),
+    (
         "quizzes",
         [("user_id", 1), ("roadmapId", 1), ("topicId", 1), ("kind", 1)],
         "learning_quizzes_by_topic",
@@ -132,6 +141,12 @@ _SHAPES = (
         DIGESTS,
         {"user_id": "u", "roadmapId": "r", "topicId": "t"},
         [("createdAt", -1), ("_id", -1)],
+    ),
+    (
+        "learning_stats streak (marked digests)",
+        DIGESTS,
+        {"user_id": "u", "status": "marked"},
+        None,
     ),
     (
         "recent_attempts (retry limits)",

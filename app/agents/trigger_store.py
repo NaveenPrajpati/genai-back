@@ -87,6 +87,28 @@ def next_run_at(trig: dict, now: datetime | None = None) -> str | None:
     return candidate.astimezone(timezone.utc).isoformat()
 
 
+async def user_zone(user_id: str, action_type: str) -> ZoneInfo:
+    """The timezone this user's `action_type` trigger is scheduled in, or UTC.
+
+    The trigger row is the only place a learner's timezone is recorded, and it is
+    already what decides when their day's work arrives. Anything else that has to
+    answer "which day did this happen on" — a streak, a daily cap — has to ask
+    the same question of the same source, or it will disagree with the schedule
+    the user actually set for users far from UTC.
+    """
+    try:
+        trig = await get_db()["triggers"].find_one(
+            {"user_id": user_id, "action_type": action_type},
+            {"timezone": 1, "user_id": 1},
+        )
+    except Exception as e:
+        logger.error("user_zone lookup failed user=%s: %s", user_id, e)
+        return ZoneInfo("UTC")
+    # A user who never opted in has no row, and UTC is the same default the
+    # trigger itself would have been created with.
+    return _zone(trig or {})
+
+
 async def due_triggers(action_type: str, now: datetime | None = None) -> list[dict]:
     """Enabled triggers of `action_type` that are due to fire right now."""
     now = now or datetime.now(timezone.utc)
