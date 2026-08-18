@@ -33,18 +33,22 @@ from app.core.config import (
     LEARNING_QUERY_RATE_LIMIT,
     LEARNING_QUERY_RATE_WINDOW,
     MISCONCEPTION_REPROBE_DAYS,
+    redis_client,
 )
 from app.services import rate_limit
 from app.agents.learning_tracker.service import (
+    build_briefing,
     build_checkpoint,
     grade_oneliner,
     judge_explanation,
     refresh_misconceptions,
 )
+from app.agents.learning_tracker.context import learner_context, situation_key
 from app.agents.learning_tracker.triggers import (
     build_digest,
     build_revision_digest,
     escalate_to_reteach,
+    pull_next_digest,
 )
 from app.agents.learning_tracker.repository import (
     LEARNING_NS,
@@ -881,6 +885,51 @@ async def get_focus(current_user: Annotated[dict, Depends(get_current_user)]):
     return {"status": "done", "result": await learning_focus(current_user["uid"])}
 
 
+# A briefing holds while the learner's position holds, so it is keyed on a
+# fingerprint of that position rather than on time — see `situation_key`. The TTL
+# is a backstop against a stale key surviving a deploy that changes the prompt,
+# not the thing that expires it.
+BRIEFING_CACHE_TTL = 6 * 60 * 60
+
+
+@router.get("/briefing")
+async def get_briefing(current_user: Annotated[dict, Depends(get_current_user)]):
+    """What the assistant says on arrival, before being asked anything.
+
+    The screen already lists what is outstanding. This is the judgement over that
+    list: which one thing to do first, why, and the actions to do it — which is
+    the part that previously lived in the client as a table of fixed copy keyed
+    on `blocked_reason`, and so could never weigh two situations against each
+    other or explain itself.
+
+    Generated once per *situation*, not per request. The learner opening the app
+    four times in an evening gets one LLM call; the fifth, after they read a
+    digest, gets a new one because the situation actually moved. A model failure
+    degrades to `fallback_briefing`, which is deterministic and follows the same
+    priority order — so this endpoint always answers.
+    """
+    user_id = current_user["uid"]
+    ctx = await learner_context(user_id, with_stats=True)
+    key = f"learning:briefing:{user_id}:{situation_key(ctx)}"
+
+    try:
+        cached = await redis_client.get(key)
+        if cached:
+            return {"status": "done", "result": json.loads(cached)}
+    except Exception:
+        # A cache that cannot be read is a cache miss, never a failed request.
+        logger.warning("briefing cache read failed user=%s", user_id)
+
+    briefing = await build_briefing(ctx)
+
+    try:
+        await redis_client.set(key, json.dumps(briefing), ex=BRIEFING_CACHE_TTL)
+    except Exception:
+        logger.warning("briefing cache write failed user=%s", user_id)
+
+    return {"status": "done", "result": briefing}
+
+
 @router.post("/digests/generate")
 async def generate_digest(
     current_user: Annotated[dict, Depends(get_current_user)],
@@ -905,59 +954,29 @@ async def generate_digest(
         LEARNING_DIGEST_RATE_LIMIT,
         LEARNING_DIGEST_RATE_WINDOW,
     )
-    roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
-    if not roadmap:
+    # Every guard lives in `pull_next_digest`, which the tutor's own
+    # `pull_next_lesson` tool calls as well: one copy of the rules, two ways in.
+    # This route's job is now only to turn a refusal into the status and detail
+    # shape shipped clients already read.
+    outcome = await pull_next_digest(user_id, roadmapId, topicId)
+    if "digest" in outcome:
+        return {"status": "done", "result": outcome["digest"]}
+
+    reason = outcome.get("reason")
+    if reason == "no_roadmap":
         raise HTTPException(status_code=404, detail="No active roadmap to digest.")
 
-    # A topic owed revision after a failed checkpoint gets that instead. It's no
-    # longer `in_progress`, so the teaching path below would find nothing to send
-    # and report "nothing new" to a learner who is in fact blocked.
-    owed = next(
-        (t for t in roadmap.get("topics") or [] if revision_outstanding(t)), None
-    )
-    if owed and topicId in (None, owed["id"]):
-        revision = await build_revision_digest(
-            user_id, roadmap, owed["id"], notify=False
-        )
-        if revision:
-            return {"status": "done", "result": revision}
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Your revision tips are already waiting — go over those first.",
-                "blocked_reason": "needs_revision",
-                "topicId": owed["id"],
-            },
-        )
+    # A bare string rather than an object, as before: the client renders a string
+    # detail directly, and an object would reach a <Text> child as "[object Object]".
+    if reason == "nothing_to_send":
+        raise HTTPException(status_code=409, detail=outcome["refused"])
 
-    # Checked here as well as inside `build_digest` only to say which check is
-    # outstanding. `build_digest` returns a bare None, and "nothing new to send"
-    # would send the learner looking for a digest that isn't the problem.
-    topic = in_progress_topic(roadmap)
-    if topic:
-        gated_on = digest_quiz_gate(
-            await topic_digest_states(user_id, str(roadmap["_id"]), topic.get("id"))
-        )
-        if gated_on:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": (
-                        f"Pass the recall check on digest #{gated_on} first — "
-                        "it's on the digest itself."
-                    ),
-                    "blocked_reason": "awaiting_quiz",
-                    "sequence": gated_on,
-                },
-            )
-
-    digest = await build_digest(user_id, roadmap, topicId, notify=False)
-    if not digest:
-        raise HTTPException(
-            status_code=409,
-            detail="Nothing new to send — finish the digest you already have, or the roadmap is complete.",
-        )
-    return {"status": "done", "result": digest}
+    detail = {"message": outcome["refused"], "blocked_reason": reason}
+    if reason == "needs_revision":
+        detail["topicId"] = outcome["topicId"]
+    if reason == "awaiting_quiz":
+        detail["sequence"] = outcome["sequence"]
+    raise HTTPException(status_code=409, detail=detail)
 
 
 NoteKind = Literal["note", "snippet", "link", "question"]

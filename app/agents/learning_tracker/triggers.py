@@ -39,9 +39,11 @@ from .repository import (
     mark_misconceptions_addressed,
     in_progress_topic,
     public_question,
+    resolve_roadmap_id,
     revision_outstanding,
     set_topic_progress,
     teaching_digests,
+    topic_digest_states,
     topic_digests,
 )
 from .tools import tavily_search_tool
@@ -638,6 +640,75 @@ async def escalate_to_reteach(
 
     doc["quiz"] = None
     return {**doc, "_id": str(res.inserted_id)}
+
+
+async def pull_next_digest(
+    user_id: str, roadmapId: Optional[str] = None, topicId: Optional[str] = None
+) -> dict:
+    """Everything that decides what "give me the next lesson" produces.
+
+    Extracted so the HTTP route and the tutor's `pull_next_lesson` tool cannot
+    drift: the guards here are the ones that keep the drip-feed honest, and a
+    second copy of them behind the chat path would be a second chance to get one
+    of them wrong. The route turns a refusal into an HTTP status; the tool turns
+    the same refusal into a sentence.
+
+    Returns `{"digest": …}` on success, or `{"refused": <why>, "reason": <code>}`
+    — never raises for an ordinary refusal, because "you can't have one yet" is
+    an answer rather than a failure.
+    """
+    roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
+    if not roadmap:
+        return {"refused": "There's no active roadmap to pull a lesson from.",
+                "reason": "no_roadmap"}
+
+    # A topic owed revision after a failed checkpoint gets that instead. It's no
+    # longer `in_progress`, so the teaching path below would find nothing to send
+    # and report "nothing new" to a learner who is in fact blocked.
+    owed = next(
+        (t for t in roadmap.get("topics") or [] if revision_outstanding(t)), None
+    )
+    if owed and topicId in (None, owed["id"]):
+        revision = await build_revision_digest(
+            user_id, roadmap, owed["id"], notify=False
+        )
+        if revision:
+            return {"digest": revision}
+        return {
+            "refused": "Your revision tips are already waiting — go over those first.",
+            "reason": "needs_revision",
+            "topicId": owed["id"],
+        }
+
+    # Checked here as well as inside `build_digest` only to say which check is
+    # outstanding. `build_digest` returns a bare None, and "nothing new to send"
+    # would send the learner looking for a digest that isn't the problem.
+    topic = in_progress_topic(roadmap)
+    if topic:
+        gated_on = digest_quiz_gate(
+            await topic_digest_states(user_id, str(roadmap["_id"]), topic.get("id"))
+        )
+        if gated_on:
+            return {
+                "refused": (
+                    f"Pass the recall check on digest #{gated_on} first — "
+                    "it's on the digest itself."
+                ),
+                "reason": "awaiting_quiz",
+                "topicId": topic.get("id"),
+                "sequence": gated_on,
+            }
+
+    digest = await build_digest(user_id, roadmap, topicId, notify=False)
+    if not digest:
+        return {
+            "refused": (
+                "Nothing new to send — finish the digest you already have, or the "
+                "roadmap is complete."
+            ),
+            "reason": "nothing_to_send",
+        }
+    return {"digest": digest}
 
 
 async def run_triggers(agent=None):

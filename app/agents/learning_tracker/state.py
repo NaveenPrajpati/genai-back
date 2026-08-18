@@ -342,6 +342,12 @@ class LearningState(TypedDict, total=False):
     user_id: str
     thread_id: str
     memory: dict
+    # Where the learner is standing: what's running, what's blocked and why,
+    # what's due, what isn't sticking. Assembled once per turn by `load_context`
+    # and read by every node that writes something the learner will read — see
+    # `context.py`. `memory` is who they are; this is their current position, and
+    # an agent with only the first can answer but cannot coach.
+    context: Optional[dict]
     plan_status: Optional[str]
     log_status: Optional[str]
     conflict: Optional[dict]
@@ -353,7 +359,16 @@ class LearningState(TypedDict, total=False):
     pa_tasks_created: Optional[int]
     next_topic: str
     progress: Optional[dict]
+    # The coached sentence that accompanies `progress` on a "what next?" turn.
+    # Kept apart from the numbers beside it: those are computed and exact, this
+    # is written and advisory, and a failure to produce it must not take the
+    # progress card down with it.
+    guidance: Optional[str]
     topic_explaination: str
+    # Names of the tools an `take_action` turn actually ran. The client refreshes
+    # what they touched — a list rather than a flag so it can re-read only what
+    # moved instead of the whole section on every turn.
+    actions_taken: Optional[list]
     quiz: list[dict]
     quizId: str
     quiz_result: Optional[dict]
@@ -369,6 +384,10 @@ class IntentOutput(BaseModel):
         "update_progress",
         "query_roadmap",
         "modify_roadmap",
+        # The learner asking for something to be *done*, not described. Routed to
+        # the one node holding tools — see `actions.py` for what it may and may
+        # not touch.
+        "take_action",
         "chitchat",
         "fallback",
     ]
@@ -433,3 +452,53 @@ ONBOARDED_FLAG = "onboarded"
 
 class TopicTipsOutput(BaseModel):
     bullets: list[str]
+
+
+# ── the briefing: the agent speaking first ───────────────────────────────────
+BriefingActionKind = Literal[
+    "open_roadmap",
+    "read_digests",
+    "generate_digest",
+    "open_checkpoint",
+    "open_reviews",
+    "create_roadmap",
+    "ask",
+]
+
+
+class BriefingAction(BaseModel):
+    """One thing the learner could do next, as a typed instruction.
+
+    A `kind` from a fixed set plus the ids it applies to — never a route, a
+    screen name, or a URL. The client owns navigation: a model inventing
+    "/learning/next" produces a button that goes nowhere, and one inventing an id
+    produces a button that goes somewhere wrong.
+
+    Every action is checked against the learner's actual situation before it is
+    sent, so a briefing cannot offer a checkpoint the server would refuse — the
+    same rule the topic card already follows on the client.
+    """
+
+    kind: BriefingActionKind
+    label: str = Field(description="What the button says. Four words at most.")
+    roadmapId: Optional[str] = None
+    topicId: Optional[str] = None
+    # `ask` only: the message to put to the tutor on the learner's behalf.
+    prompt: Optional[str] = None
+
+
+class BriefingOutput(BaseModel):
+    """What the assistant says when the learner arrives, before being asked.
+
+    One judgement, not a status report. The screen already lists everything
+    outstanding and repeating that list in prose helps nobody; this says which of
+    it matters most right now, and why.
+    """
+
+    headline: str = Field(
+        description="The one thing that matters right now. One sentence, under 15 words."
+    )
+    detail: str = Field(
+        description="Why it matters and what it will take. One or two sentences."
+    )
+    actions: list[BriefingAction] = Field(default_factory=list)

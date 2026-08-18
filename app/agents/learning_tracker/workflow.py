@@ -1,11 +1,13 @@
 """LangGraph nodes and graph wiring for the learning-tracker agent."""
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import START, StateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
@@ -15,6 +17,8 @@ from app.agents.approval_store import get_pending, create_pending, resolve
 from app.agents.react import run_tool_loop
 from app.agents.memory_store import get_profile, save_profile
 from .service import build_roadmap, revise_roadmap, sync_roadmap_to_pa
+from .context import learner_context, situation_text
+from .actions import build_action_tools
 from .state import (
     LearningState,
     LearnerMemory,
@@ -70,6 +74,17 @@ async def classify_intent(state: LearningState):
                 "- update_progress: user marks progress, completes a step, or logs learning activity\n"
                 "- query_roadmap: user asks what to do next in their roadmap, or wants to view/check its current state\n"
                 "- modify_roadmap: user wants to change, restructure, or regenerate their roadmap\n"
+                # The distinction that matters is asking-about versus asking-for.
+                # "What should I do next?" wants an answer; "start the next topic"
+                # wants it done. Spelled out with examples because the two are one
+                # word apart and the wrong branch is a tutor describing a button.
+                "- take_action: user asks the assistant to DO something to their learning setup: "
+                "start/begin a topic, send or generate today's lesson now, pause or resume a "
+                "roadmap, write a note down for them, or change what time lessons arrive. "
+                "Examples: 'start the next topic', 'give me today's lesson now', 'pause Rust', "
+                "'note that I keep mixing these up', 'send my lessons at 7am'. "
+                "Choose query_roadmap instead when they are only asking what to do, not asking "
+                "you to do it.\n"
                 "- chitchat: greetings, small talk, or meta questions about what this agent can do\n"
                 "- fallback: the message is unclear, ambiguous, or outside the scope of learning/studying\n"
                 "When unsure between a real action and fallback, prefer fallback only if no learning action clearly fits.\n",
@@ -87,8 +102,14 @@ async def classify_intent(state: LearningState):
 
     # Intent depends only on the message and is user-independent → global scope,
     # shared across users, with the loose classification threshold.
+    #
+    # The scope carries a version, and it MUST be bumped whenever the label set
+    # changes. Entries cached under the old scope hold verdicts from a classifier
+    # that had never heard of the new label, so "start the next topic" would go on
+    # resolving to `update_progress` for the rest of the TTL — a new intent that
+    # silently does nothing for existing phrasings. v2 added `take_action`.
     data = await cached_value(
-        query, "agent:learning:classify_intent", CACHE_CLASSIFY_THRESHOLD, produce
+        query, "agent:learning:classify_intent:v2", CACHE_CLASSIFY_THRESHOLD, produce
     )
     return {"intent": data["intent"]}
 
@@ -180,7 +201,17 @@ async def tutor_agent(state: LearningState):
                     "system",
                     "You are an expert in: {existing_roadmap}\n"
                     "Briefly explain the topic the user wants to know — prefer bullet points.\n"
-                    "Pitch the explanation to the learner's profile:\n{memory}",
+                    "Pitch the explanation to the learner's profile:\n{memory}\n"
+                    # The difference between an explanation and a *tutor's*
+                    # explanation. A learner who has failed this topic's recall
+                    # check twice on the same point needs that point attacked,
+                    # not the same treatment a stranger would get.
+                    "Where they currently stand:\n{situation}\n"
+                    "Use that: if one of their recorded misunderstandings bears on "
+                    "what they asked, teach directly against it. Do NOT say you are "
+                    "doing so, do not mention their mistakes, scores or progress, and "
+                    "do not tell them what is coming in a future question — teach the "
+                    "point, and let the correction be the explanation.",
                 ),
                 ("human", "{text}"),
             ]
@@ -195,6 +226,7 @@ async def tutor_agent(state: LearningState):
                 "text": state["query"],
                 "existing_roadmap": roadmap_title,
                 "memory": state.get("memory") or "none",
+                "situation": situation_text(state.get("context")),
             }
         )
         logger.info("query data %s", response.content)
@@ -313,12 +345,63 @@ async def progress_agent(state: LearningState):
     existing_roadmap = await fetch_roadmap(state.get("roadmapId"), user_id)
 
     if state.get("intent") == "query_roadmap":
-        # Pure data work — what's next and how far along is fully determined by
-        # `progress_status` / `order`. No LLM: it can't hallucinate or miscount.
+        # The numbers stay pure data work: what's next and how far along is fully
+        # determined by `progress_status` / `order`, and a model asked to count
+        # them would eventually miscount. What the model adds is the part a count
+        # cannot be — which of it to do first, and why.
+        #
+        # This is the path behind "what should I work on next?", and answering
+        # that with a progress bar was the most mechanical moment in the whole
+        # app. The bar was never wrong; it just wasn't an answer.
         progress = roadmap_progress(existing_roadmap)
+        guidance = ""
+        if existing_roadmap:
+            try:
+                chain = (
+                    ChatPromptTemplate.from_messages(
+                        [
+                            (
+                                "system",
+                                "You are the learner's coach. They have asked what to "
+                                "work on next.\n"
+                                "Their situation:\n{situation}\n"
+                                "Answer in one or two sentences: name the single thing "
+                                "to do first, and why it is that one.\n"
+                                "Rules:\n"
+                                "- The screen beside you already shows their progress "
+                                "and next topic. Do not restate counts, percentages or "
+                                "the topic name as a heading — add the judgement they "
+                                "cannot read off a bar.\n"
+                                "- Prefer an overdue review, then anything blocking a "
+                                "roadmap, then unread digests.\n"
+                                "- Never state a clock time or countdown.\n"
+                                "- Never use internal names like blocked_reason or "
+                                "needs_revision; say what they mean.\n"
+                                "- Speak to them as 'you'. No praise, no exclamation "
+                                "marks.",
+                            ),
+                            ("human", "{text}"),
+                        ]
+                    )
+                    | fast_llm
+                )
+                reply = await chain.ainvoke(
+                    {
+                        "text": state.get("query", "What should I do next?"),
+                        "situation": situation_text(state.get("context")),
+                    }
+                )
+                guidance = (reply.content or "").strip()
+            except Exception as e:
+                # The card renders from `progress` alone, exactly as it did
+                # before this existed — the coaching is the addition, not the
+                # substance, and losing it must not lose the answer.
+                logger.error("query_roadmap guidance failed: %s", e)
+
         return {
             "next_topic": progress["next_topic"] or "",
             "progress": progress,
+            "guidance": guidance,
             "log_status": "listed" if existing_roadmap else "no_roadmap",
         }
 
@@ -418,6 +501,79 @@ async def research_agent(state: LearningState):
     return {"suggestions": [r.model_dump() for r in result.resources]}
 
 
+_ACTION_SYSTEM = """You are the learner's tutor, and you can act on their behalf \
+rather than telling them where to tap.
+
+Their situation:
+{situation}
+
+Do what they asked, then say what you did in one or two sentences.
+
+Rules:
+- Resolve ids with list_topics before any action that needs a topicId. Never \
+guess an id, and never invent one.
+- Take the action. Do not ask permission for something they just asked for; if \
+their request is genuinely ambiguous between two roadmaps or two topics, ask one \
+short question instead of guessing.
+- If a tool declines, relay its reason in your own words and say what would \
+unblock it. A refusal is an answer, not an error — do not retry it.
+- Never claim to have done something a tool did not confirm.
+- You cannot mark a lesson as read, complete a topic, or answer a check for them. \
+Those are earned by doing them. If they ask, say so plainly and without apology, \
+and point at what would actually move it.
+- Speak to them as "you". No clock times, no internal names, no exclamation marks.
+"""
+
+
+async def action_agent(state: LearningState):
+    """Does the thing, instead of describing where the button is.
+
+    The tools are built per turn and closed over this learner's id — see
+    `build_action_tools`, which also carries the rules about what may never be
+    exposed. The loop is the shared ReAct one: look ids up, act, report.
+
+    On any failure this degrades to an explanation rather than a stack trace: the
+    learner asked for something to happen, and "I couldn't" is a worse answer than
+    a description of what to do, but both beat a broken turn.
+    """
+    user_id = state.get("user_id")
+    tools = build_action_tools(user_id)
+
+    messages = [
+        SystemMessage(
+            content=_ACTION_SYSTEM.format(situation=situation_text(state.get("context")))
+        ),
+        HumanMessage(content=state.get("query", "")),
+    ]
+
+    try:
+        messages = await run_tool_loop(llm.bind_tools(tools), ToolNode(tools), messages)
+    except Exception as e:
+        logger.error("action_agent tool loop failed: %s", e)
+        return {
+            "topic_explaination": (
+                "I couldn't do that just now — the action didn't go through. "
+                "Nothing has changed, so it's safe to ask again."
+            ),
+            "actions_taken": [],
+        }
+
+    # Which tools actually ran. The client refreshes what they touched, and
+    # returning the names rather than a bare flag means it can refresh only what
+    # moved instead of re-reading the whole section on every chat turn.
+    taken = [
+        call["name"]
+        for message in messages
+        for call in (getattr(message, "tool_calls", None) or [])
+    ]
+    reply = messages[-1].content if messages else ""
+
+    return {
+        "topic_explaination": reply or "Done.",
+        "actions_taken": taken,
+    }
+
+
 async def fallback_agent(state: LearningState):
     """Handles anything the router can't map to a real learning action:
     capability questions, greetings, ambiguous input, and off-scope requests.
@@ -445,7 +601,14 @@ async def fallback_agent(state: LearningState):
                 "politely in one line and redirect — do not attempt to answer it.\n"
                 "- Keep it to 2-4 sentences. Prefer bullets only when listing "
                 "capabilities.\n"
-                "Learner profile (for tone/level only):\n{memory}",
+                "Learner profile (for tone/level only):\n{memory}\n"
+                # A greeting is the single best moment to say the useful thing,
+                # and answering "hi" with a feature list wastes it.
+                "Where they currently stand:\n{situation}\n"
+                "If they are greeting you or asking what you can do, lead with the "
+                "one thing actually waiting for them rather than a list of features — "
+                "name it, then keep the capabilities to a line. Never state a clock "
+                "time or countdown, and never use internal names like blocked_reason.",
             ),
             ("human", "{text}"),
         ]
@@ -456,6 +619,7 @@ async def fallback_agent(state: LearningState):
         {
             "text": state.get("query", ""),
             "memory": state.get("memory") or "none",
+            "situation": situation_text(state.get("context")),
         }
     )
     logger.info("fallback_agent reply: %s", response.content)
@@ -513,13 +677,30 @@ async def onboard(state: LearningState):
     return {"memory": {**(state.get("memory") or {}), **profile}}
 
 
-async def load_memory(state: LearningState):
+async def load_context(state: LearningState):
+    """Who the learner is, which roadmap they mean, and where they are standing.
+
+    The third of those is what separates a tutor from a router. Until it existed,
+    every node saw the learner's profile and their message and nothing else — so
+    the agent could explain a topic but could not know the learner had failed its
+    checkpoint that morning, and every judgement of that kind had to be made in
+    the client instead.
+
+    All three reads are independent, so they go out together: the situation costs
+    about what one screen load costs, and it is paid once per turn rather than
+    once per node.
+    """
     user_id = state["user_id"]
-    memory = await get_profile(user_id, LEARNING_NS)
-    # A bare "what should I study next?" carries no roadmapId, so resolve the
-    # learner's current roadmap once here for every downstream node to use.
-    roadmapId = await resolve_roadmap_id(user_id, state.get("roadmapId"))
-    return {"memory": memory, "roadmapId": roadmapId}
+    memory, roadmapId, context = await asyncio.gather(
+        get_profile(user_id, LEARNING_NS),
+        # A bare "what should I study next?" carries no roadmapId, so resolve the
+        # learner's current roadmap once here for every downstream node to use.
+        resolve_roadmap_id(user_id, state.get("roadmapId")),
+        # Cheap half only — mastery sweeps every attempt ever recorded, which is
+        # a briefing's cost to pay, not a chat turn's. See `learner_context`.
+        learner_context(user_id),
+    )
+    return {"memory": memory, "roadmapId": roadmapId, "context": context}
 
 
 def decide_onboarding(state: LearningState):
@@ -536,6 +717,7 @@ INTENT_ROUTES = {
     "find_resources": "research_agent",
     "update_progress": "progress_agent",
     "query_roadmap": "progress_agent",
+    "take_action": "action_agent",
     "chitchat": "fallback_agent",
     "fallback": "fallback_agent",
 }
@@ -547,7 +729,7 @@ def decide_agent(state: LearningState):
 
 def build_graph() -> StateGraph:
     graph = StateGraph(LearningState)
-    graph.add_node("load_memory", load_memory)
+    graph.add_node("load_context", load_context)
     graph.add_node("onboard", onboard)
     graph.add_node("classify_intent", classify_intent)
     graph.add_node("roadmap_agent", roadmap_agent)
@@ -555,11 +737,12 @@ def build_graph() -> StateGraph:
     graph.add_node("tutor_agent", tutor_agent)
     graph.add_node("quiz_grader_agent", quiz_grader_agent)
     graph.add_node("research_agent", research_agent)
+    graph.add_node("action_agent", action_agent)
     graph.add_node("fallback_agent", fallback_agent)
 
-    graph.add_edge(START, "load_memory")
+    graph.add_edge(START, "load_context")
     graph.add_conditional_edges(
-        "load_memory", decide_onboarding, ["onboard", "classify_intent"]
+        "load_context", decide_onboarding, ["onboard", "classify_intent"]
     )
     graph.add_edge("onboard", "classify_intent")
     graph.add_conditional_edges(

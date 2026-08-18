@@ -329,13 +329,27 @@ def test_onboarding_runs_once_then_never_again():
     assert lt.decide_onboarding({"memory": {"onboarded": True}}) == "classify_intent"
 
 
-async def test_load_memory_resolves_the_active_roadmap(monkeypatch):
+async def test_load_context_resolves_the_active_roadmap(monkeypatch):
     """A bare "what should I study next?" carries no roadmapId."""
     monkeypatch.setattr(lt, "get_profile", AsyncMock(return_value={}))
     monkeypatch.setattr(lt, "resolve_roadmap_id", AsyncMock(return_value="resolved"))
+    monkeypatch.setattr(lt, "learner_context", AsyncMock(return_value={}))
 
-    out = await lt.load_memory({"user_id": "userA", "roadmapId": None})
+    out = await lt.load_context({"user_id": "userA", "roadmapId": None})
     assert out["roadmapId"] == "resolved"
+
+
+async def test_load_context_carries_the_learner_position(monkeypatch):
+    """Every node downstream reads `context`; without it the agent can answer a
+    question but cannot know what the learner is in the middle of."""
+    monkeypatch.setattr(lt, "get_profile", AsyncMock(return_value={}))
+    monkeypatch.setattr(lt, "resolve_roadmap_id", AsyncMock(return_value="r1"))
+    monkeypatch.setattr(
+        lt, "learner_context", AsyncMock(return_value={"unread_digests": 3})
+    )
+
+    out = await lt.load_context({"user_id": "userA", "roadmapId": "r1"})
+    assert out["context"] == {"unread_digests": 3}
 
 
 async def test_onboarding_keeps_only_the_keys_it_asked_for(monkeypatch):
@@ -4148,3 +4162,307 @@ async def test_the_count_reaches_the_client(monkeypatch):
 
     assert result["passed"] is True
     assert result["digests_closed"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# the briefing: the agent speaking first
+#
+# The judgement is a model's and isn't tested here. What is tested is the part
+# that must hold regardless of what the model says: a briefing may never offer an
+# action the server would refuse, and it must still answer when the model doesn't.
+# --------------------------------------------------------------------------- #
+
+from app.agents.learning_tracker.context import situation_key, situation_text
+from app.agents.learning_tracker.service import (
+    _briefing_action_allowed,
+    fallback_briefing,
+)
+from app.agents.learning_tracker.state import BriefingAction
+
+
+def _ctx(**overrides):
+    base = {
+        "roadmaps": [
+            {
+                "roadmapId": "r1",
+                "title": "Rust",
+                "topic": "Ownership",
+                "topicId": "t3",
+                "topic_status": "needs_review",
+                "completed": 2,
+                "total": 21,
+                "percent": 10,
+                "unread": 0,
+                "can_generate": True,
+                "blocked_reason": None,
+                "blocked_meaning": None,
+            }
+        ],
+        "unread_digests": 0,
+        "reviews_due": [],
+        "reviews_due_total": 0,
+        "misconceptions": [],
+        "misconceptions_total": 0,
+        "mastery": None,
+        "streak_days": None,
+        "profile": {},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_briefing_never_offers_a_checkpoint_that_owes_revision():
+    """The server refuses the attempt until the revision digest is read, so
+    offering it would be the dead end the rest of the app avoids by hand."""
+    ctx = _ctx()
+    action = BriefingAction(
+        kind="open_checkpoint", label="Take it", roadmapId="r1", topicId="t3"
+    )
+    assert _briefing_action_allowed(action, ctx) is True
+
+    ctx["roadmaps"][0]["blocked_reason"] = "needs_revision"
+    assert _briefing_action_allowed(action, ctx) is False
+
+
+def test_briefing_never_offers_a_checkpoint_on_an_unfinished_topic():
+    ctx = _ctx()
+    ctx["roadmaps"][0]["topic_status"] = "in_progress"
+    action = BriefingAction(
+        kind="open_checkpoint", label="Take it", roadmapId="r1", topicId="t3"
+    )
+    assert _briefing_action_allowed(action, ctx) is False
+
+
+def test_briefing_respects_can_generate():
+    """The same flag the home screen's button reads, so the two can't disagree
+    about whether anything can be pulled."""
+    ctx = _ctx()
+    action = BriefingAction(
+        kind="generate_digest", label="Pull one", roadmapId="r1", topicId="t3"
+    )
+    assert _briefing_action_allowed(action, ctx) is True
+
+    ctx["roadmaps"][0]["can_generate"] = False
+    assert _briefing_action_allowed(action, ctx) is False
+
+
+def test_briefing_rejects_an_invented_roadmap():
+    """A model that hallucinates an id must not produce a button that goes
+    somewhere wrong."""
+    action = BriefingAction(kind="open_roadmap", label="Go", roadmapId="nope")
+    assert _briefing_action_allowed(action, _ctx()) is False
+
+
+def test_briefing_only_offers_reviews_when_one_is_due():
+    ctx = _ctx()
+    action = BriefingAction(kind="open_reviews", label="Review")
+    assert _briefing_action_allowed(action, ctx) is False
+
+    ctx["reviews_due"] = [{"topicId": "t1", "title": "Borrowing", "overdue_days": 2}]
+    assert _briefing_action_allowed(action, ctx) is True
+
+
+def test_briefing_only_offers_roadmap_creation_when_there_is_none():
+    action = BriefingAction(kind="create_roadmap", label="Build one")
+    assert _briefing_action_allowed(action, _ctx()) is False
+    assert _briefing_action_allowed(action, _ctx(roadmaps=[])) is True
+
+
+def test_fallback_briefing_leads_with_an_overdue_review():
+    """Model unavailable is not the same as nothing to say. The fallback follows
+    the same priority order the prompt asks for."""
+    ctx = _ctx(
+        reviews_due=[{"topicId": "t1", "title": "Borrowing", "overdue_days": 3}],
+        reviews_due_total=1,
+    )
+    out = fallback_briefing(ctx)
+    assert "Borrowing" in out["headline"]
+    assert out["actions"][0]["kind"] == "open_reviews"
+
+
+def test_fallback_briefing_sends_a_new_learner_to_build_a_roadmap():
+    out = fallback_briefing(_ctx(roadmaps=[]))
+    assert out["actions"][0]["kind"] == "create_roadmap"
+
+
+def test_fallback_briefing_always_answers():
+    """Every branch produces a headline and a detail — an empty coach is worse
+    than a plain one."""
+    for ctx in (_ctx(), _ctx(roadmaps=[]), _ctx(unread_digests=2)):
+        out = fallback_briefing(ctx)
+        assert out["headline"] and out["detail"]
+
+
+def test_situation_key_ignores_the_clock():
+    """A briefing holds while the learner's position holds. Keying it on anything
+    that ticks would expire advice that is still correct."""
+    a = _ctx()
+    b = _ctx()
+    b["next_digest_at"] = "2030-01-01T09:00:00Z"
+    assert situation_key(a) == situation_key(b)
+
+
+def test_situation_key_moves_when_the_position_does():
+    a = _ctx()
+    b = _ctx()
+    b["roadmaps"][0]["blocked_reason"] = "needs_revision"
+    assert situation_key(a) != situation_key(b)
+
+
+def test_situation_text_never_leaks_the_probe():
+    """`probe` describes how a misunderstanding will be re-tested. Every consumer
+    of this text writes something the learner reads."""
+    ctx = _ctx(
+        misconceptions=[
+            {
+                "topic": "Ownership",
+                "roadmap": "Rust",
+                "label": "Move equals copy",
+                "detail": "Believes assignment copies.",
+            }
+        ]
+    )
+    text = situation_text(ctx)
+    assert "Move equals copy" in text
+    assert "probe" not in text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# the action tools: the tutor doing things rather than describing buttons
+#
+# The safety property is the one that has to hold no matter what the model asks
+# for: no tool may open a gate. A digest is acknowledged by passing its recall
+# check, a topic is completed by passing its checkpoint, and neither is reachable
+# from chat — otherwise every mastery score in the app is a claim about nothing.
+# --------------------------------------------------------------------------- #
+
+import app.agents.learning_tracker.actions as lt_actions
+
+
+def _tools(user_id="userA"):
+    return {t.name: t for t in lt_actions.build_action_tools(user_id)}
+
+
+def test_no_tool_can_open_a_gate():
+    """The whole product rests on these three being unreachable from chat."""
+    names = set(_tools())
+    forbidden = {
+        "mark_digest_read",
+        "mark_digest",
+        "complete_topic",
+        "set_topic_complete",
+        "submit_checkpoint",
+        "answer_check",
+        "submit_quiz",
+        "delete_roadmap",
+    }
+    assert names & forbidden == set()
+
+
+def test_no_tool_accepts_a_user_id():
+    """Tools close over the learner instead of taking one as an argument, so a
+    model has no parameter through which to reach another learner's data."""
+    for name, tool in _tools().items():
+        fields = set(tool.args_schema.model_fields)
+        assert "user_id" not in fields, name
+        assert "userId" not in fields, name
+
+
+async def test_start_topic_says_what_it_displaced(monkeypatch):
+    """Exactly one topic is underway, so starting one gives another up. A learner
+    told only "started X" has not been told the whole truth."""
+    roadmap = {
+        "_id": ObjectId(),
+        "title": "Rust",
+        "topics": [
+            {"id": "t1", "order": 1, "title": "Ownership", "progress_status": "in_progress"},
+            {"id": "t2", "order": 2, "title": "Borrowing", "progress_status": "not_started"},
+        ],
+    }
+    monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    monkeypatch.setattr(lt_actions, "start_topic", AsyncMock(return_value=True))
+
+    out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": "t2"})
+    assert "Borrowing" in out
+    assert "Ownership" in out
+
+
+async def test_start_topic_refuses_an_unknown_topic(monkeypatch):
+    roadmap = {"_id": ObjectId(), "title": "Rust", "topics": []}
+    monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    started = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt_actions, "start_topic", started)
+
+    out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": "nope"})
+    assert "No topic" in out
+    started.assert_not_awaited()
+
+
+async def test_pull_next_lesson_relays_a_refusal_verbatim(monkeypatch):
+    """A gate that stops the drip-feed has to reach the learner as the reason it
+    is, not as a generic failure — and the tool must not retry around it."""
+    monkeypatch.setattr(
+        lt_actions,
+        "pull_next_digest",
+        AsyncMock(
+            return_value={
+                "refused": "Pass the recall check on digest #2 first — it's on the digest itself.",
+                "reason": "awaiting_quiz",
+            }
+        ),
+    )
+    out = await _tools()["pull_next_lesson"].ainvoke({})
+    assert "recall check" in out
+
+
+async def test_pull_next_lesson_reports_a_delivered_digest(monkeypatch):
+    monkeypatch.setattr(
+        lt_actions,
+        "pull_next_digest",
+        AsyncMock(
+            return_value={
+                "digest": {"topicTitle": "Ownership", "bullets": ["a", "b", "c"], "quiz": None}
+            }
+        ),
+    )
+    out = await _tools()["pull_next_lesson"].ainvoke({})
+    assert "Ownership" in out
+    assert "3 points" in out
+
+
+async def test_resume_explains_the_active_cap(monkeypatch):
+    """Being over the cap is a choice to make, not an error to report."""
+    monkeypatch.setattr(
+        lt_actions, "fetch_roadmap", AsyncMock(return_value={"title": "Go"})
+    )
+    monkeypatch.setattr(
+        lt_actions,
+        "set_roadmap_status",
+        AsyncMock(side_effect=repo.ActiveRoadmapLimit(2, [{"title": "Rust"}, {"title": "SQL"}])),
+    )
+    out = await _tools()["resume_roadmap"].ainvoke({"roadmapId": "r9"})
+    assert "Rust" in out and "SQL" in out
+    assert "paused first" in out
+
+
+async def test_set_digest_time_rejects_a_bad_hour(monkeypatch):
+    """The validation lives in one place and both callers report it their own way;
+    the tool's way is a sentence."""
+    out = await _tools()["set_digest_time"].ainvoke({"hour": 99})
+    assert "0-23" in out
+
+
+async def test_list_topics_reports_ids_so_actions_need_no_guessing(monkeypatch):
+    roadmap = {
+        "_id": ObjectId(),
+        "title": "Rust",
+        "topics": [{"id": "t7", "order": 1, "title": "Ownership", "progress_status": "in_progress"}],
+    }
+    monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    out = await _tools()["list_topics"].ainvoke({"roadmapId": "r1"})
+    assert "id=t7" in out
+    assert "in_progress" in out
+
+
+def test_take_action_routes_to_a_node_that_exists():
+    assert lt.INTENT_ROUTES["take_action"] in set(lt.build_graph().nodes)

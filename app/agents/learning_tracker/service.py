@@ -28,6 +28,8 @@ from app.agents.personal_assistant.service import (
     create_tasks as create_pa_tasks,
 )
 from .state import (
+    BriefingAction,
+    BriefingOutput,
     CoverageOutput,
     ExplanationJudgement,
     MisconceptionOutput,
@@ -37,6 +39,7 @@ from .state import (
     RoadmapOutput,
     TopicTipsOutput,
 )
+from .context import situation_text
 from .repository import (
     get_misconceptions,
     insertRoadmapToDb,
@@ -573,6 +576,197 @@ async def check_coverage(topic: dict, bullets: List[str]) -> CoverageOutput:
             "bullets": "\n".join(f"- {b}" for b in bullets) or "- (none yet)",
         }
     )
+
+
+_BRIEFING_SYSTEM = """You are a learning coach opening a conversation with a learner \
+who has just arrived. Say the one thing that matters most right now.
+
+Their situation:
+{situation}
+
+What you are for: this app tracks a roadmap of topics, teaches each one through \
+short daily digests, and only marks a topic complete when the learner passes its \
+checkpoint. Completed topics come back later for spaced review.
+
+Rules:
+- ONE priority. The screen already lists everything outstanding; your job is to \
+say which of it to do first, not to repeat the list.
+- Prefer, in order: an overdue review, a blocked roadmap the learner can unblock, \
+unread digests, then anything else. A learner with nothing pressing should be told \
+that plainly rather than given busywork.
+- Speak to them, not about them. "You" and "your", never "the learner".
+- Never state a clock time or a countdown ("in 6 hours", "at 09:00"). This text is \
+cached and reused while the situation holds, so anything time-relative goes stale. \
+The screen shows the schedule itself.
+- Never mention internal names: blocked_reason, needs_revision, roadmapId. Say what \
+it means in plain words.
+- Do not invent topics, roadmaps or numbers. If it is not in the situation above, \
+it did not happen.
+- No praise for showing up, no exclamation marks, no "let's dive in".
+
+Actions: offer one to three, most important first, and only ones the situation \
+supports. Use these kinds:
+- open_roadmap (needs roadmapId) — go to a roadmap
+- read_digests (needs roadmapId; topicId optional) — read what is waiting
+- generate_digest (needs roadmapId and topicId) — pull the next lesson now. ONLY if \
+that roadmap's can_generate is true.
+- open_checkpoint (needs roadmapId and topicId) — sit the check that completes a \
+topic. ONLY if that topic's status is needs_review AND it is not blocked pending \
+revision.
+- open_reviews — go to what is due for review. ONLY if a review is due.
+- create_roadmap — only when they have no roadmap at all.
+- ask (needs prompt) — put a question to you on their behalf, e.g. "Explain X to me". \
+Use this when the useful next step is a conversation rather than a screen.
+
+Labels are four words at most and name the action ("Take the checkpoint", \
+"Review Ownership"), never "Click here"."""
+
+
+def _briefing_action_allowed(action: BriefingAction, ctx: dict) -> bool:
+    """Whether the learner's situation actually supports this action.
+
+    The model is told the rules in the prompt and mostly follows them; this is
+    what makes that guarantee rather than a tendency. An offered checkpoint the
+    server would refuse is precisely the dead end the rest of the app goes out of
+    its way to avoid — see `revisionOwed` on the client, which exists so a topic
+    card never offers an attempt it knows will be turned away.
+    """
+    roadmaps = {r.get("roadmapId"): r for r in (ctx.get("roadmaps") or [])}
+
+    if action.kind == "create_roadmap":
+        return not roadmaps
+
+    if action.kind == "open_reviews":
+        return bool(ctx.get("reviews_due"))
+
+    if action.kind == "ask":
+        return bool((action.prompt or "").strip())
+
+    # Everything left is scoped to a roadmap the learner actually has running.
+    roadmap = roadmaps.get(action.roadmapId)
+    if not roadmap:
+        return False
+
+    if action.kind == "generate_digest":
+        # `can_generate` is the same flag the home screen's button reads, so the
+        # briefing and the card agree about whether anything can be pulled.
+        return bool(roadmap.get("can_generate")) and bool(action.topicId)
+
+    if action.kind == "open_checkpoint":
+        # A topic owed revision is also `needs_review`; the server refuses the
+        # attempt until the revision digest has been read.
+        return (
+            roadmap.get("topic_status") == "needs_review"
+            and roadmap.get("blocked_reason") != "needs_revision"
+            and bool(action.topicId)
+        )
+
+    return True
+
+
+def fallback_briefing(ctx: dict) -> dict:
+    """The briefing when the model is unavailable.
+
+    Deterministic, and deliberately the same priority order the prompt asks for.
+    A coach that goes silent when an API call fails is worse than a plain one:
+    this degrades the feature to the fixed copy the client used to hardcode,
+    which was the whole of the experience until now.
+    """
+    roadmaps = ctx.get("roadmaps") or []
+    reviews = ctx.get("reviews_due") or []
+
+    if not roadmaps:
+        return {
+            "headline": "You have no roadmap yet.",
+            "detail": "Tell me what you want to learn and I'll build you one.",
+            "actions": [
+                {"kind": "create_roadmap", "label": "Build a roadmap"},
+            ],
+        }
+
+    if reviews:
+        first = reviews[0]
+        overdue = first.get("overdue_days") or 0
+        return {
+            "headline": f'"{first.get("title")}" is due for review.',
+            "detail": (
+                f"It's {overdue} day(s) past due — a few questions is all it takes to keep it."
+                if overdue
+                else "A few questions is all it takes to keep it from fading."
+            ),
+            "actions": [{"kind": "open_reviews", "label": "Start the review"}],
+        }
+
+    blocked = next((r for r in roadmaps if r.get("blocked_reason")), None)
+    if blocked and blocked.get("blocked_meaning"):
+        return {
+            "headline": f'"{blocked.get("topic") or blocked.get("title")}" needs your attention.',
+            "detail": blocked.get("blocked_meaning").capitalize() + ".",
+            "actions": [
+                {
+                    "kind": "open_roadmap",
+                    "label": "Open the roadmap",
+                    "roadmapId": blocked.get("roadmapId"),
+                }
+            ],
+        }
+
+    if ctx.get("unread_digests"):
+        first = roadmaps[0]
+        return {
+            "headline": f'{ctx.get("unread_digests")} digest(s) waiting.',
+            "detail": "Reading them is what moves the current topic toward its checkpoint.",
+            "actions": [
+                {
+                    "kind": "read_digests",
+                    "label": "Read them",
+                    "roadmapId": first.get("roadmapId"),
+                }
+            ],
+        }
+
+    current = roadmaps[0]
+    return {
+        "headline": "You're caught up.",
+        "detail": f'Nothing is waiting on "{current.get("title")}". The next digest arrives on schedule.',
+        "actions": [
+            {
+                "kind": "open_roadmap",
+                "label": "Open the roadmap",
+                "roadmapId": current.get("roadmapId"),
+            }
+        ],
+    }
+
+
+async def build_briefing(ctx: dict) -> dict:
+    """What the assistant says on arrival, given where the learner is standing.
+
+    Falls back to `fallback_briefing` on any failure, and drops any action the
+    situation doesn't support. A briefing with no surviving actions still ships:
+    the sentence is the point, and the buttons are the convenience.
+    """
+    try:
+        chain = ChatPromptTemplate.from_messages(
+            [("system", _BRIEFING_SYSTEM), ("human", "Give me my briefing.")]
+        ) | llm.with_structured_output(BriefingOutput)
+        result: BriefingOutput = await chain.ainvoke(
+            {"situation": situation_text(ctx) or "Nothing is known yet."}
+        )
+    except Exception as e:
+        logger.error("build_briefing failed, using fallback: %s", e)
+        return fallback_briefing(ctx)
+
+    actions = [a for a in result.actions if _briefing_action_allowed(a, ctx)]
+    dropped = len(result.actions) - len(actions)
+    if dropped:
+        logger.info("build_briefing dropped %d unsupported action(s)", dropped)
+
+    return {
+        "headline": result.headline,
+        "detail": result.detail,
+        "actions": [a.model_dump(exclude_none=True) for a in actions[:3]],
+    }
 
 
 def roadmap_task_specs(roadmap: RoadmapOutput, roadmap_id: str) -> List[TaskSpec]:

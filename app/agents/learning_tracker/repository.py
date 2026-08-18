@@ -2184,6 +2184,62 @@ async def list_digests(
     return docs
 
 
+#: The one auto-trigger this agent owns. Named rather than repeated as a literal
+#: now that three call sites reach for it.
+DIGEST_TRIGGER = "learning_digest"
+
+
+async def set_digest_schedule(
+    user_id: str,
+    *,
+    hour: Optional[int] = None,
+    timezone_name: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> dict:
+    """Update when the daily digest goes out, creating the row if the learner has
+    never opted in.
+
+    Raises ValueError on an hour outside 0-23 or a timezone `zoneinfo` doesn't
+    recognise. Both are the caller's to report and they report it differently:
+    the settings route turns one into a 422, the tutor's tool turns it into a
+    sentence. Validating in one place is what keeps those two answers about the
+    same rule.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    update: dict = {}
+    if enabled is not None:
+        update["enabled"] = enabled
+    if hour is not None:
+        if not 0 <= hour <= 23:
+            raise ValueError("schedule_hour must be 0-23.")
+        update["schedule_hour"] = hour
+    if timezone_name is not None:
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError(f"Unknown timezone: {timezone_name}")
+        update["timezone"] = timezone_name
+    if not update:
+        raise ValueError("No settings provided.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    update["updatedAt"] = now
+    await get_db()["triggers"].update_one(
+        {"user_id": user_id, "action_type": DIGEST_TRIGGER},
+        {
+            "$set": update,
+            "$setOnInsert": {
+                "user_id": user_id,
+                "action_type": DIGEST_TRIGGER,
+                "createdAt": now,
+            },
+        },
+        upsert=True,
+    )
+    return update
+
+
 async def learning_focus(user_id: str) -> dict:
     """Every roadmap the learner has in play, and when the next digest is due.
 
