@@ -315,6 +315,13 @@ async def insertRoadmapToDb(
             and len(await active_roadmaps(user_id)) >= MAX_ACTIVE_ROADMAPS
         ):
             doc["status"] = "paused"
+            # Carried back onto the model the caller holds, not just written to
+            # the document. Callers report what they built — `roadmap_agent`
+            # returns `roadmap.model_dump()` to the client — so leaving the
+            # in-memory copy saying "active" told the learner their new roadmap
+            # was running when it had in fact been parked, and they found out by
+            # noticing no lessons ever arrived.
+            roadmap.status = "paused"
             logger.info("new roadmap parked at active cap user=%s", user_id)
         res = await get_db()["roadmaps"].insert_one(doc)
         logger.info("insertRoadmapToDb inserted: %s", res.inserted_id)
@@ -491,6 +498,11 @@ def topic_mastery(
         "delta": round(delta),
         "attempts": len(dated),
         "overdue_days": round(overdue) if overdue else 0,
+        # The newest attempt on its own. The weighted mean is the right number to
+        # *show*, and the wrong one to decide "is this person struggling with it
+        # right now" — a topic can average low on the strength of early attempts
+        # while the last thing that happened was a pass.
+        "latest": round(latest),
     }
 
 
@@ -529,7 +541,18 @@ def mastery_summary(topics: list[dict]) -> dict:
         "topics_scored": len(scored),
         # What to actually do about it. Sorted by mastery so the weakest lead,
         # and capped — a list of everything is a list nobody acts on.
-        "weakest": sorted(scored, key=lambda t: t["mastery"])[:3],
+        #
+        # A topic whose most recent assessment was a pass is excluded however low
+        # its mean still is. This list is rendered as "not sticking yet", and
+        # saying that about something the learner passed an hour ago is both
+        # wrong and the kind of wrong that makes every other number look
+        # untrustworthy. The mean is still theirs — it simply hasn't caught up
+        # yet, and one more good attempt will move it.
+        "weakest": [
+            t
+            for t in sorted(scored, key=lambda t: t["mastery"])
+            if (t.get("latest") or 0) < CHECKPOINT_PASS_SCORE
+        ][:3],
     }
 
 
@@ -679,7 +702,11 @@ async def learning_stats(user_id: str) -> dict:
         rows = await (
             get_db()["quiz_attempts"]
             .find(
-                {"user_id": user_id},
+                # Practice is excluded from both numbers below — see
+                # UNSCORED_KINDS. `$nin` also matches attempts recorded before
+                # `kind` existed, which is what we want: they are real graded
+                # work, they simply predate the label.
+                {"user_id": user_id, "kind": {"$nin": list(UNSCORED_KINDS)}},
                 projection={
                     "score": 1,
                     "createdAt": 1,
@@ -998,12 +1025,41 @@ def find_topic(roadmap: Optional[dict], topicId: str) -> Optional[dict]:
     )
 
 
+#: A checkpoint too short to be a fair gate still has to have a bar. Below this
+#: the set is degenerate anyway, and a mark under it would pass someone who got
+#: half of a two-question quiz right.
+MIN_CHECKPOINT_PASS_SCORE = 50
+
+
+def checkpoint_pass_mark(question_count: int) -> int:
+    """The pass mark for the set actually issued.
+
+    `CHECKPOINT_PASS_SCORE` states the intent — one mistake allowed at
+    `CHECKPOINT_QUESTIONS`. But the generator is a model, and a model asked for
+    five questions sometimes returns four. At four, an 80% bar cannot be met with
+    a mistake (3/4 is 75%), so a short set silently restores the "no mistakes
+    allowed" gate that raising the question count existed to remove — while the
+    screen still says 80%. The learner is then held to a stricter bar than the
+    one they were shown, which is the wrong direction for a gate to drift.
+
+    So the mark is derived from the questions issued rather than assumed, using
+    the same rounding `grade_quiz` scores with, and stored on the quiz. Grading
+    reads it back, so a checkpoint is always marked against the bar it advertised
+    — including for attempts issued before a config change.
+    """
+    if question_count <= 0:
+        return CHECKPOINT_PASS_SCORE
+    one_mistake = round((question_count - 1) / question_count * 100)
+    return max(MIN_CHECKPOINT_PASS_SCORE, min(CHECKPOINT_PASS_SCORE, one_mistake))
+
+
 async def apply_checkpoint(
     roadmapId: str,
     topicId: str,
     user_id: str,
     score: int,
     missed: Optional[list[str]] = None,
+    pass_score: Optional[int] = None,
 ) -> Optional[dict]:
     """Fold a graded checkpoint into the topic: mastery, completion, next review.
 
@@ -1031,7 +1087,9 @@ async def apply_checkpoint(
     if topic is None:
         return None
 
-    passed = score >= CHECKPOINT_PASS_SCORE
+    # The bar this set was issued under, not today's config: a learner is graded
+    # against what they were told, and a checkpoint sat last week keeps its terms.
+    passed = score >= (pass_score if pass_score is not None else CHECKPOINT_PASS_SCORE)
     was_completed = topic.get("progress_status") == "completed"
     review_count = (int(topic.get("review_count") or 0) + 1) if passed else 0
 
@@ -1664,6 +1722,56 @@ async def list_misconceptions(
 
 
 # ── checkpoint attempt policy ────────────────────────────────────────────────
+def hint_gives_it_away(hint: Optional[str], question: dict) -> bool:
+    """Whether a hint has quoted the answer it is supposed to point around.
+
+    The prompts tell the generator not to, and mostly it doesn't. This is what
+    makes that a guarantee rather than a tendency, because the failure is
+    invisible from the outside: a hint is only ever shown on a *failed* attempt,
+    the one moment where handing over the correct option turns the retry into
+    transcription. Nobody reviewing the app would see it unless they failed on
+    purpose and read carefully.
+
+    Deliberately crude — a containment check on the correct option's wording, and
+    a check that it hasn't been named by position. A paraphrase will still get
+    through; this catches the blunt case, which is the one a model actually
+    produces when it forgets the instruction.
+    """
+    if not hint:
+        return False
+    options = question.get("options") or []
+    answer = question.get("answer")
+    text = hint.casefold()
+
+    if isinstance(answer, int) and 0 <= answer < len(options):
+        correct = str(options[answer]).strip().casefold()
+        # Short options ("true", "O(n)") appear in innocent prose far too easily
+        # to judge by containment; anything longer quoted verbatim is a give-away.
+        if len(correct) >= 12 and correct in text:
+            return True
+        # "the third one", "option B" — naming it without quoting it.
+        #
+        # An ordinal only counts when it is attached to something that means an
+        # option. On its own it is far too common in exactly the sentences a good
+        # hint is made of: "re-read the second tip" points at the material, not
+        # at answer two, and stripping that would eat the feature this protects.
+        position = answer + 1
+        letter = "abcdefgh"[answer] if answer < 8 else ""
+        ordinals = ["first", "second", "third", "fourth", "fifth", "sixth"]
+        named = [f"option {position}", f"answer {position}"]
+        if letter:
+            named += [f"option {letter}", f"answer {letter}", f"({letter})"]
+        if answer < len(ordinals):
+            named += [
+                f"{ordinals[answer]} {noun}"
+                for noun in ("option", "answer", "choice", "one")
+            ]
+        if any(n in text for n in named):
+            return True
+
+    return False
+
+
 def redact_review(result: dict, reveal: bool, questions: list[dict]) -> dict:
     """The graded result as the learner may see it.
 
@@ -1682,6 +1790,14 @@ def redact_review(result: dict, reveal: bool, questions: list[dict]) -> dict:
     for r in result.get("review") or []:
         idx = r.get("question")
         q = questions[idx] if isinstance(idx, int) and 0 <= idx < len(questions) else {}
+        hint = q.get("hint")
+        if hint_gives_it_away(hint, q):
+            # Dropped rather than sent. Withholding the answer everywhere else and
+            # then leaking it through the hint would be worse than having no hint,
+            # because it would look deliberate. The outcome still says what the
+            # question was testing, which is most of the value.
+            logger.warning("hint withheld: it quoted the answer (question %s)", idx)
+            hint = None
         redacted.append(
             {
                 "question": idx,
@@ -1690,7 +1806,7 @@ def redact_review(result: dict, reveal: bool, questions: list[dict]) -> dict:
                 # `correctOption ?? '—'` shows a dash either way, and a null here
                 # would read as "we don't know" instead of "not yet".
                 "outcome": q.get("outcome"),
-                "hint": q.get("hint"),
+                "hint": hint,
             }
         )
     return {**result, "review": redacted, "answers_revealed": False}
@@ -1751,7 +1867,11 @@ async def replace_quiz_questions(quizId: str, user_id: str, questions: list[dict
 
 
 async def asked_questions(
-    user_id: str, roadmapId: str, topicId: str, limit: int = 30
+    user_id: str,
+    roadmapId: str,
+    topicId: str,
+    limit: int = 30,
+    kinds: tuple[str, ...] = ("checkpoint", "review"),
 ) -> list[str]:
     """Every checkpoint question this learner has already been asked on a topic,
     newest first.
@@ -1770,7 +1890,11 @@ async def asked_questions(
                     "user_id": user_id,
                     "roadmapId": roadmapId,
                     "topicId": topicId,
-                    "kind": {"$in": ["checkpoint", "review"]},
+                    # Which sets count as "already asked" is the caller's call.
+                    # A checkpoint avoids repeating checkpoints and reviews; a
+                    # practice deck also avoids repeating earlier practice, or it
+                    # drills the same handful of questions forever.
+                    "kind": {"$in": list(kinds)},
                 },
                 projection={"questions.question": 1},
             )
@@ -1837,6 +1961,105 @@ async def recent_attempts(
         return [{"createdAt": datetime.now(timezone.utc).isoformat(), "score": 0}] * (
             CHECKPOINT_MAX_ATTEMPTS_PER_DAY
         )
+
+
+#: Attempt kinds that do NOT count toward mastery. Both still feed the
+#: misconception tracker, which is what they are actually for.
+#:
+#: `practice` is voluntary and unscheduled, and a voluntary exercise that can
+#: lower your headline number is one nobody volunteers for — the same reason a
+#: poor Feynman attempt is never recorded against a topic.
+#:
+#: `digest` is formative, not summative, and counting it was a measurement error
+#: rather than a policy choice. A recall check is a gate at DIGEST_QUIZ_PASS_SCORE
+#: (100) which the learner retries until they pass, so getting one wrong on the
+#: way through is a *structural* part of being taught — every learner accumulates
+#: those failures, and averaging them against the checkpoint meant the act of
+#: learning a topic dragged down the measure of having learned it. With a 14-day
+#: half-life, six failed retries this morning outweighed the checkpoint you aced
+#: this afternoon, so a topic completed at 100% could sit at 45% and be reported
+#: as "not sticking yet".
+#:
+#: What remains is what mastery was always meant to be: `checkpoint` and `review`,
+#: the two assessments, plus any attempt recorded before kinds existed.
+UNSCORED_KINDS = ("practice", "digest")
+
+
+async def roadmap_mastery(user_id: str, roadmap: dict) -> dict:
+    """`{topicId: mastery}` for one roadmap, in a single read.
+
+    The same computation `learning_stats` runs across every roadmap, scoped to
+    one. It exists because the topic screen had no way to ask for it and reached
+    for the nearest fields instead: `mastery_score`, which is the *last
+    checkpoint's score* and is overwritten on every attempt, and
+    `checkpoint_attempts`, which counts *failures* because it is the revision
+    debt. Both were labelled as mastery and attempts, so one topic reported "50%
+    · 1 attempt" on its own page and "33% · 6 attempts" on the home screen — two
+    calculations, both shown, neither wrong about what it was actually measuring.
+
+    One query and a group-by rather than a read per topic: a 26-topic roadmap
+    opened this on every visit.
+    """
+    rid = str(roadmap.get("_id"))
+    try:
+        rows = await (
+            get_db()["quiz_attempts"]
+            .find(
+                {
+                    "user_id": user_id,
+                    "roadmapId": rid,
+                    "kind": {"$nin": list(UNSCORED_KINDS)},
+                },
+                projection={"createdAt": 1, "score": 1, "topicId": 1},
+            )
+            .to_list(None)
+        )
+    except Exception as e:
+        logger.error("roadmap_mastery error user=%s roadmap=%s: %s", user_id, rid, e)
+        return {}
+
+    by_topic: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("topicId"):
+            by_topic.setdefault(r["topicId"], []).append(r)
+
+    out: dict[str, dict] = {}
+    for t in roadmap.get("topics") or []:
+        graded = by_topic.get(t.get("id"))
+        if not graded:
+            continue
+        # Absent rather than zeroed for a topic with no attempts: never having
+        # been graded is not a mastery of nothing, and the UI needs to tell those
+        # two apart to know whether to show the badge at all.
+        m = topic_mastery(graded, t.get("next_review_at"))
+        if m:
+            out[t["id"]] = m
+    return out
+
+
+async def topic_attempts(user_id: str, roadmapId: str, topicId: str) -> list[dict]:
+    """One topic's attempts, for measuring how well it is held.
+
+    Deliberately not `recent_attempts`, which fails *closed* — on a read error it
+    invents failed attempts so an unreadable history can't hand out an unlimited
+    retry. That is right for a gate and wrong here: this feeds mastery and the
+    practice ranking, where the same trick would report a topic as mastery zero
+    and put it at the front of every deck on the strength of a database blip.
+    """
+    try:
+        cursor = get_db()["quiz_attempts"].find(
+            {
+                "user_id": user_id,
+                "roadmapId": roadmapId,
+                "topicId": topicId,
+                "kind": {"$nin": list(UNSCORED_KINDS)},
+            },
+            projection={"createdAt": 1, "score": 1, "kind": 1},
+        )
+        return await cursor.to_list(None)
+    except Exception as e:
+        logger.error("topic_attempts error user=%s: %s", user_id, e)
+        return []
 
 
 def retry_block(attempts: list[dict], now: Optional[datetime] = None) -> Optional[dict]:

@@ -11,14 +11,23 @@ a Feynman judgement each cost model calls (a digest also costs a web search). Th
 reads cost a Mongo query. Grading costs arithmetic. The domain limits that exist
 — CHECKPOINT_MAX_ATTEMPTS_PER_DAY, DIGEST_MAX_UNREAD — are per topic, so they
 bound one topic rather than one account.
+
+Routes are not the only door, which is the thing these tests exist to keep true.
+The tutor's `pull_next_lesson` tool writes a digest straight from a chat turn, so
+the digest cap is asserted on both paths and against one shared key — a cap on
+the route alone left the same spend reachable under `learning_query`, which is
+30 a minute rather than 20 an hour.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from app.agents.learning_tracker import triggers
+from app.agents.learning_tracker.actions import build_action_tools
 from app.core import config
 from app.dependencies import get_current_user
 from app.routers import learning_tracker as route
@@ -55,6 +64,24 @@ def blocked(monkeypatch):
 
 
 @pytest.fixture
+def digest_blocked(monkeypatch):
+    """The digest cap, over its limit.
+
+    Patches the non-raising variant, because the digest cap does not sit on the
+    route: it lives in `pull_next_digest`, which the chat tool reaches directly.
+    Returns the seconds to wait, as the real one does.
+    """
+    recorded: list = []
+
+    async def _capture_and_block(name, user_id, limit, window_seconds):
+        recorded.append((name, user_id, limit, window_seconds))
+        return 900
+
+    monkeypatch.setattr(rate_limit, "check_user", _capture_and_block)
+    return recorded
+
+
+@pytest.fixture
 def allowed(monkeypatch):
     """The limiter as it behaves under the cap — and as it behaves during a Redis
     outage, which fails open."""
@@ -62,6 +89,7 @@ def allowed(monkeypatch):
         return None
 
     monkeypatch.setattr(rate_limit, "limit_user", _noop)
+    monkeypatch.setattr(rate_limit, "check_user", _noop)
 
 
 def test_a_chat_turn_is_capped(client, blocked):
@@ -85,12 +113,13 @@ def test_the_streaming_turn_shares_the_same_bucket(client, blocked):
     assert blocked[0][0] == "learning_query"
 
 
-def test_pulling_a_digest_is_capped(client, blocked):
+def test_pulling_a_digest_is_capped(client, digest_blocked):
     """The most expensive request in the feature: a web search plus two or three
     model calls."""
     r = client.post("/learning/digests/generate")
     assert r.status_code == 429
-    assert blocked == [
+    assert r.headers["Retry-After"] == "900"
+    assert digest_blocked == [
         (
             "learning_digest",
             "u-rl",
@@ -98,6 +127,55 @@ def test_pulling_a_digest_is_capped(client, blocked):
             config.LEARNING_DIGEST_RATE_WINDOW,
         )
     ]
+
+
+async def test_the_chat_tool_shares_the_digest_budget(digest_blocked, monkeypatch):
+    """The second door onto the same spend, and the one that used to be open.
+
+    `pull_next_lesson` calls `pull_next_digest` directly, so while the cap sat on
+    the HTTP route the tool was bounded only by `learning_query` — 30 a minute,
+    1800 an hour, ninety times the digest budget on the single most expensive
+    operation in the product.
+    """
+    generated = AsyncMock()
+    monkeypatch.setattr(triggers, "build_digest", generated)
+    monkeypatch.setattr(triggers, "build_revision_digest", generated)
+    monkeypatch.setattr(triggers, "fetch_roadmap", generated)
+
+    tool = {t.name: t for t in build_action_tools("u-rl")}["pull_next_lesson"]
+    out = await tool.ainvoke({})
+
+    # A sentence the tutor can relay, not an exception that breaks the turn.
+    assert "900s" in out
+    # Nothing downstream was reached — not the search, not the model, not Mongo.
+    generated.assert_not_awaited()
+    assert digest_blocked == [
+        (
+            "learning_digest",
+            "u-rl",
+            config.LEARNING_DIGEST_RATE_LIMIT,
+            config.LEARNING_DIGEST_RATE_WINDOW,
+        )
+    ]
+
+
+def test_both_doors_spend_one_allowance(client, monkeypatch):
+    """Route and tool must not get a bucket each — the key is what couples them,
+    so a learner cannot double their budget by alternating."""
+    keys: list = []
+
+    async def _record(key, limit, window_seconds):
+        keys.append(key)
+        return None
+
+    monkeypatch.setattr(rate_limit, "check", _record)
+    monkeypatch.setattr(triggers, "fetch_roadmap", AsyncMock(return_value=None))
+
+    client.post("/learning/digests/generate")
+    tool = {t.name: t for t in build_action_tools("u-rl")}["pull_next_lesson"]
+    asyncio.run(tool.ainvoke({}))
+
+    assert keys == ["learning_digest:user:u-rl"] * 2
 
 
 def test_issuing_a_checkpoint_is_capped(client, blocked):

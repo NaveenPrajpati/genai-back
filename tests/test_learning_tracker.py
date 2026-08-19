@@ -2420,14 +2420,29 @@ def test_an_overdue_topic_decays():
 
 def test_the_summary_leads_with_the_weakest_topics():
     topics = [
-        {**repo.topic_mastery(_scored((1, 90))), "title": "strong"},
+        {**repo.topic_mastery(_scored((1, 70))), "title": "shaky"},
         {**repo.topic_mastery(_scored((1, 40))), "title": "weak"},
         {**repo.topic_mastery(_scored((1, 65))), "title": "middling"},
     ]
     summary = repo.mastery_summary(topics)
 
-    assert [t["title"] for t in summary["weakest"]] == ["weak", "middling", "strong"]
+    assert [t["title"] for t in summary["weakest"]] == ["weak", "middling", "shaky"]
     assert summary["topics_scored"] == 3
+
+
+def test_the_summary_counts_a_passing_topic_but_never_calls_it_weakest():
+    """`weakest` is rendered as "not sticking yet", so a topic whose most recent
+    assessment was a pass is left out however low its mean still is. It still
+    counts toward `topics_scored` and the overall figure — it is not hidden, only
+    not accused."""
+    topics = [
+        {**repo.topic_mastery(_scored((2, 20), (0, 100))), "title": "just passed"},
+        {**repo.topic_mastery(_scored((1, 40))), "title": "weak"},
+    ]
+    summary = repo.mastery_summary(topics)
+
+    assert [t["title"] for t in summary["weakest"]] == ["weak"]
+    assert summary["topics_scored"] == 2
 
 
 def test_the_summary_reports_nothing_rather_than_zero_when_untested():
@@ -4466,3 +4481,655 @@ async def test_list_topics_reports_ids_so_actions_need_no_guessing(monkeypatch):
 
 def test_take_action_routes_to_a_node_that_exists():
     assert lt.INTENT_ROUTES["take_action"] in set(lt.build_graph().nodes)
+
+
+# --------------------------------------------------------------------------- #
+# practice: interleaved retrieval on a day with nothing waiting
+#
+# The generated questions are a model's and aren't tested here. What is tested is
+# everything around them: that a deck is spread across topics rather than pooled
+# into one, that a question the model misfiled is dropped rather than attributed
+# to the wrong topic, and that practice cannot move mastery.
+# --------------------------------------------------------------------------- #
+
+import app.agents.learning_tracker.practice as lt_practice
+
+
+def test_a_deck_spreads_across_topics():
+    """One question each until the topics run out — that is what makes it
+    interleaved rather than a quiz with a wide net."""
+    assert lt_practice.spread(5, 5) == [1, 1, 1, 1, 1]
+    # Remainder to the front, and the front is where the shakiest topics are.
+    assert lt_practice.spread(5, 3) == [2, 2, 1]
+    assert lt_practice.spread(5, 1) == [5]
+    assert lt_practice.spread(5, 0) == []
+    assert sum(lt_practice.spread(5, 4)) == 5
+
+
+def _candidate(topic_id, *, misconceptions=0, mastery=None, overdue=0, attempts=0):
+    return {
+        "roadmapId": "r1",
+        "roadmapTitle": "Rust",
+        "topic": {"id": topic_id, "title": topic_id},
+        "misconceptions": [{"label": f"m{i}"} for i in range(misconceptions)],
+        "mastery": mastery,
+        "overdue_days": overdue,
+        "attempts": attempts,
+    }
+
+
+def test_topics_with_misconceptions_lead_the_deck():
+    ranked = sorted(
+        [
+            _candidate("solid", mastery=95),
+            _candidate("shaky", mastery=40),
+            _candidate("misunderstood", mastery=90, misconceptions=2),
+        ],
+        key=lambda c: (
+            -len(c["misconceptions"]),
+            c["mastery"] if c["mastery"] is not None else 100,
+            -c["overdue_days"],
+            c["attempts"],
+        ),
+    )
+    assert [c["topic"]["id"] for c in ranked] == ["misunderstood", "shaky", "solid"]
+
+
+def test_an_ungraded_topic_is_not_treated_as_a_weak_one():
+    """Never having been tested is not evidence of weakness. Letting None read as
+    zero would put every untouched topic at the front of every deck."""
+    ranked = sorted(
+        [_candidate("untested", mastery=None), _candidate("weak", mastery=30)],
+        key=lambda c: (
+            -len(c["misconceptions"]),
+            c["mastery"] if c["mastery"] is not None else 100,
+            -c["overdue_days"],
+            c["attempts"],
+        ),
+    )
+    assert [c["topic"]["id"] for c in ranked] == ["weak", "untested"]
+
+
+async def test_practice_refuses_when_nothing_has_been_taught(monkeypatch):
+    """A learner mid-way through their first topic has nothing to retrieve, and
+    the answer is to finish one — not an error."""
+    monkeypatch.setattr(lt_practice, "list_roadmaps", AsyncMock(return_value=[]))
+    out = await lt_practice.build_practice_deck("userA")
+    assert "refused" in out
+    assert "finish one" in out["refused"]
+
+
+async def test_practice_only_draws_on_topics_already_taught(monkeypatch):
+    """`not_started` and `in_progress` topics are excluded: there is nothing to
+    retrieve from a topic still being taught."""
+    monkeypatch.setattr(
+        lt_practice,
+        "list_roadmaps",
+        AsyncMock(
+            return_value=[
+                {
+                    "_id": ObjectId(),
+                    "title": "Rust",
+                    "status": "active",
+                    "topics": [
+                        {"id": "t1", "title": "Ownership", "progress_status": "completed"},
+                        {"id": "t2", "title": "Async", "progress_status": "in_progress"},
+                        {"id": "t3", "title": "Macros", "progress_status": "not_started"},
+                    ],
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(lt_practice, "roadmap_mastery", AsyncMock(return_value={}))
+    monkeypatch.setattr(lt_practice, "get_misconceptions", AsyncMock(return_value=None))
+
+    candidates = await lt_practice.practice_candidates("userA")
+    assert [c["topic"]["id"] for c in candidates] == ["t1"]
+
+
+async def test_practice_skips_parked_and_archived_roadmaps(monkeypatch):
+    """Pausing and archiving are deliberate 'not now' signals. A *completed*
+    roadmap is the opposite — it is the richest thing to keep sharp."""
+    def roadmap(status, tid):
+        return {
+            "_id": ObjectId(),
+            "title": status,
+            "status": status,
+            "topics": [{"id": tid, "title": tid, "progress_status": "completed"}],
+        }
+
+    monkeypatch.setattr(
+        lt_practice,
+        "list_roadmaps",
+        AsyncMock(
+            return_value=[
+                roadmap("active", "a"),
+                roadmap("completed", "c"),
+                roadmap("paused", "p"),
+                roadmap("archived", "x"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(lt_practice, "roadmap_mastery", AsyncMock(return_value={}))
+    monkeypatch.setattr(lt_practice, "get_misconceptions", AsyncMock(return_value=None))
+
+    ids = {c["topic"]["id"] for c in await lt_practice.practice_candidates("userA")}
+    assert ids == {"a", "c"}
+
+
+async def test_a_misfiled_question_is_dropped_not_reattributed(monkeypatch):
+    """`topic_index` is validated, not trusted. A question filed against a topic
+    it isn't about would teach the misconception tracker something untrue."""
+    from app.agents.learning_tracker.state import PracticeDeckOutput, PracticeQuestionDraft
+
+    monkeypatch.setattr(
+        lt_practice,
+        "practice_candidates",
+        AsyncMock(
+            return_value=[
+                {
+                    "roadmapId": "r1",
+                    "roadmapTitle": "Rust",
+                    "topic": {"id": "t1", "title": "Ownership", "learning_outcomes": []},
+                    "misconceptions": [],
+                    "mastery": 50,
+                    "overdue_days": 0,
+                    "attempts": 1,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(lt_practice, "asked_questions", AsyncMock(return_value=[]))
+
+    good = PracticeQuestionDraft(
+        topic_index=0, question="ok?", options=["a", "b", "c", "d"], answer=1
+    )
+    misfiled = PracticeQuestionDraft(
+        topic_index=7, question="whose?", options=["a", "b", "c", "d"], answer=0
+    )
+    unanswerable = PracticeQuestionDraft(
+        topic_index=0, question="bad index", options=["a", "b"], answer=9
+    )
+
+    class _Chain:
+        async def ainvoke(self, _):
+            return PracticeDeckOutput(questions=[good, misfiled, unanswerable])
+
+    monkeypatch.setattr(lt_practice, "ChatPromptTemplate", MagicMock())
+    monkeypatch.setattr(
+        lt_practice.ChatPromptTemplate, "from_messages", lambda *_a, **_k: _Pipe(_Chain())
+    )
+
+    out = await lt_practice.build_practice_deck("userA")
+    assert len(out["questions"]) == 1
+    assert out["questions"][0]["topicId"] == "t1"
+
+
+class _Pipe:
+    """Stands in for `prompt | llm.with_structured_output(...)`."""
+
+    def __init__(self, chain):
+        self._chain = chain
+
+    def __or__(self, _other):
+        return self._chain
+
+
+def test_practice_is_kept_out_of_mastery():
+    """The rule that makes the exercise safe to volunteer for: it feeds the
+    misconception tracker but can never lower the headline number."""
+    assert "practice" in repo.UNSCORED_KINDS
+
+
+# --------------------------------------------------------------------------- #
+# one mastery, everywhere
+#
+# A topic reported "50% · 1 attempt" on its own page and "33% · 6 attempts" on
+# the home screen, because the topic screen was reading `mastery_score` (the last
+# checkpoint's score, overwritten each attempt) and `checkpoint_attempts` (a count
+# of failures — it is the revision debt) and labelling them mastery and attempts.
+# --------------------------------------------------------------------------- #
+
+async def test_topic_mastery_matches_what_the_home_screen_computes(monkeypatch):
+    """`roadmap_mastery` and `learning_stats` must agree about a topic: same
+    attempts, same function, so the two screens cannot diverge again."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    attempts = [
+        {"topicId": "t1", "score": 20, "createdAt": (now - timedelta(days=9)).isoformat()},
+        {"topicId": "t1", "score": 40, "createdAt": (now - timedelta(days=4)).isoformat()},
+        {"topicId": "t1", "score": 100, "createdAt": now.isoformat()},
+    ]
+    roadmap = {
+        "_id": ObjectId(),
+        "title": "Rust",
+        "topics": [{"id": "t1", "title": "Neural Networks", "next_review_at": None}],
+    }
+
+    col = MagicMock()
+    col.find.return_value = _cursor(attempts)
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    from_view = await repo.roadmap_mastery("userA", roadmap)
+    direct = repo.topic_mastery(attempts, None)
+
+    assert from_view["t1"]["mastery"] == direct["mastery"]
+    assert from_view["t1"]["attempts"] == direct["attempts"] == 3
+
+
+async def test_roadmap_mastery_excludes_practice(monkeypatch):
+    """Same exclusion the home screen applies, or practising would move one
+    number and not the other."""
+    col = MagicMock()
+    col.find.return_value = _cursor([])
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    await repo.roadmap_mastery("userA", {"_id": ObjectId(), "topics": []})
+
+    query = col.find.call_args.args[0]
+    assert query["kind"] == {"$nin": list(repo.UNSCORED_KINDS)}
+
+
+async def test_roadmap_mastery_is_one_read_not_one_per_topic(monkeypatch):
+    """A 26-topic roadmap opened this on every visit."""
+    col = MagicMock()
+    col.find.return_value = _cursor([])
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    roadmap = {
+        "_id": ObjectId(),
+        "topics": [{"id": f"t{i}"} for i in range(26)],
+    }
+    await repo.roadmap_mastery("userA", roadmap)
+    assert col.find.call_count == 1
+
+
+async def test_a_topic_with_no_attempts_has_no_mastery(monkeypatch):
+    """Absent, not zero: never having been graded is not a mastery of nothing,
+    and the badge has to be able to tell those apart."""
+    col = MagicMock()
+    col.find.return_value = _cursor([])
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    out = await repo.roadmap_mastery("userA", {"_id": ObjectId(), "topics": [{"id": "t1"}]})
+    assert out == {}
+
+
+# --------------------------------------------------------------------------- #
+# mastery measures assessment, not the act of being taught
+# --------------------------------------------------------------------------- #
+
+def _attempt(score, days_ago=0, kind="checkpoint", topic="t1"):
+    from datetime import datetime, timedelta, timezone
+
+    return {
+        "topicId": topic,
+        "score": score,
+        "kind": kind,
+        "createdAt": (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat(),
+    }
+
+
+async def test_digest_checks_are_excluded_from_mastery(monkeypatch):
+    """A recall check is a gate at 100% that the learner retries until they pass,
+    so failing on the way through is structural. Averaging those against the
+    checkpoint made learning a topic lower the measure of having learned it."""
+    col = MagicMock()
+    col.find.return_value = _cursor([])
+    monkeypatch.setattr(repo, "get_db", lambda: {"quiz_attempts": col})
+
+    await repo.roadmap_mastery("userA", {"_id": ObjectId(), "topics": []})
+    assert "digest" in repo.UNSCORED_KINDS
+    assert col.find.call_args.args[0]["kind"] == {"$nin": list(repo.UNSCORED_KINDS)}
+
+
+def test_a_topic_just_passed_is_not_reported_as_not_sticking():
+    """The exact report: completed at 100%, still listed under 'Not sticking yet'
+    because early attempts held the weighted mean down."""
+    scored = [
+        {
+            **repo.topic_mastery([_attempt(20, 2), _attempt(30, 1), _attempt(100, 0)]),
+            "roadmapId": "r1",
+            "topicId": "t1",
+            "title": "Neural Networks",
+        }
+    ]
+    # The mean is genuinely still low — that number is honest and stays on screen.
+    assert scored[0]["mastery"] < 70
+    # But the last thing that happened was a pass, so it is not "not sticking".
+    assert scored[0]["latest"] == 100
+    assert repo.mastery_summary(scored)["weakest"] == []
+
+
+def test_a_topic_still_being_got_wrong_is_reported():
+    """The guard must not swallow the real case it exists beside."""
+    scored = [
+        {
+            **repo.topic_mastery([_attempt(80, 3), _attempt(40, 1), _attempt(30, 0)]),
+            "roadmapId": "r1",
+            "topicId": "t2",
+            "title": "Backprop",
+        }
+    ]
+    weakest = repo.mastery_summary(scored)["weakest"]
+    assert [t["topicId"] for t in weakest] == ["t2"]
+
+
+# --------------------------------------------------------------------------- #
+# the checkpoint bar has to be reachable
+# --------------------------------------------------------------------------- #
+
+def test_the_pass_mark_allows_one_mistake():
+    """At four questions an 80% bar cannot be met at 3/4 (75%), so the gate was
+    silently 'no mistakes allowed' while the screen said 80%."""
+    from app.core.config import CHECKPOINT_PASS_SCORE, CHECKPOINT_QUESTIONS
+
+    one_wrong = round((CHECKPOINT_QUESTIONS - 1) / CHECKPOINT_QUESTIONS * 100)
+    assert one_wrong >= CHECKPOINT_PASS_SCORE, (
+        f"{CHECKPOINT_QUESTIONS} questions at {CHECKPOINT_PASS_SCORE}% means every "
+        "answer must be right — say so, or change one of them"
+    )
+
+
+def test_the_pass_mark_is_a_number_someone_can_actually_score():
+    """Every reachable score is a whole number of correct answers; the bar has to
+    sit on one of them or it is a fiction."""
+    from app.core.config import CHECKPOINT_PASS_SCORE, CHECKPOINT_QUESTIONS
+
+    reachable = {
+        round(c / CHECKPOINT_QUESTIONS * 100) for c in range(CHECKPOINT_QUESTIONS + 1)
+    }
+    assert CHECKPOINT_PASS_SCORE in reachable
+
+
+# --------------------------------------------------------------------------- #
+# a failed recall check says which one, and still doesn't say the answer
+# --------------------------------------------------------------------------- #
+
+def test_a_failed_recall_check_withholds_the_answer():
+    """This gate is retried until it is passed, which makes it the one place the
+    correct option must not appear. It was being sent raw."""
+    questions = [
+        {"question": "q1", "options": ["a", "b"], "answer": 1, "outcome": "scope", "hint": "tip 2"},
+        {"question": "q2", "options": ["a", "b"], "answer": 0},
+    ]
+    graded = repo.grade_quiz(questions, {0: 0, 1: 0})
+    out = repo.redact_review(graded, False, questions)
+
+    for entry in out["review"]:
+        assert "correctOption" not in entry
+        assert "correctAnswer" not in entry
+    assert out["answers_revealed"] is False
+
+
+def test_a_failed_recall_check_says_what_was_missed():
+    """"1/2 right" sent the learner back over every tip with no idea which one."""
+    questions = [
+        {"question": "q1", "options": ["a", "b"], "answer": 1, "outcome": "scope", "hint": "tip 2"},
+    ]
+    graded = repo.grade_quiz(questions, {0: 0})
+    out = repo.redact_review(graded, False, questions)
+
+    assert out["review"][0]["outcome"] == "scope"
+    assert out["review"][0]["hint"] == "tip 2"
+    assert out["review"][0]["question"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# a roadmap parked at the cap says so
+# --------------------------------------------------------------------------- #
+
+async def test_a_roadmap_parked_at_the_cap_reports_itself_as_paused(monkeypatch):
+    """The document was written as paused while the model handed back to the
+    client still said active, so the learner was told it was running."""
+    roadmap = _draft(_topic(1, "Ownership"))
+    stored = repo.materialize_roadmap(roadmap)
+    assert stored.status == "active"
+
+    col = _collection()
+    _patch_db(monkeypatch, col)
+    monkeypatch.setattr(
+        repo, "active_roadmaps", AsyncMock(return_value=[{}] * repo.MAX_ACTIVE_ROADMAPS)
+    )
+
+    await repo.insertRoadmapToDb(stored, "userA")
+
+    assert col.insert_one.await_args.args[0]["status"] == "paused"
+    # The half that was missing: what the caller reports to the client.
+    assert stored.status == "paused"
+
+
+async def test_a_roadmap_below_the_cap_stays_active(monkeypatch):
+    stored = repo.materialize_roadmap(_draft(_topic(1, "Ownership")))
+    col = _collection()
+    _patch_db(monkeypatch, col)
+    monkeypatch.setattr(repo, "active_roadmaps", AsyncMock(return_value=[]))
+
+    await repo.insertRoadmapToDb(stored, "userA")
+
+    assert col.insert_one.await_args.args[0]["status"] == "active"
+    assert stored.status == "active"
+
+
+# --------------------------------------------------------------------------- #
+# the first five minutes
+#
+# Everything below is on the path a stranger walks before they have anything:
+# no roadmap, no attempts, no profile. It is the least-exercised state in the
+# app and the only one a new arrival is guaranteed to see.
+# --------------------------------------------------------------------------- #
+
+async def test_a_brand_new_account_has_a_situation_rather_than_a_crash(monkeypatch):
+    """`learner_context` fans out over four reads that all return nothing. Every
+    downstream consumer formats whatever comes back."""
+    from app.agents.learning_tracker import context as lt_context
+
+    monkeypatch.setattr(lt_context, "learning_focus", AsyncMock(return_value={}))
+    monkeypatch.setattr(lt_context, "due_reviews", AsyncMock(return_value=[]))
+    monkeypatch.setattr(lt_context, "list_misconceptions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(lt_context, "get_profile", AsyncMock(return_value=None))
+    monkeypatch.setattr(lt_context, "learning_stats", AsyncMock(return_value={}))
+
+    ctx = await lt_context.learner_context("newbie", with_stats=True)
+
+    assert ctx["roadmaps"] == []
+    # Must be renderable, hashable and describable with nothing in it.
+    assert "no roadmap running" in lt_context.situation_text(ctx)
+    assert lt_context.situation_key(ctx)
+
+
+async def test_learner_context_survives_a_read_that_fails(monkeypatch):
+    """A context that can't be assembled degrades the agent from situated to
+    generic — which is where it started. It must not take the turn down."""
+    from app.agents.learning_tracker import context as lt_context
+
+    monkeypatch.setattr(lt_context, "learning_focus", AsyncMock(side_effect=RuntimeError))
+    monkeypatch.setattr(lt_context, "due_reviews", AsyncMock(side_effect=RuntimeError))
+    monkeypatch.setattr(lt_context, "list_misconceptions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(lt_context, "get_profile", AsyncMock(return_value={}))
+
+    ctx = await lt_context.learner_context("newbie")
+    assert ctx["roadmaps"] == []
+
+
+async def test_stats_on_an_empty_account(monkeypatch):
+    """Every counter is derived from loops over roadmaps and attempts. With none
+    of either, the landing screen still has to get numbers it can render."""
+    from datetime import timezone as tz
+
+    db = _DB()
+    monkeypatch.setattr(repo, "get_db", lambda: db)
+    monkeypatch.setattr(repo, "user_zone", AsyncMock(return_value=tz.utc))
+
+    stats = await repo.learning_stats("newbie")
+
+    assert stats["topics"]["total"] == 0
+    assert stats["topics"]["percent"] == 0
+    assert stats["streak_days"] == 0
+    # Null, not zero: nothing has been graded, which is not a mastery of nothing.
+    assert stats["mastery"]["score"] is None
+    assert stats["mastery"]["weakest"] == []
+
+
+def test_the_briefing_answers_a_brand_new_account(monkeypatch):
+    """The very first request Today makes. It has never had anything to describe
+    at this point, and it must still come back with something to do."""
+    client, db, route = _api(monkeypatch)
+    monkeypatch.setattr(
+        route,
+        "learner_context",
+        AsyncMock(return_value={"roadmaps": [], "reviews_due": [], "unread_digests": 0}),
+    )
+    # No model: the deterministic path is the one that has to hold when the LLM
+    # is slow, rate-limited or down — which is also when a stranger is watching.
+    monkeypatch.setattr(
+        route, "build_briefing", AsyncMock(side_effect=lambda ctx: _fallback(ctx))
+    )
+
+    body = client.get("/learning/briefing").json()["result"]
+
+    assert body["headline"]
+    assert body["detail"]
+    assert [a["kind"] for a in body["actions"]] == ["create_roadmap"]
+
+
+def _fallback(ctx):
+    from app.agents.learning_tracker.service import fallback_briefing
+
+    return fallback_briefing(ctx)
+
+
+def test_the_briefing_is_replayed_rather_than_regenerated(monkeypatch):
+    """One LLM call per *situation*, not per app open. A learner checking Today
+    four times in an evening should pay for one."""
+    client, db, route = _api(monkeypatch)
+    ctx = {"roadmaps": [], "reviews_due": [], "unread_digests": 0}
+    monkeypatch.setattr(route, "learner_context", AsyncMock(return_value=ctx))
+    build = AsyncMock(return_value={"headline": "h", "detail": "d", "actions": []})
+    monkeypatch.setattr(route, "build_briefing", build)
+
+    store: dict = {}
+
+    class _Redis:
+        async def get(self, k):
+            return store.get(k)
+
+        async def set(self, k, v, ex=None):
+            store[k] = v
+
+    monkeypatch.setattr(route, "redis_client", _Redis())
+
+    for _ in range(4):
+        client.get("/learning/briefing")
+
+    assert build.await_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# the bar is the bar it was advertised as
+# --------------------------------------------------------------------------- #
+
+def test_the_pass_mark_adapts_to_a_short_set():
+    """The generator is a model. Asked for five it sometimes returns four, and at
+    four an 80% bar cannot be met with a mistake — silently restoring the "no
+    mistakes allowed" gate while the screen still says 80%."""
+    assert repo.checkpoint_pass_mark(5) == 80
+    assert repo.checkpoint_pass_mark(4) == 75
+    assert repo.checkpoint_pass_mark(3) == 67
+
+
+def test_one_mistake_passes_at_every_set_size():
+    """The invariant the number exists to express, checked against the same
+    rounding `grade_quiz` scores with."""
+    for n in range(3, 9):
+        one_wrong = round((n - 1) / n * 100)
+        assert one_wrong >= repo.checkpoint_pass_mark(n), n
+
+
+def test_the_pass_mark_never_collapses_on_a_tiny_set():
+    """One mistake out of two is half the quiz. Below three questions the set is
+    degenerate and the bar holds rather than following it down."""
+    assert repo.checkpoint_pass_mark(2) >= repo.MIN_CHECKPOINT_PASS_SCORE
+    assert repo.checkpoint_pass_mark(1) >= repo.MIN_CHECKPOINT_PASS_SCORE
+    assert repo.checkpoint_pass_mark(0) == repo.CHECKPOINT_PASS_SCORE
+
+
+async def test_a_checkpoint_is_graded_against_the_bar_it_was_issued_under(monkeypatch):
+    """A set sat last week keeps its terms, whatever the config says today."""
+    roadmap = {
+        "_id": ObjectId(),
+        "topics": [{"id": "t1", "title": "Ownership", "progress_status": "needs_review"}],
+    }
+    monkeypatch.setattr(repo, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    col = _collection()
+    _patch_db(monkeypatch, col)
+    rid = str(roadmap["_id"])
+
+    # 75 was the bar for the four-question set they were given.
+    out = await repo.apply_checkpoint(rid, "t1", "userA", 75, pass_score=75)
+    assert out["passed"] is True
+
+    # The same score against today's five-question bar would not have passed.
+    out = await repo.apply_checkpoint(rid, "t1", "userA", 75, pass_score=80)
+    assert out["passed"] is False
+
+
+# --------------------------------------------------------------------------- #
+# a hint may not hand over the answer
+# --------------------------------------------------------------------------- #
+
+def test_a_hint_that_quotes_the_answer_is_withheld():
+    """Hints appear only on a FAILED attempt — the one moment where handing over
+    the correct option turns the retry into transcription. The prompt forbids it;
+    this is what makes that a guarantee."""
+    q = {
+        "question": "What does ownership mean?",
+        "options": ["a reference count", "a single owning binding per value", "c", "d"],
+        "answer": 1,
+        "outcome": "ownership",
+        "hint": "Remember there is a single owning binding per value.",
+    }
+    graded = repo.grade_quiz([q], {0: 0})
+    out = repo.redact_review(graded, False, [q])
+
+    assert out["review"][0]["hint"] is None
+    # The useful half survives: they still know what was being tested.
+    assert out["review"][0]["outcome"] == "ownership"
+
+
+def test_a_hint_that_names_the_answer_by_position_is_withheld():
+    q = {
+        "question": "q",
+        "options": ["a", "b", "c", "d"],
+        "answer": 2,
+        "hint": "Have another look at option C.",
+    }
+    graded = repo.grade_quiz([q], {0: 0})
+    assert repo.redact_review(graded, False, [q])["review"][0]["hint"] is None
+
+
+def test_an_honest_hint_survives():
+    """The guard must not eat the feature it protects."""
+    q = {
+        "question": "q",
+        "options": ["a reference count", "a single owning binding per value", "c", "d"],
+        "answer": 1,
+        "hint": "Go back to the tip about what happens on assignment.",
+    }
+    graded = repo.grade_quiz([q], {0: 0})
+    hint = repo.redact_review(graded, False, [q])["review"][0]["hint"]
+    assert hint == "Go back to the tip about what happens on assignment."
+
+
+def test_a_short_option_appearing_in_prose_is_not_treated_as_a_leak():
+    """"true" and "O(n)" turn up in innocent sentences constantly. Judging those
+    by containment would strip every useful hint on a true/false question."""
+    q = {
+        "question": "q",
+        "options": ["true", "false"],
+        "answer": 0,
+        "hint": "It is worth checking whether that holds when the list is empty.",
+    }
+    graded = repo.grade_quiz([q], {0: 1})
+    assert repo.redact_review(graded, False, [q])["review"][0]["hint"] is not None

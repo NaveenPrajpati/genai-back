@@ -10,11 +10,14 @@ from app.core.config import (
     DIGEST_MAX_UNREAD,
     DIGEST_MIN_BEFORE_CHECKPOINT,
     DIGEST_ONELINER_FROM,
+    LEARNING_DIGEST_RATE_LIMIT,
+    LEARNING_DIGEST_RATE_WINDOW,
     MISCONCEPTION_RETEACH_DAYS,
 )
 from app.core.llm import llm
 from app.database import get_db
 from app.agents.trigger_store import due_triggers, mark_ran
+from app.services import rate_limit
 from app.services.push_service import send_push_notification
 from app.agents.memory_store import get_profile
 from .service import (
@@ -657,6 +660,32 @@ async def pull_next_digest(
     — never raises for an ordinary refusal, because "you can't have one yet" is
     an answer rather than a failure.
     """
+    # The account-level spend cap, and the reason it lives here rather than on
+    # the route: the route is not the only door. `pull_next_lesson` reaches this
+    # function straight from a chat turn, which is capped only by
+    # `learning_query` at 30/minute — so a cap sitting on the route left the most
+    # expensive operation in the product running on the loosest budget in it.
+    #
+    # Counted before the roadmap is read. Every branch below can reach a web
+    # search and two or three model calls, and a cap that starts counting after
+    # the cheap refusals is one a caller can walk past by asking for a topic that
+    # refuses.
+    retry_after = await rate_limit.check_user(
+        "learning_digest",
+        user_id,
+        LEARNING_DIGEST_RATE_LIMIT,
+        LEARNING_DIGEST_RATE_WINDOW,
+    )
+    if retry_after is not None:
+        return {
+            "refused": (
+                "That's a lot of lessons in one stretch — the next one can be "
+                f"written in {retry_after}s."
+            ),
+            "reason": "rate_limited",
+            "retry_after": retry_after,
+        }
+
     roadmap = await fetch_roadmap(await resolve_roadmap_id(user_id, roadmapId), user_id)
     if not roadmap:
         return {"refused": "There's no active roadmap to pull a lesson from.",

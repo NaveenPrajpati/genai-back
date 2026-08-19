@@ -9,6 +9,7 @@ the JWT/password layers are the real security boundary, this is defense-in-depth
 """
 
 import logging
+from typing import Optional
 
 from fastapi import HTTPException, Request
 
@@ -26,31 +27,47 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-async def enforce(key: str, limit: int, window_seconds: int) -> None:
-    """Count one hit against `key`; raise 429 if it exceeds `limit` within the
-    window. No-op on any Redis error (fail open)."""
+async def check(key: str, limit: int, window_seconds: int) -> Optional[int]:
+    """Count one hit against `key`. Returns None while under `limit`, or the
+    seconds to wait once over it.
+
+    The counting half of `enforce`, split out for callers that must not raise. A
+    limit reached below the HTTP layer has to become that caller's own kind of
+    answer: an HTTPException thrown inside an agent's tool loop reaches the
+    learner as a broken turn rather than as a reason.
+
+    Fails open — a Redis error counts nothing and returns None (allowed).
+    """
     full = f"rl:{key}"
     try:
         count = await redis_client.incr(full)
         if count == 1:
             await redis_client.expire(full, window_seconds)
-    except HTTPException:
-        raise
     except Exception:
         logger.warning("rate-limit check failed for %s — allowing", key)
-        return
+        return None
 
-    if count > limit:
-        try:
-            ttl = await redis_client.ttl(full)
-        except Exception:
-            ttl = window_seconds
-        retry = max(ttl, 1)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many attempts. Please try again in {retry}s.",
-            headers={"Retry-After": str(retry)},
-        )
+    if count <= limit:
+        return None
+
+    try:
+        ttl = await redis_client.ttl(full)
+    except Exception:
+        ttl = window_seconds
+    return max(ttl, 1)
+
+
+async def enforce(key: str, limit: int, window_seconds: int) -> None:
+    """Count one hit against `key`; raise 429 if it exceeds `limit` within the
+    window. No-op on any Redis error (fail open)."""
+    retry = await check(key, limit, window_seconds)
+    if retry is None:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=f"Too many attempts. Please try again in {retry}s.",
+        headers={"Retry-After": str(retry)},
+    )
 
 
 async def limit_ip(
@@ -75,3 +92,12 @@ async def limit_user(
     global daily spend cap (the cap bounds total $/day; this bounds one user's
     request rate). Fails open on a Redis outage, like the auth limiters."""
     await enforce(f"{name}:user:{user_id}", limit, window_seconds)
+
+
+async def check_user(
+    name: str, user_id: str, limit: int, window_seconds: int
+) -> Optional[int]:
+    """Non-raising `limit_user`: None while under the cap, else the seconds to
+    wait. Same key, so a call site using this and one using `limit_user` spend
+    the same allowance rather than getting one each."""
+    return await check(f"{name}:user:{user_id}", limit, window_seconds)

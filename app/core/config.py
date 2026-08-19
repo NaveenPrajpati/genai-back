@@ -116,8 +116,18 @@ LEARNING_EXPLAIN_RATE_WINDOW = _int_env("LEARNING_EXPLAIN_RATE_WINDOW", 3600)
 # Percentage a learner must score on a topic's checkpoint before it counts as
 # completed. Also the bar a spaced-repetition review has to clear to push the
 # next review further out.
+#
+# These two have to be chosen together, because the question count decides which
+# pass marks are reachable. At four questions an 80% bar is unreachable at 3/4
+# (75%), so the gate was silently "no mistakes allowed" while telling the learner
+# it was 80% — a stricter promise than the one on screen, which is the wrong
+# direction for a bar to be wrong in. Five questions makes 4/5 exactly 80%: one
+# mistake, as advertised.
+#
+# If you change either, check the other: PASS_SCORE must be achievable by some
+# whole number of correct answers, or the stated bar is a fiction.
 CHECKPOINT_PASS_SCORE = _int_env("CHECKPOINT_PASS_SCORE", 80)
-CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 4)
+CHECKPOINT_QUESTIONS = _int_env("CHECKPOINT_QUESTIONS", 5)
 
 # --- Checkpoint retries ---
 # A completion gate is only a gate if failing costs something. Two limits, doing

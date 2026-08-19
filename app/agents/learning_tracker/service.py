@@ -514,6 +514,14 @@ _DIGEST_QUIZ_SYSTEM = (
     "beats a check about trivia.\n"
     "Keep them short and concrete. Exactly one option is correct, and `answer` is "
     "its 0-based index. Make the wrong options plausible.\n"
+    # Without these a failed check can only say "1/2 right". The learner is sent
+    # back to re-read every tip they were given with no idea which one they
+    # missed, on a gate they have to pass before anything else moves.
+    "For every question also set `outcome` — what it checks, in a few words — and "
+    "`hint`, one sentence pointing at the tip it came from. The hint must NOT "
+    "state or paraphrase the correct option, name it by position, or rule the "
+    "wrong ones out: they retry this same check, so a hint that gives it away "
+    "turns the retry into copying.\n"
     "Topic: {topic}\n"
     "Tips already sent:\n{bullets}"
 )

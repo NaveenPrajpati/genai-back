@@ -202,6 +202,36 @@ class QuizOutput(BaseModel):
     quiz: list[Question]
 
 
+class PracticeQuestionDraft(BaseModel):
+    """One question in a mixed practice deck.
+
+    `topic_index` rather than a topic id, for the same reason `TopicDraft` carries
+    `stage_order`: the model is never handed an id it could echo back wrong. An
+    index out of range is a question we drop — a misattributed one would file the
+    learner's wrong answer against a topic it isn't about, and that is how a
+    misconception tracker comes to believe something untrue.
+    """
+
+    topic_index: int = Field(description="0-based index of the topic this question is for")
+    question: str
+    options: list[str] = Field(description="Exactly four options")
+    answer: int = Field(description="0-based index of the correct option")
+    outcome: Optional[str] = Field(
+        default=None, description="What this question tests, in a few words"
+    )
+    hint: Optional[str] = Field(
+        default=None,
+        description=(
+            "One sentence pointing at what to re-read. Must NOT state or paraphrase "
+            "the correct option, name it by position, or eliminate the wrong ones."
+        ),
+    )
+
+
+class PracticeDeckOutput(BaseModel):
+    questions: list[PracticeQuestionDraft] = Field(default_factory=list)
+
+
 class CoverageOutput(BaseModel):
     """Whether the digests sent so far have actually taught the whole topic.
 

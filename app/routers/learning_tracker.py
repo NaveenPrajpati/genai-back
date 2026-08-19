@@ -19,6 +19,7 @@ from app.agents.memory_store import MEMORIES, get_profile, save_profile
 from app.core.config import (
     CHECKPOINT_MAX_ATTEMPTS_PER_DAY,
     CHECKPOINT_PASS_SCORE,
+    CHECKPOINT_QUESTIONS,
     DIGEST_QUIZ_PASS_SCORE,
     DIGEST_RETEACH_AFTER,
     FEYNMAN_LADDER_BONUS,
@@ -26,8 +27,6 @@ from app.core.config import (
     FEYNMAN_PASS_SCORE,
     LEARNING_CHECKPOINT_RATE_LIMIT,
     LEARNING_CHECKPOINT_RATE_WINDOW,
-    LEARNING_DIGEST_RATE_LIMIT,
-    LEARNING_DIGEST_RATE_WINDOW,
     LEARNING_EXPLAIN_RATE_LIMIT,
     LEARNING_EXPLAIN_RATE_WINDOW,
     LEARNING_QUERY_RATE_LIMIT,
@@ -44,6 +43,7 @@ from app.agents.learning_tracker.service import (
     refresh_misconceptions,
 )
 from app.agents.learning_tracker.context import learner_context, situation_key
+from app.agents.learning_tracker.practice import build_practice_deck
 from app.agents.learning_tracker.triggers import (
     build_digest,
     build_revision_digest,
@@ -55,6 +55,7 @@ from app.agents.learning_tracker.repository import (
     ActiveRoadmapLimit,
     apply_checkpoint,
     asked_questions,
+    checkpoint_pass_mark,
     completion_forecast,
     create_note,
     delete_note,
@@ -80,6 +81,7 @@ from app.agents.learning_tracker.repository import (
     mark_misconceptions_addressed,
     note_counts,
     open_questions,
+    public_question,
     profile_drift,
     profile_snapshot,
     quiz_graded,
@@ -90,6 +92,7 @@ from app.agents.learning_tracker.repository import (
     redact_review,
     retry_block,
     revision_outstanding,
+    roadmap_mastery,
     update_note,
     resolve_roadmap_id,
     roadmap_progress,
@@ -458,6 +461,11 @@ async def _roadmap_view(roadmap: dict, user_id: str) -> dict:
         # {topicId: n} — lets the roadmap mark which topics have been written
         # about without shipping the notes themselves.
         "note_counts": await note_counts(user_id, str(roadmap["_id"])),
+        # {topicId: mastery} from the same computation the home screen's numbers
+        # come from. Without it the topic screen had nothing to show but
+        # `mastery_score` — the last checkpoint's score — under the word mastery,
+        # and the two screens disagreed about the same topic.
+        "topic_mastery": await roadmap_mastery(user_id, roadmap),
     }
 
 
@@ -777,7 +785,16 @@ async def acknowledge_digest(
                             if escalating
                             else "Not quite — check the earlier tips and try again."
                         ),
-                        "quiz_result": graded,
+                        # Redacted, exactly as a failed checkpoint is. This
+                        # carried the raw grading, so the correct option for every
+                        # missed question was on the wire — on a gate the learner
+                        # retries until they pass, which makes it the one place
+                        # the answer must not be. What replaces it is more useful
+                        # anyway: what each missed question was testing, and
+                        # which tip to go back to.
+                        "quiz_result": redact_review(
+                            graded, False, quiz.get("questions", [])
+                        ),
                         "pass_score": DIGEST_QUIZ_PASS_SCORE,
                         # The client can stop saying "try again" and start saying
                         # "a new explanation is coming".
@@ -945,19 +962,14 @@ async def generate_digest(
     them up or to skip a check.
     """
     user_id = current_user["uid"]
-    # The most expensive thing the learner can ask for: a web search and two or
-    # three model calls. `build_digest`'s guards are per topic, so this is the
-    # account-level backstop across topics and roadmaps.
-    await rate_limit.limit_user(
-        "learning_digest",
-        user_id,
-        LEARNING_DIGEST_RATE_LIMIT,
-        LEARNING_DIGEST_RATE_WINDOW,
-    )
     # Every guard lives in `pull_next_digest`, which the tutor's own
     # `pull_next_lesson` tool calls as well: one copy of the rules, two ways in.
     # This route's job is now only to turn a refusal into the status and detail
     # shape shipped clients already read.
+    #
+    # That now includes the per-user cap on the most expensive thing the learner
+    # can ask for — a web search and two or three model calls. It used to be
+    # applied here, which capped this door and left the chat one open.
     outcome = await pull_next_digest(user_id, roadmapId, topicId)
     if "digest" in outcome:
         return {"status": "done", "result": outcome["digest"]}
@@ -965,6 +977,16 @@ async def generate_digest(
     reason = outcome.get("reason")
     if reason == "no_roadmap":
         raise HTTPException(status_code=404, detail="No active roadmap to digest.")
+
+    # Over the hourly cap. Same 429 and `Retry-After` the limiter raised when it
+    # sat on this route; the detail is now the refusal sentence, which is a
+    # string like every other detail here and says what the learner ran out of.
+    if reason == "rate_limited":
+        raise HTTPException(
+            status_code=429,
+            detail=outcome["refused"],
+            headers={"Retry-After": str(outcome["retry_after"])},
+        )
 
     # A bare string rather than an object, as before: the client renders a string
     # detail directly, and an object would reach a <Text> child as "[object Object]".
@@ -1169,6 +1191,9 @@ async def start_checkpoint(
 
     if existing:
         quizId, questions = str(existing["_id"]), existing.get("questions", [])
+        # Resumed mid-attempt: keep the bar it was issued under. Falls back to
+        # deriving it for sets stored before the mark was recorded.
+        pass_score = existing.get("pass_score") or checkpoint_pass_mark(len(questions))
     else:
         memory = await get_profile(user_id, LEARNING_NS)
         # Both cached reads — the misconception analysis runs in the background
@@ -1201,6 +1226,17 @@ async def start_checkpoint(
                 "last_probed_at",
             )
         questions = [q.model_dump() for q in generated.quiz]
+        if len(questions) != CHECKPOINT_QUESTIONS:
+            # Not fatal — the bar below adapts to what actually arrived — but it
+            # means the generator is under-delivering, which is invisible from
+            # the outside and quietly changes how hard the gate is.
+            logger.warning(
+                "checkpoint generated %d questions, expected %d (topic=%s)",
+                len(questions),
+                CHECKPOINT_QUESTIONS,
+                topicId,
+            )
+        pass_score = checkpoint_pass_mark(len(questions))
         res = await get_db()["quizzes"].insert_one(
             {
                 "user_id": user_id,
@@ -1208,6 +1244,9 @@ async def start_checkpoint(
                 "topicId": topicId,
                 "kind": "review" if is_review else "checkpoint",
                 "questions": questions,
+                # Stored with the set, so grading marks it against the bar it was
+                # advertised under rather than whatever the config says later.
+                "pass_score": pass_score,
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -1221,7 +1260,7 @@ async def start_checkpoint(
             "topicId": topicId,
             "title": topic.get("title"),
             "is_review": is_review,
-            "pass_score": CHECKPOINT_PASS_SCORE,
+            "pass_score": pass_score,
             # So the learner knows what a failure costs before they answer,
             # rather than discovering the limit by hitting it.
             "attempts_today": len(today),
@@ -1304,8 +1343,18 @@ async def submit_checkpoint(
         if 0 <= r["question"] < len(questions)
     ]
 
+    # The bar this set was issued under. Derived for sets stored before it was
+    # recorded, so an attempt in flight across the change is graded on its own
+    # terms rather than on today's config.
+    pass_score = quiz.get("pass_score") or checkpoint_pass_mark(len(questions))
+
     outcome = await apply_checkpoint(
-        quiz["roadmapId"], quiz["topicId"], user_id, graded["score"], missed=missed
+        quiz["roadmapId"],
+        quiz["topicId"],
+        user_id,
+        graded["score"],
+        missed=missed,
+        pass_score=pass_score,
     )
     if outcome is None:
         raise HTTPException(status_code=404, detail="Roadmap or topic not found.")
@@ -1328,7 +1377,7 @@ async def submit_checkpoint(
         "result": CheckpointOutcome(
             **redact_review(graded, outcome["passed"], questions),
             **outcome,
-            pass_score=CHECKPOINT_PASS_SCORE,
+            pass_score=pass_score,
         ).model_dump(),
     }
 
@@ -1467,6 +1516,158 @@ async def explain_topic(
             "topicId": topicId,
             "roadmapId": body.roadmapId,
         },
+    }
+
+
+@router.post("/practice")
+async def start_practice(current_user: Annotated[dict, Depends(get_current_user)]):
+    """A short mixed-topic practice deck, for a day with nothing waiting.
+
+    The only retrieval in the app that interleaves: every other check sits inside
+    one topic, which lets the surrounding context carry half the answer. It gates
+    nothing, completes nothing, and — unlike a checkpoint — comes back with the
+    answers, because there is no retry here to protect.
+
+    Refusals are answers rather than errors: a learner who has not finished a
+    topic yet has nothing to retrieve, and the thing to do is finish one.
+    """
+    user_id = current_user["uid"]
+    # A deck is a single model call over several topics, so it sits in the same
+    # bucket as a checkpoint rather than getting a cheaper one of its own.
+    await rate_limit.limit_user(
+        "learning_checkpoint",
+        user_id,
+        LEARNING_CHECKPOINT_RATE_LIMIT,
+        LEARNING_CHECKPOINT_RATE_WINDOW,
+    )
+
+    deck = await build_practice_deck(user_id)
+    if "refused" in deck:
+        raise HTTPException(status_code=409, detail=deck["refused"])
+
+    questions = deck["questions"]
+    # `topicId` is null on the document and set per question instead: a deck spans
+    # topics, and the attempt it produces has to be attributed to each of them
+    # separately or the misconception tracker learns the wrong thing.
+    res = await get_db()["quizzes"].insert_one(
+        {
+            "user_id": user_id,
+            "roadmapId": None,
+            "topicId": None,
+            "kind": "practice",
+            "questions": questions,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    return {
+        "status": "done",
+        "result": {
+            "quizId": str(res.inserted_id),
+            "topics": deck["topics"],
+            # Answer-free, like every other set that leaves this server.
+            "questions": [
+                {**public_question(q), "topicTitle": q.get("topicTitle"), "topicId": q.get("topicId")}
+                for q in questions
+            ],
+        },
+    }
+
+
+class PracticeSubmission(BaseModel):
+    quizId: str
+    answers: list[Answer]
+
+
+@router.post("/practice/submit")
+async def submit_practice(
+    body: PracticeSubmission,
+    background_tasks: BackgroundTasks,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Grade a practice deck.
+
+    Two things separate this from every other grading route. The answers come
+    back in full — practice unlocks nothing, so there is no transcription to
+    prevent and immediate feedback is simply better teaching. And the attempt is
+    recorded per *topic*, tagged `practice`: it feeds the misconception tracker,
+    which is the diagnostic point of the exercise, and is kept out of mastery, so
+    a voluntary drill can never cost the learner their headline number.
+    """
+    user_id = current_user["uid"]
+    quiz = await fetch_quiz(user_id, body.quizId)
+    if not quiz or quiz.get("kind") != "practice":
+        raise HTTPException(status_code=404, detail="Practice set not found.")
+    if await quiz_graded(user_id, body.quizId):
+        raise HTTPException(status_code=409, detail="That practice set is already graded.")
+
+    questions = quiz.get("questions", [])
+    graded = grade_quiz(questions, {a.question: a.answer for a in body.answers})
+
+    # One attempt per topic the deck touched, holding only that topic's questions.
+    # A single attempt spanning five topics would attribute every miss to all of
+    # them, and the misconception analysis reads exactly this.
+    by_topic: dict[tuple, list[int]] = {}
+    for i, q in enumerate(questions):
+        key = (q.get("roadmapId"), q.get("topicId"))
+        if all(key):
+            by_topic.setdefault(key, []).append(i)
+
+    chosen = {a.question: a.answer for a in body.answers}
+    breakdown = []
+    for (roadmapId, topicId), positions in by_topic.items():
+        subset = [questions[i] for i in positions]
+        # Re-graded against the subset so `review` indices line up with it — the
+        # attempt is stored against this topic alone and has to be readable on
+        # its own terms months later.
+        selected = {new: chosen[old] for new, old in enumerate(positions) if old in chosen}
+        result = grade_quiz(subset, selected)
+        await record_quiz_attempt(
+            user_id,
+            body.quizId,
+            roadmapId,
+            topicId,
+            result,
+            questions=subset,
+            kind="practice",
+        )
+        title = next((q.get("topicTitle") for q in subset if q.get("topicTitle")), "")
+        background_tasks.add_task(
+            refresh_misconceptions, user_id, roadmapId, topicId, title or ""
+        )
+        breakdown.append(
+            {
+                "roadmapId": roadmapId,
+                "topicId": topicId,
+                "title": title,
+                "correct": result["correct"],
+                "total": result["total"],
+            }
+        )
+
+    # Weakest first: with the deck mixed, the useful reading is which topic let
+    # them down, and a list in deck order buries it.
+    breakdown.sort(key=lambda b: (b["correct"] / b["total"]) if b["total"] else 1)
+
+    # Everything a checkpoint shows on a pass AND everything it shows on a
+    # failure. `grade_quiz` reports the answer but not the hint, and `reveal=True`
+    # passes its result through untouched — so the hint the generator wrote would
+    # be stored and never seen. Here it costs nothing to give: there is no retry
+    # for it to leak into, and "what to go back over" is the point of the round.
+    review = [
+        {
+            **r,
+            "outcome": (questions[r["question"]] or {}).get("outcome"),
+            "hint": (questions[r["question"]] or {}).get("hint"),
+        }
+        if isinstance(r.get("question"), int) and 0 <= r["question"] < len(questions)
+        else r
+        for r in graded.get("review") or []
+    ]
+
+    return {
+        "status": "done",
+        "result": {**graded, "review": review, "answers_revealed": True, "topics": breakdown},
     }
 
 

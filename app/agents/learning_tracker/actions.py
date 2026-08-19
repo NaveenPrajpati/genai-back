@@ -134,6 +134,11 @@ def build_action_tools(user_id: str) -> list[StructuredTool]:
         )
 
     async def _pull_next_lesson(roadmapId: Optional[str] = None) -> str:
+        # The one tool that spends real money — a web search and two or three
+        # model calls. `pull_next_digest` carries the per-user hourly cap, and
+        # this door shares the budget with POST /digests/generate rather than
+        # getting one of its own: being over it arrives as a refusal sentence
+        # like any other, which is why the cap is checked in there and not here.
         outcome = await pull_next_digest(user_id, roadmapId)
         if "digest" in outcome:
             digest = outcome["digest"]
