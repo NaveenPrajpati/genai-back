@@ -24,6 +24,7 @@ jobs:
       packages: write
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,7 +88,7 @@ jobs:
           script_stop: true   # abort on first failing command
           # GITHUB_TOKEN is scoped to this run and expires when it ends, so no
           # long-lived registry credential ever sits on the server.
-          envs: GHCR_TOKEN,GHCR_USER,IMAGE_TAG
+          envs: GHCR_TOKEN,GHCR_USER,IMAGE_TAG,IMAGE_NAME
           script: |
             set -euo pipefail
             cd ~/aiserver/genai-back
@@ -98,7 +99,7 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-            export IMAGE_TAG
+            export IMAGE_TAG IMAGE_NAME
             docker compose pull
             docker compose up -d --remove-orphans
 
@@ -127,3 +128,4 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           IMAGE_TAG: ${{ needs.build.outputs.tag }}
+          IMAGE_NAME: ${{ needs.build.outputs.image }}

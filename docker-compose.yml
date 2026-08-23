@@ -9,7 +9,10 @@ services:
     # Built and pushed by .github/workflows/deploy.yml, never built on the EC2
     # box: 951MB of RAM will not survive compiling this dependency set. Pinned
     # by commit SHA at deploy time so rollback is `IMAGE_TAG=<old-sha> up -d`.
-    image: ghcr.io/naveenprajpati/genaiback:${IMAGE_TAG:-latest}
+    # IMAGE_NAME is passed by the deploy workflow, derived from github.repository
+    # so a repo rename can never desync this from what CI actually pushed. The
+    # default is only for running compose by hand on the server.
+    image: ${IMAGE_NAME:-ghcr.io/naveenprajpati/genai-back}:${IMAGE_TAG:-latest}
     # Only used by `docker compose build` on a dev machine. Note that an
     # Apple-Silicon Mac produces an arm64 image, which will NOT run on the
     # amd64 t2 instance — another reason prod images come from CI.
