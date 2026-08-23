@@ -12,7 +12,7 @@ from langgraph.types import Command
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.agents.trigger_store import toggle
+from app.agents.trigger_store import get_trigger, next_run_at, toggle
 from app.agents.approval_store import get_pending, list_pending, to_legacy
 from app.agents.memory_store import extract_and_save, get_profile
 from app.agents.personal_assistant.state import PAMemoryExtract, PA_MEMORY_INSTRUCTIONS
@@ -323,6 +323,36 @@ async def delete_task(
     if not deleted:
         raise HTTPException(status_code=404, detail="Task not found.")
     return {"status": "done"}
+
+
+@router.get("/trigger")
+async def get_trigger_state(current_user: Annotated[dict, Depends(get_current_user)]):
+    """The current state of this user's daily digest.
+
+    `POST /toggle-trigger` was write-only, so a client had nothing to render the
+    switch from and had to assume "off" on every launch — which silently
+    inverted the control for anyone who had already turned the digest on: their
+    next tap disabled the thing they were trying to keep.
+
+    A user who never opted in has no row, which is reported as disabled at the
+    default hour rather than as an error — that is what they will get if they
+    switch it on.
+    """
+    try:
+        trig = await get_trigger(current_user["uid"], "pa_digest")
+        return {
+            "status": "done",
+            "result": {
+                "enabled": bool(trig.get("enabled")) if trig else False,
+                "schedule_hour": (trig or {}).get("schedule_hour", 8),
+                "timezone": (trig or {}).get("timezone", "UTC"),
+                # None when off — there is no next run to count down to.
+                "next_run_at": next_run_at(trig) if trig else None,
+                "last_run_at": (trig or {}).get("last_run_at"),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/toggle-trigger")

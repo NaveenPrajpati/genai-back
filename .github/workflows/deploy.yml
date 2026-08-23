@@ -119,8 +119,13 @@ jobs:
                 --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \
                 "$cid" 2>/dev/null)" || status=inspect-failed
               echo "  [$i] $status"
-              [ "$status" = healthy ] && break
-              [ "$status" = no-healthcheck ] && break
+              # Every statement here must exit 0 on the "keep waiting" path.
+              # `[ x = y ] && break` returns 1 when the test is false, and
+              # drone-ssh's script_stop treats that as a failed command and
+              # aborts the deploy — so branch only with if/fi, never with &&.
+              if [ "$status" = healthy ] || [ "$status" = no-healthcheck ]; then
+                break
+              fi
               if [ "$status" = unhealthy ]; then
                 echo "--- last healthcheck output ---"
                 docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}}: {{.Output}}{{end}}' "$cid" || true

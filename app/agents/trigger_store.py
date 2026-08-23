@@ -109,6 +109,25 @@ async def user_zone(user_id: str, action_type: str) -> ZoneInfo:
     return _zone(trig or {})
 
 
+async def get_trigger(user_id: str, action_type: str) -> dict | None:
+    """This user's `action_type` trigger row, or None if they never opted in.
+
+    The counterpart to `toggle`, which until now was write-only: a client could
+    flip a digest on but had no way to ask whether it was on. Every caller of
+    `toggle` therefore had to *assume* a starting state, and a switch rendered
+    from an assumption is wrong for anyone who set it in an earlier session.
+    """
+    try:
+        return await get_db()["triggers"].find_one(
+            {"user_id": user_id, "action_type": action_type}
+        )
+    except Exception as e:
+        logger.error(
+            "get_trigger lookup failed user=%s action=%s: %s", user_id, action_type, e
+        )
+        return None
+
+
 async def due_triggers(action_type: str, now: datetime | None = None) -> list[dict]:
     """Enabled triggers of `action_type` that are due to fire right now."""
     now = now or datetime.now(timezone.utc)

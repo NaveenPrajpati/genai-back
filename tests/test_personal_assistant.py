@@ -517,3 +517,65 @@ async def test_run_pa_triggers_creates_digest(monkeypatch):
     pa_triggers.fetch_todos.assert_awaited_once_with("u1", status="pending")
     pa_triggers.create_pending.assert_awaited_once()
     pa_triggers.mark_ran.assert_awaited_once()
+
+
+# --------------------------------------------------------------------------- #
+# digest trigger state
+# --------------------------------------------------------------------------- #
+def test_pa_trigger_state_reports_enabled(monkeypatch):
+    # The row exists and is on: the client can render the switch from this
+    # instead of assuming a starting state.
+    monkeypatch.setattr(
+        pa_router,
+        "get_trigger",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "schedule_hour": 8,
+                "timezone": "UTC",
+                "last_run_at": "2026-08-22T08:00:00+00:00",
+            }
+        ),
+    )
+    client = _make_client(MagicMock())
+
+    resp = client.get("/personal-assistant/trigger")
+
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["enabled"] is True
+    assert result["schedule_hour"] == 8
+    # Enabled triggers advertise when they next fire.
+    assert result["next_run_at"]
+
+
+def test_pa_trigger_state_without_a_row_is_disabled(monkeypatch):
+    # Never opted in. That is not an error — it is the state they would be
+    # switching on from, reported at the hour they would get.
+    monkeypatch.setattr(pa_router, "get_trigger", AsyncMock(return_value=None))
+    client = _make_client(MagicMock())
+
+    resp = client.get("/personal-assistant/trigger")
+
+    assert resp.status_code == 200
+    assert resp.json()["result"] == {
+        "enabled": False,
+        "schedule_hour": 8,
+        "timezone": "UTC",
+        "next_run_at": None,
+        "last_run_at": None,
+    }
+
+
+def test_pa_trigger_state_disabled_row_has_no_next_run(monkeypatch):
+    monkeypatch.setattr(
+        pa_router,
+        "get_trigger",
+        AsyncMock(return_value={"enabled": False, "schedule_hour": 8}),
+    )
+    client = _make_client(MagicMock())
+
+    resp = client.get("/personal-assistant/trigger")
+
+    assert resp.json()["result"]["enabled"] is False
+    assert resp.json()["result"]["next_run_at"] is None
