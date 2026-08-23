@@ -54,9 +54,22 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:latest
+          # Links the package to this repository. Without it GHCR may leave the
+          # package unattached, and the deploy job's GITHUB_TOKEN — which has
+          # packages:read for THIS repo — gets "not found" on pull, because GHCR
+          # reports missing rather than forbidden for packages you can't read.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           # Without a cache every build recompiles the whole requirements set.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify the tag is actually pullable
+        # Fail here rather than 20 minutes later on the server. A push that
+        # silently produced nothing should break the build job, not the deploy.
+        run: |
+          docker buildx imagetools inspect \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
 
   deploy:
     needs: build
