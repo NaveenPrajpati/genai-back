@@ -6,9 +6,10 @@ from typing import Annotated, List, Literal, Optional, TypedDict
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-# The three skills the supervisor can dispatch to. "learning" and "assistant"
-# are LangGraph subgraphs; "meal" is reached over MCP.
-Skill = Literal["learning", "assistant", "meal"]
+# The four skills the supervisor can dispatch to. "learning", "assistant" and
+# "job" are LangGraph subgraphs; "meal" is reached over MCP from the supervisor
+# itself. (The job helper also speaks MCP, but inside its own subgraph.)
+Skill = Literal["learning", "assistant", "job", "meal"]
 
 
 def merge_results(left: Optional[dict], right: Optional[dict]) -> dict:
@@ -26,6 +27,8 @@ class SupervisorState(TypedDict, total=False):
     # Optional deep links, forwarded to whichever subgraph needs them.
     roadmapId: Optional[str]
     plan_id: Optional[str]
+    application_id: Optional[str]
+    resume_id: Optional[str]
 
     # --- routing ---
     memory: dict

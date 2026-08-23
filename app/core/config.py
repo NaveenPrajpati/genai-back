@@ -112,6 +112,45 @@ LEARNING_CHECKPOINT_RATE_WINDOW = _int_env("LEARNING_CHECKPOINT_RATE_WINDOW", 36
 LEARNING_EXPLAIN_RATE_LIMIT = _int_env("LEARNING_EXPLAIN_RATE_LIMIT", 20)
 LEARNING_EXPLAIN_RATE_WINDOW = _int_env("LEARNING_EXPLAIN_RATE_WINDOW", 3600)
 
+# --- Job-helper per-user rate limits ---
+# Two buckets, because the two kinds of work cost differently. "job_query" is a
+# chat turn or a fit assessment: one tool loop, a handful of model calls, and the
+# thing a user does repeatedly while thinking about a role. "job_write" is
+# ingesting new material — a resume upload (a parse over several pages) or
+# tracking a posting (an analysis over a full JD) — which is rarer per user and
+# each call is a single large prompt.
+#
+# Tailoring rides on "job_query" through the chat; it is the most expensive call
+# here, and bounding it separately would let a user spend the chat allowance and
+# the tailoring allowance in the same minute. Reads cost a Mongo query and are
+# not limited. Fails OPEN on a Redis outage, like every other limiter.
+JOB_QUERY_RATE_LIMIT = _int_env("JOB_QUERY_RATE_LIMIT", 30)
+JOB_QUERY_RATE_WINDOW = _int_env("JOB_QUERY_RATE_WINDOW", 60)
+JOB_WRITE_RATE_LIMIT = _int_env("JOB_WRITE_RATE_LIMIT", 20)
+JOB_WRITE_RATE_WINDOW = _int_env("JOB_WRITE_RATE_WINDOW", 3600)
+
+# --- Job search ---
+# Which board `search_jobs` queries. "auto" takes the best one whose keys are
+# actually present and falls back to a keyless board, so a fresh clone can
+# search with no configuration at all and improves when a key is added. Read at
+# call time in agents/job_helper/jobsearch.py, which is also where the coverage
+# and description-quality trade-offs between the four providers are written down.
+#
+#   auto | jsearch (RAPIDAPI_KEY) | adzuna (ADZUNA_APP_ID + ADZUNA_APP_KEY)
+#        | remotive (keyless, remote tech) | arbeitnow (keyless, mostly EU)
+JOB_SEARCH_PROVIDER = os.getenv("JOB_SEARCH_PROVIDER", "auto")
+# Adzuna is per-country; India by default, matching where this app's users are.
+ADZUNA_COUNTRY = os.getenv("ADZUNA_COUNTRY", "in")
+
+# --- Resume file storage ---
+# The user's uploaded resume is kept byte-for-byte in this Supabase Storage
+# bucket, because the structure we parse out of it is not what they send to an
+# employer. Create the bucket PRIVATE: a resume is a phone number, an address
+# and an employment history in one file, and reads go through short-lived signed
+# URLs (agents/job_helper/files.py) rather than a permanent public link.
+RESUME_BUCKET = os.getenv("RESUME_BUCKET", "resumes")
+RESUME_URL_TTL = _int_env("RESUME_URL_TTL", 3600)
+
 # --- Learning checkpoints (active recall) ---
 # Percentage a learner must score on a topic's checkpoint before it counts as
 # completed. Also the bar a spaced-repetition review has to clear to push the
@@ -218,15 +257,19 @@ FEYNMAN_LADDER_BONUS = _int_env("FEYNMAN_LADDER_BONUS", 1)
 FEYNMAN_MIN_WORDS = _int_env("FEYNMAN_MIN_WORDS", 20)
 DIGEST_QUIZ_PASS_SCORE = _int_env("DIGEST_QUIZ_PASS_SCORE", 100)
 
-# --- MCP (meal planner published over Model Context Protocol) ---
-# app.main mounts the server at /mcp of this same process, so the default URL
-# points back at ourselves. Both sides are async, so the supervisor awaiting its
+# --- MCP (skills published over Model Context Protocol) ---
+# app.main mounts these servers inside this same process, so the default URLs
+# point back at ourselves. Both sides are async, so the supervisor awaiting its
 # own MCP endpoint just yields to the event loop — no deadlock on one worker.
-# Point MEAL_MCP_URL elsewhere to run the meal planner as its own service.
-# The trailing slash matters: the server is mounted at /mcp and serves at its
+# Point either URL elsewhere to run that skill as its own service.
+# The trailing slash matters: a server is mounted at a path and serves at its
 # own root, so /mcp/ is the endpoint and /mcp would only redirect to it.
 MEAL_MCP_URL = os.getenv("MEAL_MCP_URL", "http://127.0.0.1:8000/mcp/")
 MEAL_MCP_TIMEOUT = max(1.0, float(os.getenv("MEAL_MCP_TIMEOUT", "60")))
+# The job helper's tools include a resume rewrite over a full posting, which is
+# a slower call than anything the meal planner makes — hence the longer default.
+JOB_MCP_URL = os.getenv("JOB_MCP_URL", "http://127.0.0.1:8000/mcp/jobs/")
+JOB_MCP_TIMEOUT = max(1.0, float(os.getenv("JOB_MCP_TIMEOUT", "120")))
 # Shared secret for the mounted /mcp endpoint. Unset = no check, which is only
 # acceptable when /mcp is unreachable from outside the host (EC2 security group).
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "")

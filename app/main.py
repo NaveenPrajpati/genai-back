@@ -17,6 +17,7 @@ from app.routers import (
     users,
     personal_assistant,
     meal_planner,
+    job_helper,
     supervisor,
     rag,
     chat,
@@ -29,9 +30,12 @@ from app.agents.meal_planner import (
     graph as meal_graph,
     run_triggers as run_meal_triggers,
 )
+from app.agents.job_helper import graph as job_graph, run_job_triggers
 from app.agents.supervisor import graph as supervisor_graph
 from app.agents.learning_tracker.indexes import ensure_indexes as ensure_learning_indexes
+from app.agents.job_helper.repository import ensure_indexes as ensure_job_indexes
 from app.mcp.meal_planner import mcp as meal_mcp
+from app.mcp.job_helper import mcp as job_mcp
 from app.mcp.mount import guarded_app, session_lifespan
 from app.services.user_service import (
     deactivate_expired_guests,
@@ -73,6 +77,9 @@ async def lifespan(app: FastAPI):
         # its own helper — every read there is scoped by user_id and then sorted,
         # which without them is a collection scan per screen.
         await ensure_learning_indexes()
+        # Same story for the job helper's own collections: every application and
+        # resume read is scoped by user_id and then sorted.
+        await ensure_job_indexes()
     except Exception as e:
         print(f"MongoDB connection failed (non-fatal): {e}")
 
@@ -89,10 +96,12 @@ async def lifespan(app: FastAPI):
         app.state.learning_agent = graph.compile(checkpointer=checkpointer)
         app.state.pa_agent = pa_graph.compile(checkpointer=checkpointer)
         app.state.meal_agent = meal_graph.compile(checkpointer=checkpointer)
-        # The supervisor embeds the learning and PA graphs as subgraphs. They are
-        # compiled inside it WITHOUT a checkpointer and inherit this one, which is
-        # what lets an approval raised deep in a subgraph pause the supervisor
-        # thread and resume from a single Command on the parent.
+        app.state.job_agent = job_graph.compile(checkpointer=checkpointer)
+        # The supervisor embeds the learning, PA and job-helper graphs as
+        # subgraphs. They are compiled inside it WITHOUT a checkpointer and
+        # inherit this one, which is what lets an approval raised deep in a
+        # subgraph pause the supervisor thread and resume from a single Command
+        # on the parent.
         app.state.supervisor_agent = supervisor_graph.compile(checkpointer=checkpointer)
         print("Using PostgresSaver checkpointer")
 
@@ -105,6 +114,7 @@ async def lifespan(app: FastAPI):
         app.state.learning_agent = graph.compile(checkpointer=MemorySaver())
         app.state.pa_agent = pa_graph.compile(checkpointer=MemorySaver())
         app.state.meal_agent = meal_graph.compile(checkpointer=MemorySaver())
+        app.state.job_agent = job_graph.compile(checkpointer=MemorySaver())
         app.state.supervisor_agent = supervisor_graph.compile(
             checkpointer=MemorySaver()
         )
@@ -129,6 +139,14 @@ async def lifespan(app: FastAPI):
         run_meal_triggers,
         CronTrigger(minute=0),
         args=[app.state.meal_agent],
+    )
+    # Job-application follow-ups: hourly sweep, fires per user at their chosen
+    # schedule_hour/timezone (default 09:00 daily) and raises a to-do only for
+    # applications that have gone quiet. No model calls — see its module docstring.
+    scheduler.add_job(
+        run_job_triggers,
+        CronTrigger(minute=0),
+        args=[app.state.job_agent],
     )
     # Hourly sweep: deactivate (not delete) guests past their 24h deadline.
     scheduler.add_job(deactivate_expired_guests, "interval", hours=1)
@@ -155,10 +173,10 @@ async def lifespan(app: FastAPI):
     # session manager has to be started here or every MCP request fails.
     mcp_stack = AsyncExitStack()
     try:
-        await mcp_stack.enter_async_context(session_lifespan(meal_mcp))
-        print("[Lifespan] Meal MCP server ready at /mcp")
+        await mcp_stack.enter_async_context(session_lifespan(meal_mcp, job_mcp))
+        print("[Lifespan] MCP servers ready at /mcp (meal) and /mcp/jobs (job helper)")
     except Exception as e:
-        print(f"[Lifespan] MCP server failed to start (meal skill degraded): {e}")
+        print(f"[Lifespan] MCP servers failed to start (those skills degraded): {e}")
 
     # --- ACTIVE PHASE ---
     yield
@@ -200,12 +218,19 @@ app.include_router(prefix="/api", router=chat.router)
 app.include_router(prefix="/api", router=learning_tracker.router)
 app.include_router(prefix="/api", router=personal_assistant.router)
 app.include_router(prefix="/api", router=meal_planner.router)
+app.include_router(prefix="/api", router=job_helper.router)
 app.include_router(prefix="/api", router=supervisor.router)
 
-# The meal planner as a Model Context Protocol server. The supervisor consumes
-# it over this endpoint like any other MCP client would; point an external
-# client (Claude Desktop, the MCP Inspector) here too. Additional servers mount
-# alongside this one and join the session_lifespan(...) call. See app/mcp/mount.py.
+# The skills published as Model Context Protocol servers. The supervisor consumes
+# these endpoints like any other MCP client would; point an external client
+# (Claude Desktop, the MCP Inspector) here too. Additional servers mount
+# alongside these and join the session_lifespan(...) call. See app/mcp/mount.py.
+#
+# ORDER MATTERS. A Starlette mount matches every path under its prefix, and
+# routes are tried in registration order — so /mcp registered first would
+# swallow /mcp/jobs and hand job-helper requests to the meal planner. Mount the
+# more specific path first.
+app.mount("/mcp/jobs", guarded_app(job_mcp))
 app.mount("/mcp", guarded_app(meal_mcp))
 
 

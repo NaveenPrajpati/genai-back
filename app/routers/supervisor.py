@@ -1,12 +1,13 @@
-"""HTTP routes for the supervisor — one chat surface over all three agents.
+"""HTTP routes for the supervisor — one chat surface over all four agents.
 
-The per-agent routers (/learning, /personal-assistant, /meal-planner) are
-untouched and still work; this is an additional entry point, not a replacement.
+The per-agent routers (/learning, /personal-assistant, /meal-planner,
+/job-helper) are untouched and still work; this is an additional entry point,
+not a replacement.
 
 Approvals from any skill surface here identically: the learning tracker's
-roadmap review, the personal assistant's delete confirmation and the meal
-planner's plan approval all pause the supervisor thread and resume through this
-router's POST /approve.
+roadmap review, the personal assistant's delete confirmation, the job helper's
+tailored-resume review and the meal planner's plan approval all pause the
+supervisor thread and resume through this router's POST /approve.
 """
 
 import json
@@ -20,6 +21,11 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from app.agents.approval_store import get_pending, list_pending, to_legacy
+from app.agents.job_helper.state import (
+    JOB_MEMORY_INSTRUCTIONS,
+    JobMemoryExtract,
+)
+from app.agents.job_helper.workflow import RESUME_APPROVAL
 from app.agents.learning_tracker.repository import write_memory
 from app.agents.meal_planner.state import (
     MEAL_MEMORY_INSTRUCTIONS,
@@ -31,6 +37,7 @@ from app.agents.personal_assistant.state import (
     PAMemoryExtract,
 )
 from app.dependencies import get_current_user
+from app.mcp.job_helper.client import JOB_SERVER, load_job_tools
 from app.mcp.meal_planner.client import MEAL_SERVER, load_meal_tools
 
 logger = logging.getLogger(__name__)
@@ -48,6 +55,8 @@ class QueryRequest(BaseModel):
     # Optional deep links, forwarded to whichever skill needs them.
     roadmapId: Optional[str] = None
     plan_id: Optional[str] = None
+    application_id: Optional[str] = None
+    resume_id: Optional[str] = None
 
 
 class ApproveRequest(BaseModel):
@@ -76,6 +85,8 @@ def _inputs(body: QueryRequest, current_user: dict, thread_id: str) -> dict:
         "current_user": {k: v for k, v in current_user.items() if k not in excluded},
         "roadmapId": body.roadmapId,
         "plan_id": body.plan_id,
+        "application_id": body.application_id,
+        "resume_id": body.resume_id,
     }
 
 
@@ -99,6 +110,15 @@ def _schedule_memory(
                 text,
                 PAMemoryExtract,
                 PA_MEMORY_INSTRUCTIONS,
+                memory,
+            )
+        elif skill == "job":
+            background_tasks.add_task(
+                extract_and_save,
+                user_id,
+                text,
+                JobMemoryExtract,
+                JOB_MEMORY_INSTRUCTIONS,
                 memory,
             )
         elif skill == "meal":
@@ -266,6 +286,7 @@ async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)
                 "save_roadmap",
                 "update_roadmap",
                 "pa_delete_task",
+                RESUME_APPROVAL,
                 "supervisor_save_meal_plan",
             ],
         )
@@ -276,19 +297,29 @@ async def list_approvals(current_user: Annotated[dict, Depends(get_current_user)
 
 @router.get("/skills")
 async def skills(current_user: Annotated[dict, Depends(get_current_user)]):
-    """What the supervisor can currently do — including a live check of the MCP
-    server, so a meal planner that is down is visible instead of silent."""
-    tools = await load_meal_tools(current_user["uid"])
+    """What the supervisor can currently do — including a live check of both MCP
+    servers, so a skill that is down is visible instead of silent."""
+    user_id = current_user["uid"]
+    meal_tools = await load_meal_tools(user_id)
+    job_tools = await load_job_tools(user_id)
     return {
         "status": "done",
         "result": {
             "learning": {"transport": "langgraph_subgraph", "available": True},
             "assistant": {"transport": "langgraph_subgraph", "available": True},
+            "job": {
+                # A subgraph whose own tool loop runs on MCP — down means the
+                # skill answers, but with no tools.
+                "transport": "langgraph_subgraph+mcp",
+                "server": JOB_SERVER,
+                "available": bool(job_tools),
+                "tools": sorted(t.name for t in job_tools),
+            },
             "meal": {
                 "transport": "mcp",
                 "server": MEAL_SERVER,
-                "available": bool(tools),
-                "tools": sorted(t.name for t in tools),
+                "available": bool(meal_tools),
+                "tools": sorted(t.name for t in meal_tools),
             },
         },
     }

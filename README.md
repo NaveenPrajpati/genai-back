@@ -3,7 +3,7 @@
 A production-shaped FastAPI backend with two subsystems that share one runtime:
 
 1. **A grounded RAG pipeline** — chat over your own documents, with hybrid retrieval, reranking, a semantic cache, inline citations, and a refusal path for questions the documents don't support.
-2. **A multi-agent platform** — LangGraph agents (learning tracker, personal assistant, meal planner) behind a supervisor that routes intent, with human-in-the-loop approvals and one skill exposed over the Model Context Protocol.
+2. **A multi-agent platform** — LangGraph agents (learning tracker, personal assistant, job helper, meal planner) behind a supervisor that routes intent, with human-in-the-loop approvals and two skills exposed over the Model Context Protocol.
 
 Both are instrumented end to end: Prometheus metrics, an offline eval harness that gates CI, per-user rate limits, and a daily LLM spend cap.
 
@@ -47,6 +47,7 @@ QUERY    POST /api/rag/query/stream                                        (Serv
 
 AGENTS   POST /api/supervisor/...
            └─▶ supervisor graph ─▶ routes to: learning · assistant (subgraphs)
+                                              job helper  (subgraph over MCP)
                                               meal planner (over MCP)
 ```
 
@@ -108,11 +109,17 @@ Files are ordered to match the flow. Full detail in **[RAG_SYSTEM.md](RAG_SYSTEM
 
 ## The agent system
 
-A supervisor graph routes a message to the right skill, over three deliberately different transports — in-process subgraphs for the tightly-coupled skills, MCP for the one that should be independently consumable. Approvals raised deep inside a subgraph pause the parent thread and resume from a single `Command`, which is what makes human-in-the-loop work across the protocol boundary.
+A supervisor graph routes a message to the right skill, over deliberately different transports — in-process subgraphs for the tightly-coupled skills, MCP for the ones that should be independently consumable. Approvals raised deep inside a subgraph pause the parent thread and resume from a single `Command`, which is what makes human-in-the-loop work across the protocol boundary.
+
+The four skills also collaborate: a job posting's skill gap becomes a learning roadmap, and a roadmap's steps become tasks on the assistant's to-do list.
 
 Full detail in **[AGENT_SYSTEM.md](AGENT_SYSTEM.md)**; the most developed agent has its own reference in **[LEARNING_SYSTEM.md](LEARNING_SYSTEM.md)** (spaced repetition, mastery tracking, misconception handling).
 
-The meal planner is mounted at `/mcp` and works with any MCP client — point Claude Desktop or the MCP Inspector at it.
+The meal planner (`/mcp`) and the job helper (`/mcp/jobs`) are mounted as MCP servers and work with any MCP client — point Claude Desktop or the MCP Inspector at either.
+
+**The job helper** searches job boards, tracks the postings you're applying to, scores your resume against one, and tailors it — honestly: the rewrite may reorder and re-word, never add a skill your resume does not evidence.
+
+Your uploaded resume is kept byte-for-byte and never modified, because its layout is yours. Tailoring returns *before/after edits* you apply inside your own document, so the design survives; the structure it reasons over can equally be typed in, for anyone without a resume file yet. Eighteen MCP tools, one of which — saving a tailored version — is deliberately withheld from the model and gated on your approval.
 
 ---
 
@@ -157,7 +164,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-419 tests across 15 files, covering tenant isolation, rate limiting, cache invalidation, SSE stage emission, content safety, resilience, the eval harness, and each agent's workflow.
+572 tests across 17 files, covering tenant isolation, rate limiting, cache invalidation, SSE stage emission, content safety, resilience, document rendering, job-board normalisation, the eval harness, and each agent's workflow.
 
 ---
 

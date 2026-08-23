@@ -44,7 +44,9 @@ certifi==2026.1.4
 cffi==2.0.0
     # via cryptography
 charset-normalizer==3.4.7
-    # via requests
+    # via
+    #   reportlab
+    #   requests
 click==8.3.1
     # via
     #   nltk
@@ -190,6 +192,8 @@ langsmith==0.8.8
     #   langchain-classic
     #   langchain-community
     #   langchain-core
+lxml==6.1.2
+    # via python-docx
 markdown-it-py==4.0.0
     # via rich
 mcp==1.28.1
@@ -238,6 +242,7 @@ pillow==12.3.0
     # via
     #   -r requirements.in
     #   pytesseract
+    #   reportlab
 pinecone==7.3.0
     # via -r requirements.in
 pinecone-plugin-assistant==1.8.0
@@ -315,6 +320,8 @@ python-dateutil==2.9.0.post0
     # via
     #   pinecone
     #   strictyaml
+python-docx==1.2.0
+    # via -r requirements.in
 python-dotenv==1.2.1
     # via
     #   -r requirements.in
@@ -343,6 +350,8 @@ regex==2026.5.9
     # via
     #   nltk
     #   tiktoken
+reportlab==4.4.4
+    # via -r requirements.in
 requests==2.34.2
     # via
     #   -r requirements.in
@@ -418,6 +427,7 @@ typing-extensions==4.15.0
     #   psycopg-pool
     #   pydantic
     #   pydantic-core
+    #   python-docx
     #   realtime
     #   sqlalchemy
     #   typing-inspection

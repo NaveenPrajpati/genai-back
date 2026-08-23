@@ -9,8 +9,9 @@ Sharing one client across users would leak the header of whoever built it first.
 The cost is a tools/list round-trip per turn against a local endpoint.
 """
 
+import json
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -59,3 +60,27 @@ def find_tool(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
 def only(tools: List[BaseTool], allowed: set) -> List[BaseTool]:
     """The subset a tool-calling loop is allowed to drive itself."""
     return [t for t in tools if t.name in allowed]
+
+
+def decode_result(payload: Any) -> Any:
+    """Decode one MCP tool result, from either a ToolMessage or a direct
+    `.ainvoke` return.
+
+    MCP does not hand back a plain string: a result is a list of typed content
+    blocks, and the value we want is the JSON carried in the first text block.
+    Anything that is not JSON is passed through unchanged.
+    """
+    content = getattr(payload, "content", payload)
+    if isinstance(content, list):
+        texts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        content = texts[0] if texts else None
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except (ValueError, TypeError):
+            return content
+    return content

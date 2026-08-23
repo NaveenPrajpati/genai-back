@@ -1,19 +1,26 @@
-"""The supervisor graph: one conversation over all three agents.
+"""The supervisor graph: one conversation over all four agents.
 
-    START → load_context → route ─┬→ learning_agent ─┐
-                                  ├→ assistant_agent ─┼→ (dispatch again) → finalize → END
+    START → load_context → route ─┬→ learning_agent ──┐
+                                  ├→ assistant_agent ─┤
+                                  ├→ job_agent ───────┼→ (dispatch again) → finalize → END
                                   └→ meal_agent ──────┘
 
-WHY THE SKILLS ARE REACHED THREE DIFFERENT WAYS
-───────────────────────────────────────────────
-  • learning / assistant — compiled LangGraph SUBGRAPHS, invoked inside a node.
-    They keep their own state schemas, so each node maps supervisor state in and
-    a compact summary out. They are compiled WITHOUT a checkpointer: a subgraph
-    inherits the parent's, which is what makes an `interrupt()` deep inside the
-    learning tracker's roadmap approval pause the whole supervisor run and
-    resume from a single `Command(resume=...)` on the parent thread.
-  • meal — reached over MCP (app/mcp/meal_planner/). No import of the meal agent
-    here at all; it is a network dependency that happens to live in-process.
+WHY THE SKILLS ARE REACHED TWO DIFFERENT WAYS
+─────────────────────────────────────────────
+  • learning / assistant / job — compiled LangGraph SUBGRAPHS, invoked inside a
+    node. They keep their own state schemas, so each node maps supervisor state
+    in and a compact summary out. They are compiled WITHOUT a checkpointer: a
+    subgraph inherits the parent's, which is what makes an `interrupt()` deep
+    inside the learning tracker's roadmap approval — or the job helper's resume
+    approval — pause the whole supervisor run and resume from a single
+    `Command(resume=...)` on the parent thread.
+
+    The job helper is a subgraph whose own middle node talks to an MCP server,
+    which is why it needs no special handling here: the protocol hop is its
+    business, and the interrupt still surfaces on this thread.
+  • meal — reached over MCP (app/mcp/meal_planner/) directly from this file. No
+    import of the meal agent here at all; it is a network dependency that
+    happens to live in-process.
 
 ONE SKILL PER NODE, NOT A LOOP INSIDE ONE NODE
 ──────────────────────────────────────────────
@@ -35,12 +42,14 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from app.agents.approval_store import create_pending, get_pending, resolve
+from app.agents.job_helper import graph as job_graph
 from app.agents.learning_tracker import graph as learning_graph
 from app.agents.memory_store import get_profile
 from app.agents.personal_assistant import graph as pa_graph
 from app.agents.react import run_tool_loop
 from app.core.config import CACHE_CLASSIFY_THRESHOLD
 from app.core.llm import fast_llm, llm
+from app.mcp.client import decode_result
 from app.mcp.meal_planner.client import (
     SAVE_PLAN_TOOL,
     autonomous_tools,
@@ -56,6 +65,7 @@ logger = logging.getLogger(__name__)
 # is what lets their interrupts surface on the parent thread.
 learning_subgraph = learning_graph.compile()
 assistant_subgraph = pa_graph.compile()
+job_subgraph = job_graph.compile()
 
 MEAL_APPROVAL = "supervisor_save_meal_plan"
 PROPOSE_TOOL = "propose_meal_plan"
@@ -63,6 +73,7 @@ PROPOSE_TOOL = "propose_meal_plan"
 SKILL_NODES = {
     "learning": "learning_agent",
     "assistant": "assistant_agent",
+    "job": "job_agent",
     "meal": "meal_agent",
 }
 
@@ -75,7 +86,12 @@ EXPLAINING OR TEACHING any concept or topic — including a bare "explain X", \
 - assistant: the user's own to-do list and tasks, reminders, agenda and due \
 dates, personal notes and facts to remember, breaking a goal into subtasks, and \
 general web research. Only tasks the user tracks — a shopping or grocery list \
-that comes from a meal plan belongs to meal.
+that comes from a meal plan belongs to meal, and a follow-up on an application \
+belongs to job.
+- job: the user's job search — job descriptions and postings they paste or link, \
+tracking what they have applied to and what stage it is at, their RESUME and \
+tailoring it to a role, cover letters, whether they are a fit for a posting, and \
+interview preparation.
 - meal: weekly meal plans, recipes, nutrition, GROCERY AND SHOPPING LISTS, and \
 food likes, dislikes, diets and allergies.
 
@@ -85,7 +101,9 @@ shopping to my tasks" → meal, assistant).
 
 When two skills could plausibly claim a message, these win: a grocery or \
 shopping list is always meal, never assistant. Explaining or teaching is always \
-learning, never a direct answer.
+learning, never a direct answer. Anything involving a resume, a posting or an \
+application is job — including "what should I learn for this role?", which is a \
+question about a posting's requirements, not a request to be taught.
 
 Anything that reads or changes the user's own data — their tasks, agenda, \
 reminders, notes, roadmap, progress, meal plans — needs a skill. Route it even \
@@ -100,14 +118,18 @@ Examples:
   "am I on track with my studies?"        → learning
   "swap Tuesday dinner for something else" → meal
   "break my thesis into steps"            → assistant
+  "here's a JD, am I a fit?"              → job
+  "tailor my resume for the Stripe role"  → job
+  "which jobs am I waiting to hear back on?" → job
   "make me a week of dinners and put the shopping on my list" → meal, assistant
   "good morning"                          → (none)
 """
 
 FINALIZE_SYSTEM = """\
-You are one assistant with three skills: learning coach, personal assistant, and \
-meal planner. The skill results below are your own work — never mention skills, \
-agents, routing, or tools, and never apologise for what you did not do.
+You are one assistant with four skills: learning coach, personal assistant, job \
+helper, and meal planner. The skill results below are your own work — never \
+mention skills, agents, routing, or tools, and never apologise for what you did \
+not do.
 
 Write a short, natural reply telling the user what happened and what matters \
 from it. Use plain prose or a tight list; do not dump raw data structures. If a \
@@ -237,28 +259,28 @@ async def assistant_agent(state: SupervisorState):
     }
 
 
-def _tool_result(payload: Any) -> Any:
-    """Decode one MCP tool result, from either a ToolMessage or a direct
-    `.ainvoke` return.
-
-    MCP does not hand back a plain string: a result is a list of typed content
-    blocks, and the value we want is the JSON carried in the first text block.
-    Anything that is not JSON is passed through unchanged.
-    """
-    content = getattr(payload, "content", payload)
-    if isinstance(content, list):
-        texts = [
-            block.get("text")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        ]
-        content = texts[0] if texts else None
-    if isinstance(content, str):
-        try:
-            return json.loads(content)
-        except (ValueError, TypeError):
-            return content
-    return content
+async def job_agent(state: SupervisorState):
+    """Job helper as a subgraph. Its tailored-resume approval interrupts in here
+    the same way the learning tracker's roadmap approval does."""
+    out = await job_subgraph.ainvoke(
+        {
+            **_subgraph_input(state),
+            "application_id": state.get("application_id"),
+            "resume_id": state.get("resume_id"),
+        }
+    )
+    summary = {
+        # The job graph's finalizer already writes prose (including the download
+        # links for a saved resume); hand that over rather than re-deriving it.
+        "summary": out.get("summary"),
+        "tailored_resume": out.get("resume_status"),
+        "resume_version_id": out.get("resume_version_id"),
+    }
+    return {
+        "completed": ["job"],
+        "results": {"job": {k: v for k, v in summary.items() if v is not None}},
+        "resume_id": out.get("resume_version_id") or state.get("resume_id"),
+    }
 
 
 def _last_proposal(messages: List[Any]) -> Optional[dict]:
@@ -266,7 +288,7 @@ def _last_proposal(messages: List[Any]) -> Optional[dict]:
     for message in reversed(messages):
         if getattr(message, "name", None) != PROPOSE_TOOL:
             continue
-        result = _tool_result(message)
+        result = decode_result(message)
         if isinstance(result, dict) and result.get("slots"):
             return result
     return None
@@ -366,7 +388,7 @@ async def meal_agent(state: SupervisorState):
         }
 
     save_tool = find_tool(tools, SAVE_PLAN_TOOL)
-    saved = _tool_result(
+    saved = decode_result(
         await save_tool.ainvoke(
             {
                 "week_start": proposal.get("week_start"),
@@ -441,6 +463,7 @@ def build_graph() -> StateGraph:
     graph.add_node("route", route)
     graph.add_node("learning_agent", learning_agent)
     graph.add_node("assistant_agent", assistant_agent)
+    graph.add_node("job_agent", job_agent)
     graph.add_node("meal_agent", meal_agent)
     graph.add_node("finalize", finalize)
 

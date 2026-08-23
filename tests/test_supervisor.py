@@ -17,6 +17,7 @@ import app.agents.supervisor.workflow as sup
 import app.routers.supervisor as sup_router
 from app.agents.supervisor.state import merge_results
 from app.dependencies import get_current_user
+from app.mcp.client import decode_result
 
 
 def _make_client(agent, user=None):
@@ -71,21 +72,24 @@ def test_merge_results_accumulates_across_skills():
 
 # --------------------------------------------------------------------------- #
 # decoding MCP results
+#
+# The decoder itself now lives in app/mcp/client.py, shared with the job helper.
+# These stay here because the meal path in this graph depends on the behaviour.
 # --------------------------------------------------------------------------- #
 def test_tool_result_decodes_mcp_content_blocks():
     # MCP wraps results in content blocks; the JSON lives in the text block.
     message = _tool_message("propose_meal_plan", '{"slots": [1, 2], "saved": false}')
-    assert sup._tool_result(message) == {"slots": [1, 2], "saved": False}
+    assert decode_result(message) == {"slots": [1, 2], "saved": False}
 
 
 def test_tool_result_handles_plain_strings_and_non_json():
-    assert sup._tool_result(AIMessage(content='{"a": 1}')) == {"a": 1}
-    assert sup._tool_result(AIMessage(content="just text")) == "just text"
+    assert decode_result(AIMessage(content='{"a": 1}')) == {"a": 1}
+    assert decode_result(AIMessage(content="just text")) == "just text"
 
 
 def test_tool_result_accepts_a_direct_invoke_return():
     # save_meal_plan is called directly, not through a ToolMessage.
-    assert sup._tool_result([{"type": "text", "text": '{"plan_id": "p1"}'}]) == {
+    assert decode_result([{"type": "text", "text": '{"plan_id": "p1"}'}]) == {
         "plan_id": "p1"
     }
 

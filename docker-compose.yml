@@ -1,19 +1,62 @@
+# Production configuration. This file is what runs on the server: a plain
+# `docker compose up -d` there gets exactly this.
+#
+# Local development layers docker-compose.override.yml on top (hot reload, bind
+# mounts). That file is gitignored, so it exists only on dev machines and can
+# never reach the server.
 services:
   api:
+    # Built and pushed by .github/workflows/deploy.yml, never built on the EC2
+    # box: 951MB of RAM will not survive compiling this dependency set. Pinned
+    # by commit SHA at deploy time so rollback is `IMAGE_TAG=<old-sha> up -d`.
+    image: ghcr.io/naveenprajpati/genaiback:${IMAGE_TAG:-latest}
+    # Only used by `docker compose build` on a dev machine. Note that an
+    # Apple-Silicon Mac produces an arm64 image, which will NOT run on the
+    # amd64 t2 instance — another reason prod images come from CI.
     build: .
-    image: aiengineer
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     env_file:
       - .env
-    restart: unless-stopped
-    depends_on:
-      [redis]
-      # uncomment if you enable the local redis below
-
-  # Uncomment this block AND set REDIS_URL=redis://redis:6379 in .env to use it.
-  redis:
-    image: redis:8-alpine
+    environment:
+      # Enforces the JWT_SECRET check at boot rather than trusting .env to be
+      # right on every host.
+      APP_ENV: production
+      # REDIS_URL comes from .env — Upstash (rediss://). There is deliberately no
+      # redis service here: the server has no local Redis, and a 256MB cache
+      # container is a poor use of a 951MB box. To move the cache on-host later,
+      # add a redis service and set REDIS_URL=redis://redis:6379 (inside a
+      # container "localhost" is the container itself, not the host).
     ports:
-      - "6379:6379"
-    restart: unless-stopped
+      # Loopback only, exactly matching the systemd unit this replaces
+      # (--bind 127.0.0.1:8000). Caddy terminates TLS on :443 and proxies here,
+      # so the app is never directly reachable from the internet and /metrics
+      # stays private. Do NOT change this to "8000:8000": Docker publishes ports
+      # via iptables rules that BYPASS ufw, so only the EC2 security group would
+      # be holding the door shut.
+      #
+      # If you later add the monitoring stack (monitoring/docker-compose.yml) to
+      # this host, Prometheus scrapes host.docker.internal:8000 — the host's
+      # docker-bridge IP, not loopback — so it cannot reach this. Put both
+      # projects on a shared docker network and scrape `api:8000` instead of
+      # widening this binding.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Capture output lives on the host so it survives image rebuilds. The
+      # Dockerfile pre-creates this dir owned by appuser.
+      - ./captures:/app/captures
+    healthcheck:
+      # `/` is the cheapest 200 the app serves — there is no /health route.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      # Cold start does real work (RAG warm-up, MCP mount, Mongo + Postgres
+      # connects) and measured ~18s locally, so don't count the early checks.
+      start_period: 90s
+      retries: 3
+    logging:
+      # Unbounded json-file logs are a standard way to fill a small EC2 root
+      # volume and take the box down.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

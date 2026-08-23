@@ -43,6 +43,12 @@ RUN python -m nltk.downloader -d /opt/nltk_data punkt_tab stopwords
 WORKDIR /app
 COPY --chown=appuser:appuser . .
 
+# /app stays root-owned so the app can't rewrite its own code, and .dockerignore
+# keeps captures/ out of the image — which left appuser unable to create it, so
+# LLM_CAPTURE=true silently degraded to a warning. Pre-create the one directory
+# the runtime writes to. Mount a volume here to keep captures across restarts.
+RUN mkdir -p /app/captures && chown appuser:appuser /app/captures
+
 USER appuser
 
 EXPOSE 8000

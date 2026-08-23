@@ -9,9 +9,61 @@ concurrency:
   group: deploy-ec2       # never run two deploys at once
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  deploy:
+  # The image is built here, not on the server. The EC2 box is a t2.micro with
+  # 951MB of RAM and a 2GB swapfile; compiling this dependency set there would
+  # thrash swap and likely OOM. The runner also guarantees linux/amd64, which a
+  # local Apple-Silicon build would not.
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the image name
+        id: meta
+        run: |
+          # GHCR rejects uppercase in repository names; github.repository is
+          # NaveenPrajpati/GenAiBack.
+          echo "image=$(echo '${{ env.IMAGE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # Tagged by SHA so a deploy is reproducible and rollback is just
+          # redeploying an older tag; `latest` tracks main for convenience.
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          # Without a cache every build recompiles the whole requirements set.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
@@ -20,11 +72,45 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true   # abort on first failing command
+          # GITHUB_TOKEN is scoped to this run and expires when it ends, so no
+          # long-lived registry credential ever sits on the server.
+          envs: GHCR_TOKEN,GHCR_USER,IMAGE_TAG
           script: |
-            set -e
+            set -euo pipefail
             cd ~/aiserver/genai-back
+
+            # docker-compose.yml lives in the repo, so the server still needs the
+            # source — but only for config, never to build.
             git pull origin main
-            .venv/bin/pip install -r requirements.txt
-            sudo systemctl restart aiengineer
-            sleep 3
-            sudo systemctl is-active aiengineer
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            export IMAGE_TAG
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            # Wait for the container's own healthcheck rather than a fixed sleep;
+            # cold start does RAG warm-up and DB connects (~20s+).
+            echo "waiting for health..."
+            for i in $(seq 1 60); do
+              status=$(docker inspect --format '{{.State.Health.Status}}' \
+                       "$(docker compose ps -q api)" 2>/dev/null || echo starting)
+              [ "$status" = "healthy" ] && break
+              if [ "$status" = "unhealthy" ]; then
+                echo "container went unhealthy:"; docker compose logs --tail=50 api; exit 1
+              fi
+              sleep 5
+            done
+            [ "$status" = "healthy" ] || { echo "timed out"; docker compose logs --tail=50 api; exit 1; }
+
+            # Confirm through the published port, i.e. what Caddy actually proxies to.
+            curl -fsS --max-time 10 http://127.0.0.1:8000/ >/dev/null
+
+            docker logout ghcr.io
+            # Old image layers accumulate on a 19GB disk; keep only what's in use.
+            docker image prune -af --filter "until=168h"
+            echo "deployed ${IMAGE_TAG}"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          IMAGE_TAG: ${{ needs.build.outputs.tag }}
