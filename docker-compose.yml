@@ -18,6 +18,13 @@ services:
     # amd64 t2 instance — another reason prod images come from CI.
     build: .
     restart: unless-stopped
+    # The box has 951MB total and the app idles around 412MB. Without a limit a
+    # memory spike lets the kernel OOM killer pick its own victim — which could
+    # be sshd or Caddy, locking you out or dropping TLS while the API survives.
+    # With one, the container is what dies, and `restart: unless-stopped` brings
+    # it straight back. Predictable failure beats a mystery outage on a host
+    # nobody is watching.
+    mem_limit: 700m
     env_file:
       - .env
     environment:

@@ -189,7 +189,17 @@ Multi-stage Docker build: C extensions compile in a builder stage, the runtime i
 
 The container runs a **single** gunicorn worker on purpose — the APScheduler cron loop and in-memory job state assume one process. Scaling out requires an external queue first.
 
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys to EC2 over SSH on push to `main`.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs on push to `main`. It builds on a GitHub runner and pushes to GHCR tagged with both the commit SHA and `latest`, then deploys over SSH: pull the pinned tag, `docker compose up -d`, and block on the container's own healthcheck. A container that goes unhealthy dumps its healthcheck output and logs and fails the deploy, rather than leaving a broken release running.
+
+Images are never built on the host. The target is a t2.micro with 1 GB of RAM, which cannot compile this dependency set without thrashing swap; building on the runner also guarantees `linux/amd64`, which a local Apple-Silicon build would not. Because every image is SHA-tagged, rollback is redeploying an older one:
+
+```bash
+IMAGE_TAG=<old-sha> docker compose up -d
+```
+
+Caddy terminates TLS and proxies to `127.0.0.1:8000`. The container publishes to loopback only, so the API and `/metrics` are never directly reachable from the internet — Docker writes its published ports as iptables rules that bypass `ufw`, so the binding rather than a firewall rule is what enforces that. Container logs (`max-size 10m`, 3 files) and memory (`mem_limit 700m`) are both capped: on a 1 GB host an unbounded log fills the disk, and an OOM kill with no limit set could take sshd or Caddy instead of the API.
+
+[`docker-compose.yml`](docker-compose.yml) is exactly what runs in production. A gitignored `docker-compose.override.yml` holds local-only deltas — it swaps gunicorn for `uvicorn --reload` over a bind-mounted `app/` — and because it never leaves a dev machine, it cannot alter the server.
 
 ---
 

@@ -104,18 +104,39 @@ jobs:
             docker compose up -d --remove-orphans
 
             # Wait for the container's own healthcheck rather than a fixed sleep;
-            # cold start does RAG warm-up and DB connects (~20s+).
-            echo "waiting for health..."
-            for i in $(seq 1 60); do
-              status=$(docker inspect --format '{{.State.Health.Status}}' \
-                       "$(docker compose ps -q api)" 2>/dev/null || echo starting)
-              [ "$status" = "healthy" ] && break
-              if [ "$status" = "unhealthy" ]; then
-                echo "container went unhealthy:"; docker compose logs --tail=50 api; exit 1
+            # cold start does RAG warm-up and DB connects (~20s+). Every poll is
+            # echoed: a deploy that fails here must say why in the log, not just
+            # exit. `|| true` on the inspect keeps `set -e` from killing the loop
+            # when the container is mid-restart and inspect briefly fails.
+            cid="$(docker compose ps -q api)"
+            echo "waiting for health of ${cid:0:12}..."
+            status=unknown
+            # 120 * 5s = 10 minutes. Measured: a cold start on this t2.micro
+            # blew past 5 minutes (burstable CPU, cold page cache, ~320MB of
+            # block reads), while the same image warms in ~18s on a laptop.
+            for i in $(seq 1 120); do
+              status="$(docker inspect \
+                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \
+                "$cid" 2>/dev/null)" || status=inspect-failed
+              echo "  [$i] $status"
+              [ "$status" = healthy ] && break
+              [ "$status" = no-healthcheck ] && break
+              if [ "$status" = unhealthy ]; then
+                echo "--- last healthcheck output ---"
+                docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}}: {{.Output}}{{end}}' "$cid" || true
+                echo "--- container logs ---"
+                docker compose logs --tail=80 api || true
+                exit 1
               fi
               sleep 5
             done
-            [ "$status" = "healthy" ] || { echo "timed out"; docker compose logs --tail=50 api; exit 1; }
+
+            if [ "$status" != healthy ] && [ "$status" != no-healthcheck ]; then
+              echo "never became healthy (last status: $status)"
+              docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}}: {{.Output}}{{end}}' "$cid" || true
+              docker compose logs --tail=80 api || true
+              exit 1
+            fi
 
             # Confirm through the published port, i.e. what Caddy actually proxies to.
             curl -fsS --max-time 10 http://127.0.0.1:8000/ >/dev/null
