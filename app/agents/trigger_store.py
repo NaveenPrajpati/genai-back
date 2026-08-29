@@ -41,6 +41,25 @@ def _ran_on(trig: dict, tz: ZoneInfo, day) -> bool:
         return False
 
 
+def schedule_dows(trig: dict) -> list[int] | None:
+    """The weekdays this trigger may fire on (Mon=0 .. Sun=6), or None for any day.
+
+    Accepts either a single day or a list of them. The field started out as one
+    int — the meal planner still writes a bare `6` for its Sunday plan — but the
+    case worth having for a work digest is "weekdays only", which is five days,
+    not one. Old rows keep meaning exactly what they always did.
+    """
+    dow = trig.get("schedule_dow")
+    if dow is None:
+        return None
+    if isinstance(dow, int):
+        return [dow]
+    days = sorted({d for d in dow if isinstance(d, int) and 0 <= d <= 6})
+    # An empty or unparseable list would otherwise mean "never fires", which is
+    # not something a schedule field should be able to express by accident.
+    return days or None
+
+
 def is_due(trig: dict, now: datetime) -> bool:
     """True when `now` matches the trigger's local schedule_hour (and schedule_dow,
     if set) in its timezone, and it hasn't already fired during the user's current
@@ -49,9 +68,8 @@ def is_due(trig: dict, now: datetime) -> bool:
     local = now.astimezone(tz)
     if local.hour != trig.get("schedule_hour", 9):
         return False
-    # Mon=0 .. Sun=6 (datetime.weekday()). None => every day.
-    dow = trig.get("schedule_dow")
-    if dow is not None and local.weekday() != dow:
+    dows = schedule_dows(trig)
+    if dows is not None and local.weekday() not in dows:
         return False
     return not _ran_on(trig, tz, local.date())
 
@@ -76,11 +94,11 @@ def next_run_at(trig: dict, now: datetime | None = None) -> str | None:
     if candidate <= local or _ran_on(trig, tz, candidate.date()):
         candidate += timedelta(days=1)
 
-    dow = trig.get("schedule_dow")
-    if dow is not None:
+    dows = schedule_dows(trig)
+    if dows is not None:
         # At most a week out; the loop can't run away.
         for _ in range(7):
-            if candidate.weekday() == dow:
+            if candidate.weekday() in dows:
                 break
             candidate += timedelta(days=1)
 
@@ -141,6 +159,63 @@ async def mark_ran(trig: dict, now: datetime | None = None) -> None:
     await get_db()["triggers"].update_one(
         {"_id": trig["_id"]}, {"$set": {"last_run_at": now.isoformat()}}
     )
+
+
+async def update_trigger(
+    user_id: str,
+    action_type: str,
+    updates: dict,
+    defaults: dict | None = None,
+    unset: list[str] | None = None,
+) -> dict:
+    """Set trigger fields directly, creating the row if it doesn't exist yet.
+
+    `toggle` flips a boolean and nothing else, so the delivery time every trigger
+    row already carries — `schedule_hour`, `timezone`, `schedule_dow` — could
+    only ever be whatever the router hard-coded when the row was first created.
+    The scheduler has always read those fields per user; this is what lets a
+    user actually set them.
+
+    `unset` names fields to clear outright. A None in `updates` means "leave
+    alone", so that a partial update needn't restate every field — which leaves
+    no way to say "back to the default" without saying so separately.
+
+    Returns the row as it now stands.
+    """
+    col = get_db()["triggers"]
+    now = datetime.now(timezone.utc).isoformat()
+    clean = {k: v for k, v in updates.items() if v is not None}
+    dropped = [k for k in (unset or []) if k not in clean]
+
+    update: dict = {
+        "$set": {**clean, "updatedAt": now},
+        "$setOnInsert": {
+            "user_id": user_id,
+            "action_type": action_type,
+            "createdAt": now,
+            # Only applied on insert, and only for fields the caller did not
+            # already specify — otherwise a create would overwrite the very
+            # values being set. A field being cleared is skipped for the same
+            # reason, and because Mongo rejects touching one path twice.
+            **{
+                k: v
+                for k, v in {
+                    "enabled": True,
+                    "schedule_hour": 9,
+                    "timezone": "UTC",
+                    **(defaults or {}),
+                }.items()
+                if k not in clean and k not in dropped
+            },
+        },
+    }
+    if dropped:
+        update["$unset"] = {k: "" for k in dropped}
+
+    await col.update_one(
+        {"user_id": user_id, "action_type": action_type}, update, upsert=True
+    )
+    return await col.find_one({"user_id": user_id, "action_type": action_type}) or {}
 
 
 async def toggle(user_id: str, action_type: str, defaults: dict | None = None) -> bool:

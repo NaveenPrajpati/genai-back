@@ -1,6 +1,8 @@
 """LangGraph nodes and graph wiring for the personal-assistant agent."""
 
 import logging
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -21,13 +23,18 @@ from .state import (
     TaskSelector,
     NoteInput,
     BreakdownOutput,
+    SubtaskInput,
+    PlanOutput,
     ResearchOutput,
+    ReviewOutput,
     SynthesisOutput,
 )
 from .repository import (
     insert_todo,
     fetch_todos,
+    fetch_completed_since,
     find_pending_todos,
+    describe_selection,
     complete_todo,
     delete_todos_by_ids,
     update_todo,
@@ -46,6 +53,45 @@ MEMORY_COMPLETED_KEY = "pa_completed_history"
 
 # How many prior turns to feed the classifier/extractors for follow-up context.
 HISTORY_WINDOW = 6
+
+# How far back a "what did I get done" review looks. A week: long enough to
+# have something to say, short enough that the answer is still about now.
+REVIEW_WINDOW_DAYS = 7
+
+
+def _today_for(state: PAState) -> str:
+    """Today's date in the user's own timezone, named and dated.
+
+    Anything extracting a due date needs this. Without it the model resolves
+    "tomorrow" against whatever its training suggests today is, which is how a
+    task added on 29 Aug 2026 acquires a due date in October — a wrong date that
+    then drives the agenda, the digest and every overdue count downstream.
+
+    `planner_agent` has passed a date anchor since it was written. The two nodes
+    that actually write dates to the database did not, which is the wrong way
+    round: the planner's mistake lasts one reply, theirs is persisted.
+    """
+    now = datetime.now(timezone.utc)
+    name = (state.get("memory") or {}).get("timezone")
+    if name:
+        try:
+            now = now.astimezone(ZoneInfo(name))
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "unknown timezone %r for user=%s, dating in UTC",
+                name,
+                state.get("user_id"),
+            )
+    return f"{now.strftime('%A')} {now.date().isoformat()}"
+
+
+# Appended to every prompt that may return a due date. Relative dates are the
+# whole reason a date anchor is passed at all.
+_DATE_RULES = (
+    "\nToday is {today}. Resolve every relative date — 'tomorrow', 'Friday', "
+    "'next week' — against that date, and return it as an ISO 8601 string. "
+    "Leave the date empty when the user did not give one; never invent it."
+)
 
 
 def _recent_history(state: PAState) -> str:
@@ -88,6 +134,12 @@ async def classify_intent(state: PAState):
                 "- recall: retrieve remembered facts (e.g. 'what do you know about me')\n"
                 "- agenda: show what's due — overdue, today, or upcoming reminders\n"
                 "- breakdown: split a larger goal or project into smaller subtasks\n"
+                "- plan: organise today into a schedule (e.g. 'plan my day', "
+                "'how should I spend today', 'time-block this')\n"
+                "- review: look back over what they've recently finished "
+                "(e.g. 'what did I get done this week', 'weekly review')\n"
+                "Prefer 'agenda' when they just want to see what's due, and "
+                "'plan' when they want it arranged into a day. "
                 "Use the conversation history to resolve follow-up references. "
                 "Reply with one word only.",
             ),
@@ -120,13 +172,26 @@ async def classify_intent(state: PAState):
 
 
 async def _extract_selector(text: str) -> TaskSelector:
+    """Work out which existing task(s) a complete/delete/update request means.
+
+    The old wording — "set match_all=true if they refer to all/every task" — read
+    "delete all my Learn: tasks" as an every-task request, because the sentence
+    does say "all". A qualified all is a filter, and it has to come back as one.
+    """
     chain = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "From the user's message, identify which existing task they mean. "
-                "Return the task title to match on, or set match_all=true if they "
-                "refer to all/every task.",
+                "Identify which existing task(s) the user means.\n"
+                "- title: the distinctive fragment of the task title to match "
+                "on — the words that pick the task out, not the whole sentence.\n"
+                "- match_all: true ONLY for an unqualified request covering "
+                "every task they have ('delete everything', 'clear my whole "
+                "list').\n"
+                "A qualified 'all' is a filter, not match_all: 'all my Learn: "
+                "tasks' sets title='Learn:', and 'every shopping task' sets "
+                "title='shopping'. When in doubt, prefer a title — it narrows, "
+                "and match_all does not.",
             ),
             ("human", "{text}"),
         ]
@@ -148,12 +213,14 @@ async def todo_agent(state: PAState):
                     "title, optional details, priority (low/medium/high), an "
                     "ISO due date if one is mentioned, and a recurrence "
                     "(daily/weekly/monthly) if the task clearly repeats "
-                    "(e.g. 'every Monday' -> weekly).",
+                    "(e.g. 'every Monday' -> weekly)." + _DATE_RULES,
                 ),
                 ("human", "{text}"),
             ]
         ) | fast_llm.with_structured_output(TaskInput)
-        task: TaskInput = await chain.ainvoke({"text": state["query"]})
+        task: TaskInput = await chain.ainvoke(
+            {"text": state["query"], "today": _today_for(state)}
+        )
         created = await insert_todo(user_id, task.model_dump(exclude_none=True))
         return {"intent": "add", "task_status": "added", "todos": [created]}
 
@@ -184,12 +251,15 @@ async def todo_agent(state: PAState):
                     "From the user's message, extract: which existing task to update "
                     "(title field to match) and what changes to apply "
                     "(new_title, new_priority, new_due_at, new_details). "
-                    "Only populate fields that the user explicitly wants to change.",
+                    "Only populate fields that the user explicitly wants to change."
+                    + _DATE_RULES,
                 ),
                 ("human", "{text}"),
             ]
         ) | fast_llm.with_structured_output(TaskUpdateInput)
-        update_input: TaskUpdateInput = await chain.ainvoke({"text": state["query"]})
+        update_input: TaskUpdateInput = await chain.ainvoke(
+            {"text": state["query"], "today": _today_for(state)}
+        )
         updates = {
             k: v
             for k, v in {
@@ -221,10 +291,13 @@ async def _delete_with_approval(state: PAState):
 
     approval_id = None
     proposed = None
+    scope = None
     existing = await get_pending(thread_id)
     if existing:
         approval_id = str(existing["_id"])
         proposed = existing["payload"]["tasks"]
+        # Absent on rows written before the card described its own filter.
+        scope = existing["payload"].get("scope")
 
     if not approval_id:
         selector = await _extract_selector(state["query"])
@@ -232,12 +305,29 @@ async def _delete_with_approval(state: PAState):
         if not matches:
             return {"intent": "delete", "task_status": "not_found"}
         proposed = [{"id": m["id"], "title": m["title"]} for m in matches]
+        scope = describe_selection(selector.title, selector.match_all, len(matches))
+        logger.info(
+            "pa delete proposal user=%s scope=%s matched=%d",
+            user_id,
+            scope,
+            len(matches),
+        )
         approval_id = await create_pending(
-            user_id, thread_id, "pa_delete_task", {"tasks": proposed}
+            user_id, thread_id, "pa_delete_task", {"tasks": proposed, "scope": scope}
         )
 
     decision = interrupt(
-        {"type": "pa_delete_task", "approval_id": approval_id, "tasks": proposed}
+        {
+            "type": "pa_delete_task",
+            "approval_id": approval_id,
+            "tasks": proposed,
+            # What the filter resolved to, so the user can check the rule and not
+            # just the list it produced. A card headed "12 tasks whose title
+            # contains 'Learn:'" is falsifiable at a glance; a bare list of
+            # titles is not.
+            "count": len(proposed or []),
+            "scope": scope,
+        }
     )
 
     if decision != "approved":
@@ -351,20 +441,192 @@ async def breakdown_agent(state: PAState):
             (
                 "system",
                 "The user wants to break a larger goal into actionable steps. "
-                "Return a concise parent_title for the overall goal and an ordered "
-                "list of 3-7 concrete subtasks.",
+                "Return a concise parent_title for the overall goal and an "
+                "ordered list of 3-7 concrete subtasks.\n"
+                "Each subtask has its own `priority` and `due_at`. Scheduling "
+                "goes in those fields and never in the title: a subtask titled "
+                "'Monday: draft the outline' is wrong, because a day written "
+                "inside a title cannot be sorted, reminded on, rolled over or "
+                "shown on the agenda. Title it 'Draft the outline' and put "
+                "Monday in due_at.\n"
+                "Set due_at only when the user asked for the work to be "
+                "scheduled, and priority only when they said something about "
+                "what matters most — including when they single out one step "
+                "('make the first one high priority')." + _DATE_RULES,
             ),
             ("human", "{text}"),
         ]
     ) | llm.with_structured_output(BreakdownOutput)
-    bd: BreakdownOutput = await chain.ainvoke({"text": state["query"]})
+    bd: BreakdownOutput = await chain.ainvoke(
+        {"text": state["query"], "today": _today_for(state)}
+    )
     parent = await insert_todo(user_id, {"title": bd.parent_title})
-    children = await insert_subtasks(user_id, parent["id"], bd.subtasks)
+    children = await insert_subtasks(
+        user_id, parent["id"], [s.model_dump(exclude_none=True) for s in bd.subtasks]
+    )
     return {
         "intent": "breakdown",
         "task_status": f"broke_down:{len(children)}",
         "todos": [parent],
         "subtasks": children,
+    }
+
+
+async def planner_agent(state: PAState):
+    """Lay today's pending tasks out as time blocks.
+
+    The pieces for this were already in place and unused: the agenda buckets
+    tasks by due date, and the learned profile records `work_hours` and standing
+    `priorities` that until now only shaped the wording of replies. "What should
+    I do today" could be answered with a list, but not with a shape for the day.
+
+    The plan is not persisted. It is advice about one day, it goes stale by
+    evening, and storing it would create a second, competing source of truth
+    next to the tasks themselves.
+    """
+    user_id = state["user_id"]
+    memory = state.get("memory") or {}
+    pending = await fetch_todos(user_id, status="pending")
+    agenda = categorize_agenda(pending)
+
+    # Overdue first, then today, then undated — upcoming tasks are not yet the
+    # user's problem and scheduling them today would crowd out what is.
+    candidates = agenda["overdue"] + agenda["today"] + agenda["no_date"]
+    if not candidates:
+        return {
+            "intent": "plan",
+            "task_status": "nothing_to_plan",
+            "plan": {"blocks": [], "unscheduled": [], "notes": None},
+            "agenda": agenda,
+        }
+
+    task_lines = "\n".join(
+        f"  - id={t['id']} [{t.get('priority', 'medium')}] {t.get('title', '')}"
+        f" (due: {t.get('due_at') or 'none'})"
+        for t in candidates[:20]
+    )
+    profile = "; ".join(
+        f"{label}: {memory[key]}"
+        for key, label in (
+            ("work_hours", "Working hours"),
+            ("priorities", "Standing priorities"),
+            ("recurring_commitments", "Recurring commitments"),
+        )
+        if memory.get(key)
+    )
+
+    chain = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Build a realistic time-blocked plan for the user's day from "
+                "their pending tasks.\n"
+                "Rules:\n"
+                "- Stay inside their working hours when given; otherwise assume "
+                "09:00-17:00.\n"
+                "- Respect their recurring commitments — do not schedule over "
+                "them.\n"
+                "- Overdue and high-priority work goes earliest.\n"
+                "- Use realistic durations and leave short breaks between "
+                "blocks. Do not fill every minute.\n"
+                "- Set task_id to the id given for that task; leave it null for "
+                "breaks and buffers.\n"
+                "- Anything that genuinely does not fit goes in `unscheduled` "
+                "by title. Do not silently drop it.\n"
+                "- Times are local wall-clock, 'HH:MM', ordered by start.",
+            ),
+            (
+                "human",
+                "Today is {today}.\n"
+                "User profile: {profile}\n\nTasks:\n{tasks}\n\n"
+                "Their request: {text}",
+            ),
+        ]
+    ) | llm.with_structured_output(PlanOutput)
+
+    plan: PlanOutput = await chain.ainvoke(
+        {
+            "today": date.today().isoformat(),
+            "profile": profile or "none recorded",
+            "tasks": task_lines,
+            "text": state["query"],
+        }
+    )
+    return {
+        "intent": "plan",
+        "task_status": f"planned:{len(plan.blocks)}",
+        "plan": plan.model_dump(),
+        "todos": candidates,
+        "agenda": agenda,
+    }
+
+
+async def review_agent(state: PAState):
+    """Look back over the week: what got finished, and what is still open.
+
+    This is what `MEMORY_COMPLETED_KEY` was always for. The graph has appended
+    every completed task title to it since the feature shipped, and nothing has
+    ever read it back. Paired here with the tasks actually completed in the
+    window — the memory list is capped and undated, so it is useful for
+    recognising themes but cannot answer "this week" on its own.
+    """
+    user_id = state["user_id"]
+    memory = state.get("memory") or {}
+    since = (datetime.now() - timedelta(days=REVIEW_WINDOW_DAYS)).isoformat()
+
+    completed = await fetch_completed_since(user_id, since)
+    pending = await fetch_todos(user_id, status="pending")
+    agenda = categorize_agenda(pending)
+
+    completed_lines = (
+        "\n".join(f"  - {t.get('title', '')}" for t in completed[:40]) or "  (none)"
+    )
+    open_lines = (
+        "\n".join(
+            f"  - [{t.get('priority', 'medium')}] {t.get('title', '')}"
+            for t in (agenda["overdue"] + agenda["today"])[:20]
+        )
+        or "  (none)"
+    )
+    researched = (memory.get(MEMORY_RESEARCH_KEY) or [])[-10:]
+
+    chain = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "Write a short, encouraging weekly review of the user's work. "
+                "Summarise what they finished, pull out a few genuine "
+                "highlights, name what is still open and worth carrying into "
+                "next week, and offer one or two concrete suggestions.\n"
+                "Be honest: if very little was completed, say so kindly rather "
+                "than inflating it. Do not invent work that is not listed.",
+            ),
+            (
+                "human",
+                "Window: the last {days} days.\n\n"
+                "Completed ({completed_count}):\n{completed}\n\n"
+                "Still open (overdue and due today):\n{open}\n\n"
+                "Topics they researched: {researched}\n\n"
+                "Their request: {text}",
+            ),
+        ]
+    ) | llm.with_structured_output(ReviewOutput)
+
+    review: ReviewOutput = await chain.ainvoke(
+        {
+            "days": REVIEW_WINDOW_DAYS,
+            "completed_count": len(completed),
+            "completed": completed_lines,
+            "open": open_lines,
+            "researched": ", ".join(researched) or "none",
+            "text": state["query"],
+        }
+    )
+    return {
+        "intent": "review",
+        "task_status": f"reviewed:{len(completed)}",
+        "review": {**review.model_dump(), "completed_count": len(completed)},
+        "suggestions": review.suggestions,
     }
 
 
@@ -380,6 +642,10 @@ def decide_agent(state: PAState):
         return "agenda_agent"
     if intent == "breakdown":
         return "breakdown_agent"
+    if intent == "plan":
+        return "planner_agent"
+    if intent == "review":
+        return "review_agent"
     return END
 
 
@@ -393,6 +659,8 @@ async def synthesize_response(state: PAState):
     agenda = state.get("agenda")
     subtasks = state.get("subtasks") or []
     memory = state.get("memory") or {}
+    plan = state.get("plan")
+    review = state.get("review")
 
     parts = [f"Intent: {intent}", f"Status: {task_status}"]
     # Surface the learned profile so the reply can reflect the user's standing
@@ -442,6 +710,27 @@ async def synthesize_response(state: PAState):
         parts.append(f"Research summary: {research.get('summary', '')}")
         if research.get("key_points"):
             parts.append("Key points: " + "; ".join(research["key_points"]))
+    if plan:
+        blocks = plan.get("blocks") or []
+        if blocks:
+            block_lines = "\n".join(
+                f"  {b.get('start', '')}-{b.get('end', '')} {b.get('title', '')}"
+                for b in blocks
+            )
+            parts.append(f"Day plan:\n{block_lines}")
+        else:
+            parts.append("Day plan: nothing needed scheduling.")
+        if plan.get("unscheduled"):
+            parts.append("Did not fit today: " + "; ".join(plan["unscheduled"]))
+    if review:
+        parts.append(
+            f"Weekly review — completed {review.get('completed_count', 0)}: "
+            f"{review.get('summary', '')}"
+        )
+        if review.get("highlights"):
+            parts.append("Highlights: " + "; ".join(review["highlights"]))
+        if review.get("carry_over"):
+            parts.append("Still open: " + "; ".join(review["carry_over"]))
 
     context = "\n".join(parts)
     messages = [
@@ -476,6 +765,8 @@ def build_graph() -> StateGraph:
     graph.add_node("notes_agent", notes_agent)
     graph.add_node("agenda_agent", agenda_agent)
     graph.add_node("breakdown_agent", breakdown_agent)
+    graph.add_node("planner_agent", planner_agent)
+    graph.add_node("review_agent", review_agent)
     graph.add_node("synthesize", synthesize_response)
     graph.add_edge(START, "load_memory")
     graph.add_edge("load_memory", "classify_intent")
@@ -488,6 +779,8 @@ def build_graph() -> StateGraph:
             "notes_agent",
             "agenda_agent",
             "breakdown_agent",
+            "planner_agent",
+            "review_agent",
             END,
         ],
     )
@@ -496,6 +789,8 @@ def build_graph() -> StateGraph:
     graph.add_edge("notes_agent", "synthesize")
     graph.add_edge("agenda_agent", "synthesize")
     graph.add_edge("breakdown_agent", "synthesize")
+    graph.add_edge("planner_agent", "synthesize")
+    graph.add_edge("review_agent", "synthesize")
     graph.add_edge("synthesize", END)
     return graph
 

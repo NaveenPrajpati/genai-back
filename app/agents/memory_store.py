@@ -71,6 +71,28 @@ async def save_profile(
         logger.error("save_profile error user=%s: %s", user_id, e)
 
 
+async def forget_profile_key(
+    user_id: str, key: str, namespace: str = DEFAULT_NS
+) -> bool:
+    """Drop one learned fact. Returns whether there was one to drop.
+
+    The profile is a model reading prose, so it is occasionally wrong — and a
+    wrong fact here is not inert. `get_profile` is merged into the state behind
+    every reply, so a mis-heard `work_hours` or a priority the user dropped
+    months ago keeps steering answers until something removes it, and nothing
+    could. Unlike the rest of this module it does not swallow failures: a delete
+    that reports success when the write didn't land is worse than an error.
+    """
+    res = await get_db()[MEMORIES].update_one(
+        {"user_id": user_id, f"{namespace}.{key}": {"$exists": True}},
+        {
+            "$unset": {f"{namespace}.{key}": ""},
+            "$set": {"updatedAt": datetime.now(timezone.utc).isoformat()},
+        },
+    )
+    return res.modified_count > 0
+
+
 async def extract_and_save(
     user_id: str,
     text: str,

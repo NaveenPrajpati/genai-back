@@ -34,6 +34,9 @@ from app.agents.job_helper import graph as job_graph, run_job_triggers
 from app.agents.supervisor import graph as supervisor_graph
 from app.agents.learning_tracker.indexes import ensure_indexes as ensure_learning_indexes
 from app.agents.job_helper.repository import ensure_indexes as ensure_job_indexes
+from app.agents.personal_assistant.repository import (
+    ensure_indexes as ensure_pa_indexes,
+)
 from app.mcp.meal_planner import mcp as meal_mcp
 from app.mcp.job_helper import mcp as job_mcp
 from app.mcp.mount import guarded_app, session_lifespan
@@ -80,6 +83,10 @@ async def lifespan(app: FastAPI):
         # Same story for the job helper's own collections: every application and
         # resume read is scoped by user_id and then sorted.
         await ensure_job_indexes()
+        # And for `todos`, which GET /tasks now sorts and pages server-side —
+        # an unindexed sort is done in memory and the server caps that at 32MB,
+        # so past a few thousand tasks it fails rather than slows.
+        await ensure_pa_indexes()
     except Exception as e:
         print(f"MongoDB connection failed (non-fatal): {e}")
 

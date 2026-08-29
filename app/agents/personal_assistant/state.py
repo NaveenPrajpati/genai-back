@@ -22,6 +22,10 @@ class PAState(TypedDict, total=False):
     subtasks: Optional[list]
     research: Optional[dict]
     suggestions: Optional[list]
+    # A time-blocked schedule for today (intent: plan).
+    plan: Optional[dict]
+    # A look back over the last week's finished work (intent: review).
+    review: Optional[dict]
     task_status: Optional[str]
     response: Optional[str]
 
@@ -38,6 +42,8 @@ class IntentOutput(BaseModel):
         "recall",
         "agenda",
         "breakdown",
+        "plan",
+        "review",
     ]
 
 
@@ -74,17 +80,66 @@ class NoteInput(BaseModel):
     category: Optional[str] = None
 
 
+class SubtaskInput(BaseModel):
+    """One step of a broken-down goal.
+
+    Carries the fields that make a step schedulable. Subtasks used to be bare
+    strings, so a breakdown asked to "schedule these across next week" could
+    only put the days *inside the title* — "Monday: draft the outline" — which
+    reads fine and sorts, reminds, rolls over and shows on the agenda not at
+    all. A date the user is meant to act on has to be a date field.
+    """
+
+    title: str
+    priority: Optional[Literal["low", "medium", "high"]] = "medium"
+    due_at: Optional[str] = None
+
+
 class BreakdownOutput(BaseModel):
     """An LLM-proposed split of a larger goal into ordered subtasks."""
 
     parent_title: str
-    subtasks: List[str] = []
+    subtasks: List[SubtaskInput] = []
 
 
 class ResearchOutput(BaseModel):
     summary: str
     key_points: List[str] = []
     sources: List[str] = []
+
+
+class PlanBlock(BaseModel):
+    """One slot in a day plan."""
+
+    # Local wall-clock, "HH:MM". Not a full timestamp: the plan is for today by
+    # construction, and a date would only invite the model to invent one.
+    start: str
+    end: str
+    title: str
+    # Which existing to-do this block is for, when it is for one. Breaks and
+    # buffers are legitimately task-less.
+    task_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class PlanOutput(BaseModel):
+    """A time-blocked plan for the day, ordered by start time."""
+
+    blocks: List[PlanBlock] = []
+    # Tasks that did not fit, so the reply can say so rather than quietly
+    # dropping them.
+    unscheduled: List[str] = []
+    notes: Optional[str] = None
+
+
+class ReviewOutput(BaseModel):
+    """A look back over a period of finished work."""
+
+    summary: str
+    highlights: List[str] = []
+    # Things still open that the user may want to carry into next week.
+    carry_over: List[str] = []
+    suggestions: List[str] = []
 
 
 class SynthesisOutput(BaseModel):

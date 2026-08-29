@@ -12,6 +12,17 @@ from .repository import fetch_todos, categorize_agenda
 logger = logging.getLogger(__name__)
 
 
+def has_anything_due(agenda: dict) -> bool:
+    """Whether this agenda is worth interrupting someone for.
+
+    Undated tasks deliberately don't count. They are pending but unscheduled, so
+    they are due every day forever — including them would mean anyone with a
+    single unscheduled task gets a notification every morning for the rest of
+    time, which is how a daily digest teaches people to swipe it away.
+    """
+    return any(agenda.get(bucket) for bucket in ("overdue", "today", "upcoming"))
+
+
 def _compose_digest(agenda: dict) -> str:
     """Build a friendly, prioritized digest line from a categorized agenda."""
     overdue = agenda.get("overdue", [])
@@ -48,6 +59,18 @@ async def run_pa_triggers(agent=None):
         try:
             pending = await fetch_todos(user_id, status="pending")
             agenda = categorize_agenda(pending)
+
+            # Nothing due: skip the notification and the archive entry, but
+            # still stamp the run so the hourly sweep doesn't retry this user
+            # for the rest of the day. A push that says "you have nothing to do"
+            # is a notification the user did not need, and the reliable effect
+            # of sending it daily is that the ones that do matter stop being
+            # read.
+            if not has_anything_due(agenda):
+                await mark_ran(t, now)
+                logger.info("pa digest skipped for user=%s (nothing due)", user_id)
+                continue
+
             digest = _compose_digest(agenda)
             await create_pending(
                 user_id,
