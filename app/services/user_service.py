@@ -478,6 +478,27 @@ async def refresh_access_token(refresh_token: str) -> tuple[dict, str, str]:
     return user, access, refresh
 
 
+async def verify_user_password(user_id: str, password: str) -> bool:
+    """Re-check an already-authenticated user's own password, to confirm a
+    destructive action.
+
+    Kept apart from `login_user` because the two want different things: login
+    takes an email and mints tokens, this takes an id and mints nothing. It
+    reads the document directly because `get_current_user` deliberately projects
+    `password_hash` away, so the caller never has it to hand.
+
+    A guest has no password and so can never satisfy this — callers decide
+    whether that means "refuse" or "confirm some other way".
+    """
+    if not ObjectId.is_valid(user_id):
+        return False
+    user = await _collection().find_one({"_id": ObjectId(user_id)})
+    stored = (user or {}).get("password_hash")
+    if not stored:
+        return False
+    return _verify_password(password, stored)
+
+
 async def bump_token_version(user_id: str) -> None:
     """Invalidate every token previously issued to this user (logout-all)."""
     if not ObjectId.is_valid(user_id):

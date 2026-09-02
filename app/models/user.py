@@ -99,6 +99,17 @@ class ExpoPushTokenUpdate(BaseModel):
     expo_push_token: str = Field(..., min_length=1, max_length=200)
 
 
+class DeleteAccountRequest(BaseModel):
+    """Confirmation for closing an account.
+
+    Optional in the schema and required in the route for anyone who has a
+    password: a guest account has none, and demanding one at validation time
+    would leave guests unable to delete themselves at all.
+    """
+
+    password: Optional[str] = Field(default=None, min_length=1, max_length=200)
+
+
 class RefreshTokenRequest(BaseModel):
     refresh_token: str = Field(..., min_length=1)
 

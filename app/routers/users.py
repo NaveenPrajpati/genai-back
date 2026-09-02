@@ -5,6 +5,7 @@ from app.models.user import (
     UserLogin,
     UserResponse,
     AuthResponse,
+    DeleteAccountRequest,
     ExpoPushTokenUpdate,
     ForgotPasswordRequest,
     ResetPasswordRequest,
@@ -12,6 +13,7 @@ from app.models.user import (
     ResendVerificationRequest,
     RefreshTokenRequest,
 )
+from app.services import account_deletion
 from app.services import user_service
 from app.services import rate_limit
 from app.dependencies import get_current_user
@@ -176,6 +178,53 @@ async def logout(current_user: Annotated[dict, Depends(get_current_user)]):
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: Annotated[dict, Depends(get_current_user)]):
     return current_user
+
+
+@router.delete("/me")
+async def delete_me(
+    payload: DeleteAccountRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Close this account and erase everything it owns. Irreversible.
+
+    Two confirmations are involved, and they are different in kind: the client
+    asks the user to *mean* it (a typed phrase, a dialog), and this endpoint
+    asks them to *prove* it by re-entering their password. Only the second is a
+    real check — the first can be skipped by anything talking to the API
+    directly, which is exactly what a stolen access token can do. A token alone
+    must not be enough to destroy an account.
+
+    Guests are the unavoidable exception: they have no password to re-enter.
+    Their accounts also only ever hold one anonymous session's work, so the
+    client-side confirmation is the whole of it.
+
+    Rate limited per user rather than per IP — the request is authenticated, and
+    what is worth throttling is repeated password guesses against one account.
+    """
+    user_id = str(current_user["_id"])
+    await rate_limit.limit_key("delete_account", user_id, limit=5, window_seconds=900)
+
+    if not current_user.get("is_guest"):
+        if not payload.password:
+            raise HTTPException(
+                status_code=400,
+                detail="Your password is required to delete this account.",
+            )
+        if not await user_service.verify_user_password(user_id, payload.password):
+            raise HTTPException(status_code=401, detail="That password is not correct.")
+
+    try:
+        report = await account_deletion.delete_account(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete account: {e}")
+
+    # Counts come back so the client can say what went, and so a partial purge
+    # is visible in the response rather than only in the logs.
+    return {
+        "message": "Account deleted",
+        "deleted": report.deleted,
+        "incomplete": report.failures,
+    }
 
 
 @router.patch("/me/expo-push-token", response_model=UserResponse)
