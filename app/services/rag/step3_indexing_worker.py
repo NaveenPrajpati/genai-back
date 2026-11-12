@@ -59,6 +59,10 @@ async def run_ingestion(
 
         # Step 2: chunk ──────────────────────────────────────────────────────
         chunks = await asyncio.to_thread(_splitter.split_documents, documents)
+        if not chunks:
+            # Nothing to index — report it rather than marking an empty source
+            # "completed" that silently answers nothing.
+            raise ValueError("No text could be extracted from this source")
 
         ingested_at = datetime.now(timezone.utc).isoformat()
         # Sanitise BEFORE embedding/storing: strip zero-width/control chars used

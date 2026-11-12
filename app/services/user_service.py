@@ -270,6 +270,7 @@ async def request_password_reset(email: str) -> None:
         return None
 
     code = f"{secrets.randbelow(1_000_000):06d}"
+    print(f"code---{code}")
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=RESET_CODE_TTL_MINUTES)
     await col.update_one(
         {"_id": user["_id"]},

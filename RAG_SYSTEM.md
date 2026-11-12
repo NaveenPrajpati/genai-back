@@ -101,7 +101,10 @@ Turns a raw source into LangChain `Document`s. Supported inputs:
 
 - **PDF** → `PyPDFLoader` (one Document per page, sets `metadata["page"]`).
 - **.txt** → `TextLoader`.
-- **URL** → `load_url` (requests + BeautifulSoup; strips `script/style/nav/footer/header/aside` so only article text is embedded).
+- **URL** → `load_url` (requests + BeautifulSoup; strips `script/style/nav/aside` and the site-level `header/footer` — a `<header>` inside `<article>`/`<main>` is kept as the title block). HTML and `text/plain` only; other content types are rejected. Bytes are decoded by BeautifulSoup (header charset, else `<meta>`/sniffing), so UTF-8 pages without a header charset aren't garbled.
+  - **SSRF guard:** `http`/`https` only, no embedded credentials, max 5 MB / 30 s / 5 redirects, env proxies ignored. Each socket's *connected* peer IP must be publicly routable (no loopback, RFC1918, link-local incl. `169.254.169.254`, CGNAT, IPv4-mapped forms), checked at connect time so DNS rebinding and redirects to internal hosts are refused too.
+  - **JavaScript-rendered pages** (React/Vite SPAs serve an empty `<div id="root">`): when the plain fetch yields < 500 chars, the URL is rendered by Jina Reader (`r.jina.ai`, same `JINA_API_KEY` as the reranker) and the longer result wins. Runs only *after* the guarded fetch has proven the host public. Disable with `URL_JS_FALLBACK=off`.
+  - Bad `data` JSON or a disallowed URL is a 400 at request time; a page with < 50 chars of text after all that fails the job ("too little readable text") instead of completing with an empty document that every question is refused against.
 
 `SUPPORTED_FILE_TYPES` maps MIME → loader; the router also falls back to the filename
 extension because clients often send PDFs as `application/octet-stream`.

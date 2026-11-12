@@ -37,6 +37,7 @@ from app.services import rate_limit
 from app.services.rag import storage
 from app.services.rag.step1_ingestion import (
     load_url,
+    validate_url,
     load_pdf,
     load_txt,
     load_docx,
@@ -157,7 +158,7 @@ async def ingest_document(
 
     action == "url"  → body `data` is JSON {"url": "..."}
     otherwise        → multipart file upload (pdf, txt, docx, or image);
-                       `data` is not required. Images (≤5 MB) are OCR'd.
+                       `data` is not required. Images (≤2 MB) are OCR'd.
     """
     job_id = str(uuid.uuid4())
     tmp_path: Optional[str] = None
@@ -171,7 +172,20 @@ async def ingest_document(
                 status_code=400,
                 detail='`data` form field with JSON {"url": "..."} is required',
             )
-        url = json.loads(data)["url"]
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400, detail='`data` must be JSON like {"url": "..."}'
+            )
+        if not isinstance(payload, dict) or "url" not in payload:
+            raise HTTPException(
+                status_code=400, detail='`data` must be JSON like {"url": "..."}'
+            )
+        try:
+            url = validate_url(payload["url"])
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         loader_fn = lambda: load_url(url)
         display_source, file_type = url, "url"
     else:
@@ -191,10 +205,13 @@ async def ingest_document(
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
-        # Images are OCR'd — cap them at 5 MB to bound OCR latency/memory.
+        # Images are OCR'd — cap them to bound OCR latency/memory.
         if file_type == "image" and os.path.getsize(tmp_path) > MAX_IMAGE_BYTES:
             os.unlink(tmp_path)
-            raise HTTPException(status_code=413, detail="Image exceeds the 5 MB limit")
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit",
+            )
 
         loader_fn = lambda: loader(tmp_path)
         display_source = file.filename
