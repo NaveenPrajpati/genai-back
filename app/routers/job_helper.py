@@ -672,10 +672,18 @@ async def dismiss_feed_item(
     return {"status": "done", "result": item}
 
 
+class TrackFeedItemRequest(BaseModel):
+    # The full posting as the extension read it from the job page the user
+    # opened — needed for imported cards, which carry only a title.
+    jd_text: Optional[str] = Field(default=None, max_length=30_000)
+    source_url: Optional[str] = Field(default=None, max_length=2000)
+
+
 @router.post("/feed/{item_id}/track", status_code=201)
 async def track_feed_item(
     item_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
+    body: Optional[TrackFeedItemRequest] = None,
 ):
     """Start tracking a feed posting as an application (analyses the full
     posting). Tracking the same posting twice returns the same application."""
@@ -684,7 +692,12 @@ async def track_feed_item(
         "job_write", user_id, JOB_WRITE_RATE_LIMIT, JOB_WRITE_RATE_WINDOW
     )
     try:
-        application = await feed.track_item(user_id, item_id)
+        application = await feed.track_item(
+            user_id,
+            item_id,
+            page_text=body.jd_text if body else None,
+            page_url=body.source_url if body else None,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not application:
@@ -909,8 +922,15 @@ async def update_application(
         "applied_via": body.applied_via,
         "apply_url": body.apply_url,
         "resume_id_sent": body.resume_id_sent,
+        # Personal questions (gender, disability, date of birth…) are dropped:
+        # the record exists to answer "what did I tell them?", and keeping
+        # demographic answers on it would only be a liability.
         "answers_snapshot": (
-            [a.model_dump() for a in body.answers_snapshot]
+            [
+                a.model_dump()
+                for a in body.answers_snapshot
+                if not apply.SENSITIVE.search(apply.norm_label(a.label))
+            ]
             if body.answers_snapshot is not None
             else None
         ),

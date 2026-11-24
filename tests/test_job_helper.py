@@ -1285,13 +1285,17 @@ def test_marking_applied_records_what_was_sent(monkeypatch):
                 "status": "applied",
                 "applied_via": "company_site",
                 "resume_id_sent": "r1",
-                "answers_snapshot": [{"label": "Notice period", "value": "30 days"}],
+                "answers_snapshot": [
+                    {"label": "Notice period", "value": "30 days"},
+                    {"label": "Gender", "value": "Female"},
+                ],
             },
         )
     assert resp.status_code == 200
     stored = update.await_args.args[2]
     assert stored["resume_id_sent"] == "r1"
-    assert stored["answers_snapshot"][0]["value"] == "30 days"
+    # The personal answer is not kept on the record.
+    assert stored["answers_snapshot"] == [{"label": "Notice period", "value": "30 days"}]
 
 
 def test_marking_applied_with_someone_elses_resume_is_refused(monkeypatch):
@@ -1338,3 +1342,48 @@ def test_current_annual_compensation_is_a_profile_field():
     profile = apply_mod.profile_values(ApplyProfile(current_ctc="12 LPA"))
     out = apply_mod.rule_answer(_f("Current annual compensation"), profile, {})
     assert out["value"] == "12 LPA"
+
+
+async def test_tracking_an_imported_card_uses_the_text_from_the_users_tab(monkeypatch):
+    monkeypatch.setattr(
+        feed.repo,
+        "get_feed_item",
+        AsyncMock(return_value={"id": "f1", "state": "new", "title": "AI Engineer",
+                                "description": "", "description_truncated": True,
+                                "url": "https://www.linkedin.com/jobs/view/1/", "source": "linkedin"}),
+    )
+    fetch = AsyncMock(return_value="")
+    monkeypatch.setattr(feed, "fetch_job_posting", fetch)
+    analyse = AsyncMock(return_value={"id": "a1"})
+    monkeypatch.setattr(feed, "track_application", analyse)
+    monkeypatch.setattr(feed.repo, "update_application", AsyncMock(return_value={"id": "a1"}))
+    monkeypatch.setattr(feed.repo, "update_feed_item", AsyncMock())
+
+    await feed.track_item("u1", "f1", page_text="Full posting " * 50)
+
+    assert analyse.await_args.kwargs["jd_text"].startswith("Full posting")
+    fetch.assert_not_awaited()  # LinkedIn would refuse it anyway
+
+
+async def test_a_title_only_listing_tells_the_scorer_so(monkeypatch):
+    seen = {}
+
+    async def capture(messages):
+        seen["posting"] = messages[1].content
+        return ListingScore(match_score=60, reason="From the title only: ok")
+
+    fake = SimpleNamespace(ainvoke=capture)
+    monkeypatch.setattr(ranking, "fast_llm", SimpleNamespace(with_structured_output=lambda _: fake))
+    await ranking.score_listing({"title": "AI Engineer", "description": ""}, "resume", JobPreferences(), {})
+    assert ranking.TITLE_ONLY in seen["posting"]
+
+
+def test_tracking_a_feed_item_without_a_body_still_works(monkeypatch):
+    monkeypatch.setattr(routes.rate_limit, "limit_user", AsyncMock())
+    track = AsyncMock(return_value={"id": "a1"})
+    monkeypatch.setattr(routes.feed, "track_item", track)
+    with _client() as client:
+        assert client.post("/job-helper/feed/f1/track").status_code == 201
+        assert client.post("/job-helper/feed/f1/track", json={"jd_text": "x" * 500}).status_code == 201
+    assert track.await_args_list[0].kwargs["page_text"] is None
+    assert track.await_args_list[1].kwargs["page_text"] == "x" * 500

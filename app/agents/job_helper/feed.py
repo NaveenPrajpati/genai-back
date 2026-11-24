@@ -264,9 +264,20 @@ async def import_listings(user_id: str, listings: List[dict], source: str) -> di
 
 
 # ── leaving the feed ─────────────────────────────────────────────────────────
-async def track_item(user_id: str, item_id: str) -> Optional[dict]:
+async def track_item(
+    user_id: str,
+    item_id: str,
+    page_text: Optional[str] = None,
+    page_url: Optional[str] = None,
+) -> Optional[dict]:
     """Turn a feed posting into a tracked application. Idempotent: tracking it
-    twice returns the same application. None when the item does not exist."""
+    twice returns the same application. None when the item does not exist.
+
+    `page_text` is the full posting as the browser extension read it off the
+    job page the user opened. It wins over anything stored: an imported
+    LinkedIn card carries only a title, and LinkedIn refuses the server-side
+    fetch, so the user's own tab is the only place the description exists.
+    """
     item = await repo.get_feed_item(user_id, item_id)
     if not item:
         return None
@@ -276,8 +287,10 @@ async def track_item(user_id: str, item_id: str) -> Optional[dict]:
             return existing
 
     text = item.get("description") or ""
-    url = item.get("url") or None
-    if url and (item.get("description_truncated") or len(text) < SHORT_DESCRIPTION_CHARS):
+    url = item.get("url") or page_url or None
+    if page_text and len(page_text.strip()) > len(text):
+        text = page_text.strip()
+    elif url and (item.get("description_truncated") or len(text) < SHORT_DESCRIPTION_CHARS):
         # A teaser makes a poor analysis; try for the full posting, and fall
         # back to the teaser when the site blocks the fetch.
         fetched = await fetch_job_posting(url)

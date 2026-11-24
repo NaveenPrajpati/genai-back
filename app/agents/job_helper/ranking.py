@@ -141,7 +141,15 @@ give credit for skills the candidate merely could learn. `matched` and \
 `missing` are short skill names. `reason` is one plain sentence a candidate \
 reads in a list ("Strong on LLM/RAG work; missing production Kubernetes"). \
 Set `min_years_required` only when the posting states a number.
+
+When the posting says "(No description — title only.)", judge from the title, \
+company and location alone: score no higher than 70, leave `matched` and \
+`missing` empty, and start `reason` with "From the title only:".
 """
+
+# What the scorer is shown for a listing imported from a results page, where
+# the card carries a title and no description (see feed.import_listings).
+TITLE_ONLY = "(No description — title only.)"
 
 
 def _prefs_context(prefs: JobPreferences, memory: dict) -> str:
@@ -170,7 +178,8 @@ async def score_listing(
             + (" (remote)" if listing.get("remote") else ""),
             f"Salary: {listing['salary']}" if listing.get("salary") else "",
             "",
-            (listing.get("description") or "")[:MAX_SCORE_DESCRIPTION_CHARS],
+            (listing.get("description") or "")[:MAX_SCORE_DESCRIPTION_CHARS]
+            or TITLE_ONLY,
         )
         if b is not None
     )
