@@ -49,6 +49,9 @@ MONGO_COLLECTIONS = (
     "learning_notes",
     "job_applications",
     "resumes",
+    "job_feed",
+    "job_preferences",
+    "apply_profiles",
 )
 
 # Supabase tables owned by a user. `rag_messages` is absent on purpose — it is

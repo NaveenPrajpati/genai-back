@@ -805,3 +805,536 @@ def test_the_search_route_reports_which_board_answered(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["provider"] == "remotive"
     assert routes.service.find_jobs.await_args.args[0] == "python"
+
+
+# --------------------------------------------------------------------------- #
+# daily job feed: dedupe, dealbreakers, ranking, routes
+# --------------------------------------------------------------------------- #
+import app.agents.job_helper.feed as feed  # noqa: E402
+import app.agents.job_helper.ranking as ranking  # noqa: E402
+from app.agents.job_helper.state import JobListing, JobPreferences, ListingScore  # noqa: E402
+
+
+def _listing(**kw):
+    base = {
+        "title": "AI Engineer",
+        "company": "Razorpay",
+        "location": "Bengaluru, IN",
+        "remote": False,
+        "url": "https://a.example/1",
+        "description": "We need Python, LangChain and RAG experience.",
+    }
+    return {**base, **kw}
+
+
+def test_one_posting_from_two_boards_has_one_fingerprint():
+    a = _listing(location="Bengaluru, IN", url="https://jsearch/1")
+    b = _listing(
+        title="AI Engineer (Hybrid)",
+        company="RAZORPAY",
+        location="Bangalore, Karnataka",
+        url="https://adzuna/9",
+    )
+    assert ranking.fingerprint(a) == ranking.fingerprint(b)
+
+
+def test_different_cities_are_different_postings():
+    assert ranking.fingerprint(_listing(location="Pune")) != ranking.fingerprint(
+        _listing(location="Mumbai")
+    )
+
+
+def test_dealbreakers_hide_what_the_user_said_they_never_want():
+    prefs = JobPreferences(
+        exclude_companies=["razorpay"], exclude_keywords=["intern"], work_mode="remote"
+    )
+    assert "company" in ranking.dealbreaker(_listing(), prefs)
+    other = _listing(company="Sarvam", title="AI Intern", remote=True)
+    assert "keyword" in ranking.dealbreaker(other, prefs)
+    onsite = _listing(company="Sarvam", remote=False)
+    assert ranking.dealbreaker(onsite, prefs) == "not remote"
+    assert ranking.dealbreaker(_listing(company="Sarvam", remote=True), prefs) is None
+
+
+def test_prefilter_matches_skills_that_end_in_symbols():
+    listing = _listing(title="ML Engineer", description="C++ and Python required")
+    score, hits = ranking.prefilter(listing, ["C++", "Python", "Go"], ["ML Engineer"])
+    assert set(hits) == {"C++", "Python"}  # "Go" is not matched inside other words
+    assert 0 < score <= 100
+
+
+async def test_one_board_down_does_not_sink_the_feed(monkeypatch):
+    async def ok(query, place, remote, limit):
+        return [JobListing(title=f"{query} role", company="X", location=place)]
+
+    async def down(*_):
+        raise RuntimeError("503")
+
+    monkeypatch.setattr(jobsearch, "configured_providers", lambda: ["jsearch", "remotive"])
+    monkeypatch.setitem(jobsearch._IMPLEMENTATIONS, "jsearch", down)
+    remotive = AsyncMock(side_effect=ok)
+    monkeypatch.setitem(jobsearch._IMPLEMENTATIONS, "remotive", remotive)
+
+    out = await jobsearch.search_all(["AI Engineer"], ["Pune", "Remote"])
+
+    assert out["providers"] == ["remotive"]
+    assert len(out["listings"]) == 1
+    assert "jsearch" in out["notes"][0]
+    # Remotive ignores location, so it is asked once, not once per location.
+    assert remotive.await_count == 1
+
+
+def test_a_batch_keeps_one_copy_and_the_richer_description():
+    prefs = JobPreferences(queries=["AI Engineer"], exclude_companies=["Bad Co"])
+    teaser = _listing(description="short", description_truncated=True, source="adzuna")
+    full = _listing(description="x" * 900, source="jsearch")
+    blocked = _listing(company="Bad Co")
+    items = feed._prepare([teaser, full, blocked], prefs, ["Python"])
+
+    assert len(items) == 2
+    kept = next(i for i in items if i["company"] == "Razorpay")
+    assert kept["source"] == "jsearch"
+    assert next(i for i in items if i["company"] == "Bad Co")["state"] == "filtered"
+
+
+async def test_scoring_needs_a_resume_and_spends_nothing_without_one(monkeypatch):
+    monkeypatch.setattr(feed.repo, "unscored_feed_items", AsyncMock())
+    scorer = AsyncMock()
+    monkeypatch.setattr(feed, "score_listing", scorer)
+
+    assert await feed._score_pending("u1", JobPreferences(), None) == []
+    scorer.assert_not_awaited()
+    feed.repo.unscored_feed_items.assert_not_awaited()
+
+
+async def test_only_unscored_postings_reach_the_model(monkeypatch):
+    pending = [{"id": "f1", "title": "A"}, {"id": "f2", "title": "B"}]
+    monkeypatch.setattr(feed.repo, "unscored_feed_items", AsyncMock(return_value=pending))
+    monkeypatch.setattr(feed, "get_profile", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        feed.repo,
+        "update_feed_item",
+        AsyncMock(side_effect=lambda uid, item_id, updates: {"id": item_id, **updates}),
+    )
+    scores = {
+        "A": ListingScore(match_score=88, reason="good"),
+        "B": ListingScore(match_score=70, reason="ok", min_years_required=8),
+    }
+    scorer = AsyncMock(side_effect=lambda item, *_: scores[item["title"]])
+    monkeypatch.setattr(feed, "score_listing", scorer)
+
+    out = await feed._score_pending(
+        "u1",
+        JobPreferences(max_years_required=4),
+        {"id": "r1", "content": RESUME.model_dump()},
+    )
+
+    assert scorer.await_count == 2
+    assert feed.repo.unscored_feed_items.await_args.args == ("u1", feed.MAX_SCORED_PER_RUN)
+    by_id = {i["id"]: i for i in out}
+    assert by_id["f1"]["score"] == 88 and "state" not in by_id["f1"]
+    # Asks for 8 years when the user said at most 4: scored, but hidden.
+    assert by_id["f2"]["state"] == "filtered"
+
+
+async def test_a_failed_score_leaves_the_posting_for_the_next_run(monkeypatch):
+    monkeypatch.setattr(
+        feed.repo, "unscored_feed_items", AsyncMock(return_value=[{"id": "f1"}])
+    )
+    monkeypatch.setattr(feed, "get_profile", AsyncMock(return_value={}))
+    monkeypatch.setattr(feed.repo, "update_feed_item", AsyncMock())
+    monkeypatch.setattr(feed, "score_listing", AsyncMock(side_effect=RuntimeError("x")))
+
+    out = await feed._score_pending("u1", JobPreferences(), {"id": "r1", "content": {}})
+
+    assert out == []
+    feed.repo.update_feed_item.assert_not_awaited()
+
+
+async def test_a_refresh_with_no_roles_asks_for_them(monkeypatch):
+    monkeypatch.setattr(
+        feed, "get_preferences", AsyncMock(return_value=(JobPreferences(), False))
+    )
+    search = AsyncMock()
+    monkeypatch.setattr(feed, "search_all", search)
+    with pytest.raises(ValueError):
+        await feed.refresh_feed("u1")
+    search.assert_not_awaited()
+
+
+async def test_unsaved_preferences_are_seeded_from_what_the_helper_knows(monkeypatch):
+    monkeypatch.setattr(feed.repo, "get_preferences", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        feed,
+        "get_profile",
+        AsyncMock(
+            return_value={
+                "target_roles": ["AI Engineer"],
+                "target_locations": ["Bangalore"],
+                "preferred_work_mode": "Remote",
+            }
+        ),
+    )
+    prefs, saved = await feed.get_preferences("u1")
+    assert saved is False
+    assert prefs.queries == ["AI Engineer"] and prefs.work_mode == "remote"
+
+
+async def test_tracking_a_posting_twice_returns_the_same_application(monkeypatch):
+    monkeypatch.setattr(
+        feed.repo,
+        "get_feed_item",
+        AsyncMock(return_value={"id": "f1", "state": "tracked", "application_id": "a1"}),
+    )
+    monkeypatch.setattr(
+        feed.repo, "get_application", AsyncMock(return_value={"id": "a1"})
+    )
+    analyse = AsyncMock()
+    monkeypatch.setattr(feed, "track_application", analyse)
+
+    assert (await feed.track_item("u1", "f1"))["id"] == "a1"
+    analyse.assert_not_awaited()
+
+
+def test_the_feed_route_reads_only_the_callers_feed(monkeypatch):
+    monkeypatch.setattr(routes.repo, "list_feed", AsyncMock(return_value=[]))
+    with _client(user={"uid": "me"}) as client:
+        resp = client.get("/job-helper/feed")
+    assert resp.status_code == 200
+    assert routes.repo.list_feed.await_args.args[:2] == ("me", "new")
+
+
+def test_dismissing_someone_elses_posting_is_a_404(monkeypatch):
+    monkeypatch.setattr(routes.repo, "update_feed_item", AsyncMock(return_value=None))
+    with _client() as client:
+        resp = client.post("/job-helper/feed/abc/dismiss")
+    assert resp.status_code == 404
+
+
+def test_the_first_preferences_save_turns_the_daily_feed_on(monkeypatch):
+    monkeypatch.setattr(routes.rate_limit, "limit_user", AsyncMock())
+    monkeypatch.setattr(
+        routes.feed, "save_preferences", AsyncMock(side_effect=lambda uid, p: p)
+    )
+    monkeypatch.setattr(routes, "get_trigger", AsyncMock(return_value=None))
+    toggle = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes, "toggle", toggle)
+
+    with _client() as client:
+        resp = client.put("/job-helper/preferences", json={"queries": ["AI Engineer"]})
+    assert resp.status_code == 200
+    assert toggle.await_args.args[1] == "job_feed"
+
+    # Already has a schedule (maybe one they turned off): left alone.
+    toggle.reset_mock()
+    monkeypatch.setattr(routes, "get_trigger", AsyncMock(return_value={"enabled": False}))
+    with _client() as client:
+        client.put("/job-helper/preferences", json={"queries": ["AI Engineer"]})
+    toggle.assert_not_awaited()
+
+
+def test_an_oversized_import_is_refused_before_any_scoring(monkeypatch):
+    monkeypatch.setattr(routes.rate_limit, "limit_user", AsyncMock())
+    monkeypatch.setattr(routes.feed, "import_listings", AsyncMock())
+    listings = [{"title": f"Job {i}"} for i in range(routes.MAX_IMPORT_LISTINGS + 1)]
+    with _client() as client:
+        resp = client.post(
+            "/job-helper/feed/import", json={"source": "linkedin", "listings": listings}
+        )
+    assert resp.status_code == 400
+    routes.feed.import_listings.assert_not_awaited()
+
+
+def test_an_unknown_timezone_is_refused(monkeypatch):
+    monkeypatch.setattr(routes, "update_trigger", AsyncMock())
+    with _client() as client:
+        resp = client.put("/job-helper/feed/schedule", json={"timezone": "Mars/Base"})
+    assert resp.status_code == 400
+    routes.update_trigger.assert_not_awaited()
+
+
+def test_state_all_lists_the_whole_feed(monkeypatch):
+    monkeypatch.setattr(routes.repo, "list_feed", AsyncMock(return_value=[]))
+    with _client(user={"uid": "me"}) as client:
+        assert client.get("/job-helper/feed?state=all").status_code == 200
+        assert client.get("/job-helper/feed?state=bogus").status_code == 422
+    assert routes.repo.list_feed.await_args_list[0].args[:2] == ("me", None)
+
+
+# --------------------------------------------------------------------------- #
+# applying: rules, option fitting, honesty guards, fill/remember routes
+# --------------------------------------------------------------------------- #
+import app.agents.job_helper.apply as apply_mod  # noqa: E402
+from app.agents.job_helper.state import (  # noqa: E402
+    ApplyProfile,
+    FieldMapping,
+    FieldMappings,
+    FormField,
+    QuestionAnswer,
+    QuestionAnswers,
+)
+
+PROFILE = ApplyProfile(
+    full_name="Ada Lovelace",
+    email="ada@example.com",
+    phone="+91 98765 43210",
+    linkedin_url="https://linkedin.com/in/ada",
+    notice_period="30 days",
+    expected_ctc="18 LPA",
+    total_experience_years=3.0,
+    willing_to_relocate=True,
+)
+VALUES = apply_mod.profile_values(PROFILE)
+
+
+def _f(label, type="text", options=None, key=None):
+    return FormField(key=key or label, label=label, type=type, options=options or [])
+
+
+def test_common_fields_are_filled_by_rules_without_a_model():
+    cases = {
+        "First Name *": "Ada",
+        "Last name": "Lovelace",
+        "Email address": "ada@example.com",
+        "Mobile Number (required)": "+91 98765 43210",
+        "LinkedIn Profile": "https://linkedin.com/in/ada",
+        "Notice Period": "30 days",
+        "Expected CTC": "18 LPA",
+        "Total years of experience": "3",
+    }
+    for label, expected in cases.items():
+        out = apply_mod.rule_answer(_f(label), VALUES, {})
+        assert out and out["value"] == expected and out["source"] == "profile", label
+
+
+def test_personal_and_consent_questions_are_never_filled():
+    for label, type in (
+        ("Gender", "select"),
+        ("Do you identify as a person with a disability?", "radio"),
+        ("Veteran status", "select"),
+        ("Date of birth", "date"),
+        ("I certify that the information provided is accurate", "checkbox"),
+    ):
+        out = apply_mod.rule_answer(_f(label, type, ["Yes", "No"]), VALUES, {})
+        assert out["needs_you"] and out["value"] is None, label
+
+
+def test_a_profile_value_is_fitted_to_the_forms_own_options():
+    notice = _f("Notice period", "select", ["Immediate", "15-30 days", "More than 60 days"])
+    assert apply_mod.rule_answer(notice, VALUES, {})["value"] == "15-30 days"
+    relocate = _f("Are you willing to relocate?", "radio", ["Yes, anywhere", "No"])
+    assert apply_mod.rule_answer(relocate, VALUES, {})["value"] == "Yes, anywhere"
+    exp = _f("Total experience", "select", ["0-2 years", "3-5 years", "5+ years"])
+    assert apply_mod.rule_answer(exp, VALUES, {})["value"] == "3-5 years"
+
+
+def test_a_profile_value_that_fits_no_option_goes_to_the_model_not_a_guess():
+    city = _f("Notice period", "select", ["Serving notice", "Not serving"])
+    assert apply_mod.rule_answer(city, VALUES, {}) is None
+
+
+def test_a_known_field_missing_from_the_profile_is_asked_not_invented():
+    out = apply_mod.rule_answer(_f("Current CTC"), VALUES, {})
+    assert out["needs_you"] and "profile" in out["note"]
+
+
+def test_a_remembered_answer_is_reused_by_question():
+    remembered = {
+        apply_mod.norm_label("How did you hear about us?"): {"value": "LinkedIn"}
+    }
+    out = apply_mod.rule_answer(_f("How did you hear about us? *"), VALUES, remembered)
+    assert out["value"] == "LinkedIn" and out["source"] == "remembered"
+
+
+def test_the_resume_upload_field_is_left_for_the_extension_to_attach():
+    out = apply_mod.rule_answer(_f("Resume/CV", "file"), VALUES, {})
+    assert out["source"] == "resume_file" and not out["needs_you"]
+    cover = apply_mod.rule_answer(_f("Cover Letter", "file"), VALUES, {})
+    assert cover["needs_you"]
+
+
+def test_an_invented_number_is_not_accepted_as_a_profile_answer():
+    known = "\n".join(VALUES.values())
+    assert apply_mod._supported("30", known)
+    assert not apply_mod._supported("45 days", known)
+    assert not apply_mod._supported("25 LPA", known)
+
+
+async def test_the_mapping_pass_rejects_values_the_user_never_gave(monkeypatch):
+    fields = [_f("Notice in days", key="a"), _f("Current salary", key="b"), _f("Why us?", key="c")]
+    fake = SimpleNamespace(
+        ainvoke=AsyncMock(
+            return_value=FieldMappings(
+                fields=[
+                    FieldMapping(key="a", kind="profile", value="30"),
+                    FieldMapping(key="b", kind="profile", value="12 LPA"),  # invented
+                    FieldMapping(key="c", kind="question"),
+                ]
+            )
+        )
+    )
+    monkeypatch.setattr(
+        apply_mod, "fast_llm", SimpleNamespace(with_structured_output=lambda _: fake)
+    )
+    answers, questions = await apply_mod.map_fields(fields, VALUES, {})
+    by_key = {a["key"]: a for a in answers}
+    assert by_key["a"]["value"] == "30"
+    assert by_key["b"]["needs_you"] and by_key["b"]["value"] is None
+    assert [q.key for q in questions] == ["c"]
+
+
+async def test_resume_questions_need_a_resume(monkeypatch):
+    out = await apply_mod.answer_questions([_f("Why us?")], None, "job")
+    assert out[0]["needs_you"] and "resume" in out[0]["note"]
+
+
+async def test_drafted_answers_are_flagged_and_unknowns_handed_back(monkeypatch):
+    fields = [
+        _f("Why do you want to join?", "textarea", key="why"),
+        _f("Years with Kubernetes", "number", key="k8s"),
+        _f("Experience with Python?", "radio", ["Yes", "No"], key="py"),
+    ]
+    fake = SimpleNamespace(
+        ainvoke=AsyncMock(
+            return_value=QuestionAnswers(
+                answers=[
+                    QuestionAnswer(key="why", value="I built ...", basis="drafted"),
+                    QuestionAnswer(key="k8s", value=None, basis="unknown"),
+                    QuestionAnswer(key="py", value="yes", basis="resume"),
+                ]
+            )
+        )
+    )
+    monkeypatch.setattr(apply_mod, "llm", SimpleNamespace(with_structured_output=lambda _: fake))
+    out = {a["key"]: a for a in await apply_mod.answer_questions(
+        fields, {"content": RESUME.model_dump()}, "job"
+    )}
+    assert out["why"]["source"] == "drafted" and "read it" in out["why"]["note"]
+    assert out["k8s"]["needs_you"]
+    assert out["py"]["value"] == "Yes"
+
+
+async def test_a_failed_model_still_returns_the_rule_answers(monkeypatch):
+    monkeypatch.setattr(
+        apply_mod, "get_apply_profile", AsyncMock(return_value=(PROFILE, True, []))
+    )
+    monkeypatch.setattr(apply_mod, "resume_for", AsyncMock(return_value=None))
+    monkeypatch.setattr(apply_mod, "map_fields", AsyncMock(side_effect=RuntimeError("x")))
+    out = await apply_mod.fill_form(
+        "u1", [_f("Email", key="e"), _f("Favourite colour", key="c")]
+    )
+    by_key = {a["key"]: a for a in out["answers"]}
+    assert by_key["e"]["value"] == "ada@example.com"
+    assert by_key["c"]["needs_you"]
+    assert [a["key"] for a in out["answers"]] == ["e", "c"]
+
+
+async def test_personal_answers_are_never_remembered(monkeypatch):
+    saved = AsyncMock(return_value=1)
+    monkeypatch.setattr(apply_mod.repo, "remember_answers", saved)
+    out = await apply_mod.remember(
+        "u1",
+        [{"label": "Gender", "value": "Female"}, {"label": "Referral code", "value": "X1"}],
+    )
+    assert out["skipped"] == ["Gender"]
+    assert list(saved.await_args.args[1]) == ["referral code"]
+
+
+async def test_an_application_goes_out_with_its_approved_tailored_resume(monkeypatch):
+    monkeypatch.setattr(
+        apply_mod.repo, "get_resume", AsyncMock(return_value={"id": "t1", "kind": "tailored"})
+    )
+    monkeypatch.setattr(apply_mod.repo, "latest_base_resume", AsyncMock())
+    out = await apply_mod.resume_for("u1", {"tailored_resume_id": "t1"})
+    assert out["id"] == "t1"
+    apply_mod.repo.latest_base_resume.assert_not_awaited()
+
+
+def test_filling_someone_elses_application_is_a_404(monkeypatch):
+    monkeypatch.setattr(routes.repo, "get_application", AsyncMock(return_value=None))
+    monkeypatch.setattr(routes.apply, "fill_form", AsyncMock())
+    with _client() as client:
+        resp = client.post(
+            "/job-helper/fill",
+            json={"application_id": "theirs", "fields": [{"key": "a", "label": "Email"}]},
+        )
+    assert resp.status_code == 404
+    routes.apply.fill_form.assert_not_awaited()
+
+
+def test_duplicate_field_keys_are_refused(monkeypatch):
+    monkeypatch.setattr(routes.apply, "fill_form", AsyncMock())
+    with _client() as client:
+        resp = client.post(
+            "/job-helper/fill",
+            json={"fields": [{"key": "a", "label": "x"}, {"key": "a", "label": "y"}]},
+        )
+    assert resp.status_code == 400
+
+
+def test_marking_applied_records_what_was_sent(monkeypatch):
+    monkeypatch.setattr(routes.repo, "verify_application_ownership", AsyncMock(return_value=True))
+    monkeypatch.setattr(routes.repo, "verify_resume_ownership", AsyncMock(return_value=True))
+    monkeypatch.setattr(routes.service, "set_status", AsyncMock(return_value={"id": "a1"}))
+    update = AsyncMock(return_value={"id": "a1", "applied_via": "company_site"})
+    monkeypatch.setattr(routes.repo, "update_application", update)
+    with _client() as client:
+        resp = client.patch(
+            "/job-helper/applications/a1",
+            json={
+                "status": "applied",
+                "applied_via": "company_site",
+                "resume_id_sent": "r1",
+                "answers_snapshot": [{"label": "Notice period", "value": "30 days"}],
+            },
+        )
+    assert resp.status_code == 200
+    stored = update.await_args.args[2]
+    assert stored["resume_id_sent"] == "r1"
+    assert stored["answers_snapshot"][0]["value"] == "30 days"
+
+
+def test_marking_applied_with_someone_elses_resume_is_refused(monkeypatch):
+    monkeypatch.setattr(routes.repo, "verify_application_ownership", AsyncMock(return_value=True))
+    monkeypatch.setattr(routes.repo, "verify_resume_ownership", AsyncMock(return_value=False))
+    monkeypatch.setattr(routes.service, "set_status", AsyncMock(return_value={"id": "a1"}))
+    with _client() as client:
+        resp = client.patch(
+            "/job-helper/applications/a1", json={"resume_id_sent": "theirs"}
+        )
+    assert resp.status_code == 403
+
+
+def test_the_resume_file_for_a_tailored_version_is_rendered(monkeypatch):
+    monkeypatch.setattr(routes.repo, "get_application", AsyncMock(return_value={"id": "a1"}))
+    monkeypatch.setattr(
+        routes.apply,
+        "resume_for",
+        AsyncMock(return_value={"id": "t1", "kind": "tailored", "label": "AI Eng", "content": RESUME.model_dump()}),
+    )
+    with _client() as client:
+        resp = client.get("/job-helper/resume-file?application_id=a1")
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF-")
+
+
+def test_role_durations_are_computed_not_left_to_the_model():
+    from datetime import date
+
+    content = {
+        "experience": [
+            {"title": "AI Engineer", "company": "Startup", "start": "Jun 2023", "end": "Present"},
+            {"title": "Intern", "company": "Lab", "start": "01/2022", "end": "07/2022"},
+            {"title": "Undated", "company": "X", "start": None, "end": None},
+        ]
+    }
+    out = apply_mod.role_durations(content, today=date(2026, 12, 1))
+    assert "AI Engineer at Startup: 3.5 years" in out
+    assert "Intern at Lab: 0.5 years" in out
+    assert "Undated" not in out
+
+
+def test_current_annual_compensation_is_a_profile_field():
+    profile = apply_mod.profile_values(ApplyProfile(current_ctc="12 LPA"))
+    out = apply_mod.rule_answer(_f("Current annual compensation"), profile, {})
+    assert out["value"] == "12 LPA"

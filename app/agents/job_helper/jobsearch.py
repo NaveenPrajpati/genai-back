@@ -24,6 +24,7 @@ schema no matter which board answered, and `track_job_posting` can take a search
 result straight through without knowing where it came from.
 """
 
+import asyncio
 import logging
 import os
 from typing import List, Optional
@@ -301,4 +302,70 @@ async def search_jobs(
         "provider": chosen,
         "listings": [listing.model_dump() for listing in listings],
         "note": note,
+    }
+
+
+# ── every board at once (the daily feed) ─────────────────────────────────────
+# Boards that ignore the location parameter. Asking them once per location would
+# just return the same page several times.
+LOCATIONLESS = {"remotive"}
+
+# Hard ceiling on outbound calls per sweep. Queries x locations x boards grows
+# fast, and JSearch/Adzuna bill per request.
+MAX_CALLS_PER_SWEEP = 24
+
+
+async def search_all(
+    queries: List[str],
+    locations: Optional[List[str]] = None,
+    remote: bool = False,
+    limit: int = 10,
+) -> dict:
+    """Run every configured board for every query/location, concurrently.
+
+    Returns `{listings, providers, notes}`. Never raises: one board being down
+    costs its listings and adds a note, nothing more — the feed is the union of
+    whatever answered. Deduplication is the caller's job (ranking.fingerprint),
+    because the same posting arrives from several boards with different URLs.
+    """
+    providers = configured_providers()
+    places: List[Optional[str]] = list(locations or []) or [None]
+    limit = max(1, min(limit, 20))
+
+    calls = []
+    for provider in providers:
+        for query in queries:
+            for place in [None] if provider in LOCATIONLESS else places:
+                calls.append((provider, query, place))
+    calls = calls[:MAX_CALLS_PER_SWEEP]
+
+    async def run(provider: str, query: str, place: Optional[str]):
+        return await _IMPLEMENTATIONS[provider](query, place, remote, limit)
+
+    results = await asyncio.gather(
+        *(run(*call) for call in calls), return_exceptions=True
+    )
+
+    listings: List[dict] = []
+    failed: set = set()
+    answered: set = set()
+    for (provider, query, place), result in zip(calls, results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "feed search via %s (%r, %r) failed: %s", provider, query, place, result
+            )
+            failed.add(provider)
+            continue
+        answered.add(provider)
+        listings.extend(listing.model_dump() for listing in result)
+
+    notes = [
+        f"The {p} job board could not be reached just now."
+        for p in providers
+        if p in failed and p not in answered
+    ]
+    return {
+        "listings": listings,
+        "providers": [p for p in providers if p in answered],
+        "notes": notes,
     }

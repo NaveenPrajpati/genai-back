@@ -30,7 +30,11 @@ from app.agents.meal_planner import (
     graph as meal_graph,
     run_triggers as run_meal_triggers,
 )
-from app.agents.job_helper import graph as job_graph, run_job_triggers
+from app.agents.job_helper import (
+    graph as job_graph,
+    run_job_feed_triggers,
+    run_job_triggers,
+)
 from app.agents.supervisor import graph as supervisor_graph
 from app.agents.learning_tracker.indexes import ensure_indexes as ensure_learning_indexes
 from app.agents.job_helper.repository import ensure_indexes as ensure_job_indexes
@@ -152,6 +156,15 @@ async def lifespan(app: FastAPI):
     # applications that have gone quiet. No model calls — see its module docstring.
     scheduler.add_job(
         run_job_triggers,
+        CronTrigger(minute=0),
+        args=[app.state.job_agent],
+    )
+    # Daily job feed: hourly sweep, fires per user at their chosen local hour
+    # (default 08:00). Searches every configured board, dedupes, scores new
+    # postings against the resume (capped per run) and pushes one notification
+    # when there are good matches. See agents/job_helper/feed.py.
+    scheduler.add_job(
+        run_job_feed_triggers,
         CronTrigger(minute=0),
         args=[app.state.job_agent],
     )

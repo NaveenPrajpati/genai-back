@@ -103,3 +103,71 @@ async def run_job_triggers(agent=None) -> None:
             await mark_ran(trigger, now)
         except Exception as e:
             logger.error("[job trigger] error for user=%s: %s", user_id, e)
+
+
+# ── daily job feed ───────────────────────────────────────────────────────────
+# Unlike the follow-up sweep above, this one does spend model calls — scoring
+# new postings is the whole point — but feed.MAX_SCORED_PER_RUN caps them per
+# user per day, and a posting is only ever scored once.
+FEED_TRIGGER_TYPE = "job_feed"
+
+# Only matches at or above this are worth a notification. A morning ping for
+# twelve 40% stretches teaches the user to ignore the next one.
+GOOD_MATCH = 65
+
+
+async def run_job_feed_triggers(agent=None) -> None:
+    """Hourly sweep; refreshes each opted-in user's feed at their local hour
+    and pushes one notification when there are good new matches."""
+    from .feed import refresh_feed  # deferred: feed imports the LLM client
+
+    logger.info("job feed sweep running")
+    now = datetime.now(timezone.utc)
+    try:
+        triggers = await due_triggers(FEED_TRIGGER_TYPE, now)
+    except Exception as e:
+        logger.error("job feed trigger fetch error: %s", e)
+        return
+
+    for trigger in triggers:
+        user_id = trigger.get("user_id")
+        try:
+            try:
+                result = await refresh_feed(user_id)
+            except ValueError as e:
+                # No roles set yet: nothing to search for, not an error. Still
+                # marked as run so the sweep does not retry every hour today.
+                logger.info("[job feed] skipped user=%s: %s", user_id, e)
+                await mark_ran(trigger, now)
+                continue
+
+            good = sorted(
+                (i for i in result["scored"] if (i.get("score") or 0) >= GOOD_MATCH
+                 and i.get("state") == "new"),
+                key=lambda i: i["score"],
+                reverse=True,
+            )
+            if good:
+                top = good[0]
+                label = " at ".join(
+                    b for b in (top.get("title"), top.get("company")) if b
+                )
+                await send_push_notification(
+                    user_id,
+                    title=(
+                        "1 new job match"
+                        if len(good) == 1
+                        else f"{len(good)} new job matches"
+                    ),
+                    body=f"Top: {label} ({top['score']}%)",
+                    data={"type": FEED_TRIGGER_TYPE, "count": len(good)},
+                )
+            logger.info(
+                "[job feed] user=%s: %d new, %d good match(es)",
+                user_id,
+                result["new"],
+                len(good),
+            )
+            await mark_ran(trigger, now)
+        except Exception as e:
+            logger.error("[job feed] error for user=%s: %s", user_id, e)

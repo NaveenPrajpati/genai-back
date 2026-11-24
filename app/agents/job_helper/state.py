@@ -111,6 +111,160 @@ class JobListing(BaseModel):
     )
 
 
+FeedState = Literal["new", "dismissed", "tracked", "filtered"]
+
+
+class JobPreferences(BaseModel):
+    """What the daily feed searches for and what it refuses to show.
+
+    Deliberately small. Every field is either a search input (`queries`,
+    `locations`, `remote_ok`) or a dealbreaker the user stated outright — the
+    ranking prompt sees the rest of who they are through their resume.
+    """
+
+    queries: List[str] = Field(
+        default_factory=list,
+        description="Role titles to search for, e.g. 'AI Engineer'",
+        max_length=5,
+    )
+    locations: List[str] = Field(default_factory=list, max_length=5)
+    remote_ok: bool = True
+    work_mode: Optional[Literal["remote", "hybrid", "onsite", "any"]] = "any"
+    max_years_required: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=50,
+        description="Hide postings that demand more experience than this",
+    )
+    min_salary: Optional[str] = Field(
+        default=None,
+        description="Free text such as '18 LPA'. Given to the scorer as context, "
+        "not used as a hard filter — boards report pay in mixed currencies and "
+        "periods, and most do not report it at all.",
+    )
+    exclude_companies: List[str] = Field(default_factory=list)
+    exclude_keywords: List[str] = Field(
+        default_factory=list,
+        description="A posting whose title contains one of these is hidden",
+    )
+
+
+class ListingScore(BaseModel):
+    """How well one search result fits the user — cheaper and shallower than a
+    SkillGap, because it is computed for every new listing rather than for one
+    posting the user chose."""
+
+    match_score: int = Field(ge=0, le=100, description="Overall fit, 0-100")
+    matched: List[str] = Field(
+        default_factory=list,
+        description="Required skills the resume evidences, short names",
+    )
+    missing: List[str] = Field(
+        default_factory=list,
+        description="Required skills the resume shows no evidence of",
+    )
+    reason: str = Field(description="One sentence on why this score")
+    min_years_required: Optional[int] = Field(
+        default=None,
+        description="Minimum years of experience the posting states, if any",
+    )
+
+
+# ── applying ─────────────────────────────────────────────────────────────────
+class ApplyProfile(BaseModel):
+    """The answers every application form asks for, typed in once.
+
+    Strings rather than numbers for pay and notice: "12 LPA", "₹12,00,000",
+    "30 days", "Immediate" are all real answers and each form wants its own
+    shape — the form filler adapts the string to the field, it does not
+    reformat the user's own words.
+
+    Deliberately absent: gender, ethnicity, disability, veteran status, date of
+    birth, religion, caste. Forms do ask, but those are the user's to answer
+    each time, so the filler always hands them back unfilled.
+    """
+
+    full_name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    portfolio_url: Optional[str] = None
+    current_title: Optional[str] = None
+    current_company: Optional[str] = None
+    total_experience_years: Optional[float] = Field(default=None, ge=0, le=60)
+    current_ctc: Optional[str] = None
+    expected_ctc: Optional[str] = None
+    notice_period: Optional[str] = None
+    work_authorization: Optional[str] = None
+    requires_sponsorship: Optional[bool] = None
+    willing_to_relocate: Optional[bool] = None
+    preferred_locations: List[str] = Field(default_factory=list, max_length=10)
+    highest_degree: Optional[str] = None
+    university: Optional[str] = None
+    graduation_year: Optional[str] = None
+
+
+# The profile keys a form field may be mapped onto. Derived from the model so
+# adding a field above is the only change needed.
+PROFILE_KEYS = tuple(ApplyProfile.model_fields)
+
+FieldType = Literal[
+    "text", "textarea", "email", "tel", "number", "url", "date",
+    "select", "radio", "checkbox", "file",
+]
+
+
+class FormField(BaseModel):
+    """One field the browser extension found on an application form."""
+
+    key: str = Field(max_length=200, description="The extension's own handle")
+    label: str = Field(default="", max_length=500)
+    type: FieldType = "text"
+    options: List[str] = Field(default_factory=list, max_length=60)
+    required: bool = False
+    max_length: Optional[int] = Field(default=None, ge=1)
+
+
+class FieldMapping(BaseModel):
+    """What the fast model decided one field is asking for."""
+
+    key: str
+    kind: Literal["profile", "remembered", "question", "unknown"] = Field(
+        description="profile: answered by a profile value; remembered: by one of "
+        "the user's previous answers; question: needs the resume or job to "
+        "answer; unknown: none of these"
+    )
+    value: Optional[str] = Field(
+        default=None,
+        description="For profile/remembered only: the value, adapted to the field "
+        "(for a choice field, one of its options exactly). Null if not known.",
+    )
+
+
+class FieldMappings(BaseModel):
+    fields: List[FieldMapping] = Field(default_factory=list)
+
+
+class QuestionAnswer(BaseModel):
+    key: str
+    value: Optional[str] = Field(
+        default=None, description="Null when the resume does not support an answer"
+    )
+    basis: Literal["resume", "drafted", "unknown"] = Field(
+        description="resume: a fact read off the resume; drafted: written prose "
+        "the user should review; unknown: cannot be answered honestly"
+    )
+
+
+class QuestionAnswers(BaseModel):
+    answers: List[QuestionAnswer] = Field(default_factory=list)
+
+
 class SkillGap(BaseModel):
     """How one resume stacks up against one posting."""
 

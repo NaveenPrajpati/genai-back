@@ -31,6 +31,7 @@ import os
 import shutil
 import tempfile
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Annotated, List, Literal, Optional
 
 from fastapi import (
@@ -46,11 +47,11 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.agents.approval_store import get_pending, list_pending, to_legacy
 from app.agents.job_helper import files, repository as repo
-from app.agents.job_helper import service
+from app.agents.job_helper import apply, feed, service
 from app.agents.job_helper.documents import (
     UnsupportedResumeFile,
     extract_text,
@@ -58,14 +59,20 @@ from app.agents.job_helper.documents import (
 )
 from app.agents.job_helper.jobsearch import configured_providers
 from app.agents.job_helper.state import (
+    ApplyProfile,
     ApplicationStatus,
+    FormField,
+    FeedState,
     JOB_MEMORY_INSTRUCTIONS,
+    JobListing,
     JobMemoryExtract,
+    JobPreferences,
     ResumeContent,
 )
+from app.agents.job_helper.triggers import FEED_TRIGGER_TYPE
 from app.agents.job_helper.workflow import RESUME_APPROVAL
 from app.agents.memory_store import extract_and_save
-from app.agents.trigger_store import toggle
+from app.agents.trigger_store import get_trigger, toggle, update_trigger
 from app.core.config import (
     JOB_QUERY_RATE_LIMIT,
     JOB_QUERY_RATE_WINDOW,
@@ -418,25 +425,12 @@ async def get_resume(
     return {"status": "done", "result": files.with_link(resume)}
 
 
-@router.get("/resumes/{resume_id}/download")
-async def download_resume(
-    resume_id: str,
-    current_user: Annotated[dict, Depends(get_current_user)],
-    fmt: Literal["original", "pdf", "docx"] = "original",
-):
-    """Download a stored resume. See THREE THINGS A DOWNLOAD CAN MEAN above.
-
-    `original` is the default, and falls back to a render only when there is no
-    stored file — a typed-in resume or a tailored version. The renders are done
-    on demand rather than at save time: both formats come from the same
-    structure, so storing them would mean two blobs to keep in step with every
-    edit, for a render that takes milliseconds.
-    """
-    resume = await repo.get_resume(current_user["uid"], resume_id)
-    if not resume:
-        raise HTTPException(status_code=404, detail="Resume not found.")
-
+async def _resume_response(resume: dict, fmt: str) -> Response:
+    """A stored resume as a file download: the original upload, or a fresh
+    render of its structure. `auto` means the original when there is one."""
     stored = resume.get("file") or {}
+    if fmt == "auto":
+        fmt = "original" if stored.get("path") else "pdf"
     if fmt == "original":
         if not stored.get("path"):
             raise HTTPException(
@@ -457,7 +451,7 @@ async def download_resume(
                 render, resume.get("content") or {}, fmt, resume.get("label") or "Resume"
             )
         except Exception as e:
-            logger.exception("resume render failed id=%s fmt=%s", resume_id, fmt)
+            logger.exception("resume render failed id=%s fmt=%s", resume.get("id"), fmt)
             raise HTTPException(
                 status_code=500, detail=f"Could not render the resume: {e}"
             )
@@ -472,6 +466,26 @@ async def download_resume(
             "Content-Length": str(len(payload)),
         },
     )
+
+
+@router.get("/resumes/{resume_id}/download")
+async def download_resume(
+    resume_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    fmt: Literal["original", "pdf", "docx"] = "original",
+):
+    """Download a stored resume. See THREE THINGS A DOWNLOAD CAN MEAN above.
+
+    `original` is the default, and falls back to a render only when there is no
+    stored file — a typed-in resume or a tailored version. The renders are done
+    on demand rather than at save time: both formats come from the same
+    structure, so storing them would mean two blobs to keep in step with every
+    edit, for a render that takes milliseconds.
+    """
+    resume = await repo.get_resume(current_user["uid"], resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+    return await _resume_response(resume, fmt)
 
 
 @router.delete("/resumes/{resume_id}")
@@ -524,6 +538,291 @@ async def search_providers(current_user: Annotated[dict, Depends(get_current_use
     }
 
 
+# ── daily job feed ───────────────────────────────────────────────────────────
+# One ranked list across every board (see agents/job_helper/feed.py). Reads are
+# free; refresh and import spend model calls on scoring, so they sit on the
+# query bucket like /fit does.
+FEED_TRIGGER_DEFAULTS = {"name": "daily job feed", "schedule_hour": 8}
+
+
+@router.get("/preferences")
+async def get_preferences(current_user: Annotated[dict, Depends(get_current_user)]):
+    """The feed's search preferences. Unsaved ones come back pre-filled from what
+    the job helper already knows (`saved: false`) for the user to confirm."""
+    user_id = current_user["uid"]
+    prefs, saved = await feed.get_preferences(user_id)
+    trigger = await get_trigger(user_id, FEED_TRIGGER_TYPE)
+    return {
+        "status": "done",
+        "result": prefs.model_dump(),
+        "saved": saved,
+        "schedule": {
+            "enabled": bool(trigger and trigger.get("enabled", True)),
+            "schedule_hour": (trigger or {}).get(
+                "schedule_hour", FEED_TRIGGER_DEFAULTS["schedule_hour"]
+            ),
+            "timezone": (trigger or {}).get("timezone", "UTC"),
+        },
+    }
+
+
+@router.put("/preferences")
+async def save_preferences(
+    body: JobPreferences,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Save preferences. The first save also turns the daily feed on (08:00
+    local), since that is what setting them is for; PUT /feed/schedule sets
+    the hour and timezone or turns it off."""
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_write", user_id, JOB_WRITE_RATE_LIMIT, JOB_WRITE_RATE_WINDOW
+    )
+    prefs = await feed.save_preferences(user_id, body)
+    if not await get_trigger(user_id, FEED_TRIGGER_TYPE):
+        await toggle(user_id, FEED_TRIGGER_TYPE, defaults=FEED_TRIGGER_DEFAULTS)
+    return {"status": "done", "result": prefs.model_dump()}
+
+
+@router.get("/feed")
+async def list_feed(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    state: Literal[FeedState, "all"] = "new",
+    limit: int = 50,
+):
+    """The ranked feed, best match first. `state=filtered` shows what the
+    dealbreakers hid and why; `state=all` shows everything."""
+    items = await repo.list_feed(
+        current_user["uid"],
+        None if state == "all" else state,
+        max(1, min(limit, 200)),
+    )
+    return {"status": "done", "result": items}
+
+
+@router.post("/feed/refresh")
+async def refresh_feed(current_user: Annotated[dict, Depends(get_current_user)]):
+    """Search every board now instead of waiting for the morning run."""
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_query", user_id, JOB_QUERY_RATE_LIMIT, JOB_QUERY_RATE_WINDOW
+    )
+    try:
+        result = await feed.refresh_feed(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "done", "result": result}
+
+
+class FeedImportRequest(BaseModel):
+    source: str
+    listings: List[JobListing]
+
+
+MAX_IMPORT_LISTINGS = 50
+
+
+@router.post("/feed/import")
+async def import_feed(
+    body: FeedImportRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Postings read from a portal page the user has open (the browser
+    extension's "Import this page"). Deduped and ranked like the rest."""
+    user_id = current_user["uid"]
+    if not body.listings:
+        raise HTTPException(status_code=400, detail="No listings to import.")
+    if len(body.listings) > MAX_IMPORT_LISTINGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Import at most {MAX_IMPORT_LISTINGS} listings at a time.",
+        )
+    await rate_limit.limit_user(
+        "job_query", user_id, JOB_QUERY_RATE_LIMIT, JOB_QUERY_RATE_WINDOW
+    )
+    source = body.source.strip().lower()[:40] or "import"
+    result = await feed.import_listings(
+        user_id, [listing.model_dump() for listing in body.listings], source
+    )
+    return {"status": "done", "result": result}
+
+
+@router.get("/feed/{item_id}")
+async def get_feed_item(
+    item_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    item = await repo.get_feed_item(current_user["uid"], item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"status": "done", "result": item}
+
+
+@router.post("/feed/{item_id}/dismiss")
+async def dismiss_feed_item(
+    item_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Hide a posting. It stays hidden when the boards return it again."""
+    item = await repo.update_feed_item(
+        current_user["uid"], item_id, {"state": "dismissed"}
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"status": "done", "result": item}
+
+
+@router.post("/feed/{item_id}/track", status_code=201)
+async def track_feed_item(
+    item_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Start tracking a feed posting as an application (analyses the full
+    posting). Tracking the same posting twice returns the same application."""
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_write", user_id, JOB_WRITE_RATE_LIMIT, JOB_WRITE_RATE_WINDOW
+    )
+    try:
+        application = await feed.track_item(user_id, item_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not application:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return {"status": "done", "result": application}
+
+
+
+# ── applying: profile, form answers, the resume to attach ────────────────────
+# What the browser extension calls on an application form. The user reviews
+# every value and clicks Submit themselves; nothing here submits anything.
+class AnswerSnapshot(BaseModel):
+    label: str = Field(max_length=500)
+    value: Optional[str] = Field(default=None, max_length=5000)
+
+
+@router.get("/apply-profile")
+async def get_apply_profile(current_user: Annotated[dict, Depends(get_current_user)]):
+    """The answers every form asks for. Unsaved, it comes back pre-filled from
+    the resume (`saved: false`) for the user to check and save."""
+    profile, saved, remembered = await apply.get_apply_profile(current_user["uid"])
+    return {
+        "status": "done",
+        "result": profile.model_dump(),
+        "saved": saved,
+        "remembered": remembered,
+    }
+
+
+@router.put("/apply-profile")
+async def save_apply_profile(
+    body: ApplyProfile,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_write", user_id, JOB_WRITE_RATE_LIMIT, JOB_WRITE_RATE_WINDOW
+    )
+    await repo.save_apply_profile(user_id, body.model_dump())
+    return {"status": "done", "result": body.model_dump()}
+
+
+class RememberRequest(BaseModel):
+    answers: List[AnswerSnapshot] = Field(max_length=100)
+
+
+@router.post("/apply-profile/answers")
+async def remember_answers(
+    body: RememberRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Remember answers to reuse on the next form that asks the same question.
+    Personal and consent questions are never stored (`skipped`)."""
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_write", user_id, JOB_WRITE_RATE_LIMIT, JOB_WRITE_RATE_WINDOW
+    )
+    try:
+        result = await apply.remember(user_id, [a.model_dump() for a in body.answers])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "done", "result": result}
+
+
+@router.delete("/apply-profile/answers/{answer_key}")
+async def forget_answer(
+    answer_key: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    # Normalised again so a crafted key can never address another field path.
+    norm = apply.norm_label(answer_key)
+    if not norm or not await repo.forget_answer(current_user["uid"], norm):
+        raise HTTPException(status_code=404, detail="No remembered answer by that name.")
+    return {"status": "done", "deleted": norm}
+
+
+MAX_FORM_FIELDS = 100
+
+
+class FillRequest(BaseModel):
+    fields: List[FormField]
+    application_id: Optional[str] = None
+    # The posting's text as the extension read it off the page — used when the
+    # form belongs to a job that is not tracked yet.
+    job_text: Optional[str] = Field(default=None, max_length=30_000)
+    page_url: Optional[str] = Field(default=None, max_length=2000)
+
+
+@router.post("/fill")
+async def fill_form(
+    body: FillRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Values for an application form's fields. Every field comes back either
+    with a value (and where it came from) or `needs_you` with a reason."""
+    user_id = current_user["uid"]
+    if not body.fields:
+        raise HTTPException(status_code=400, detail="No form fields were sent.")
+    if len(body.fields) > MAX_FORM_FIELDS:
+        raise HTTPException(
+            status_code=400, detail=f"At most {MAX_FORM_FIELDS} fields per request."
+        )
+    if len({f.key for f in body.fields}) != len(body.fields):
+        raise HTTPException(status_code=400, detail="Field keys must be unique.")
+
+    application = None
+    if body.application_id:
+        application = await repo.get_application(user_id, body.application_id)
+        if not application:
+            raise HTTPException(status_code=404, detail="Application not found.")
+    await rate_limit.limit_user(
+        "job_query", user_id, JOB_QUERY_RATE_LIMIT, JOB_QUERY_RATE_WINDOW
+    )
+    result = await apply.fill_form(user_id, body.fields, application, body.job_text)
+    return {"status": "done", "result": result}
+
+
+@router.get("/resume-file")
+async def resume_file(
+    current_user: Annotated[dict, Depends(get_current_user)],
+    application_id: Optional[str] = None,
+    fmt: Literal["auto", "original", "pdf", "docx"] = "auto",
+):
+    """The file to attach to an application form: the approved tailored version
+    for that application when there is one (rendered), else the user's own
+    uploaded resume, byte for byte."""
+    user_id = current_user["uid"]
+    application = None
+    if application_id:
+        application = await repo.get_application(user_id, application_id)
+        if not application:
+            raise HTTPException(status_code=404, detail="Application not found.")
+    resume = await apply.resume_for(user_id, application)
+    if not resume:
+        raise HTTPException(status_code=404, detail="No resume on file yet.")
+    return await _resume_response(resume, fmt)
+
+
 # ── applications ─────────────────────────────────────────────────────────────
 class TrackRequest(BaseModel):
     jd_text: Optional[str] = None
@@ -574,6 +873,13 @@ class UpdateApplicationRequest(BaseModel):
     status: Optional[ApplicationStatus] = None
     note: Optional[str] = None
     deadline: Optional[str] = None
+    # Sent by the browser extension when the user marks a form as submitted:
+    # where they applied and what went out, so "what did I tell them my notice
+    # period was?" has an answer when the recruiter calls.
+    applied_via: Optional[Literal["portal", "company_site", "other"]] = None
+    apply_url: Optional[str] = Field(default=None, max_length=2000)
+    resume_id_sent: Optional[str] = None
+    answers_snapshot: Optional[List[AnswerSnapshot]] = Field(default=None, max_length=150)
 
 
 @router.patch("/applications/{application_id}")
@@ -595,6 +901,22 @@ async def update_application(
         )
     if body.note:
         updated = await repo.add_application_note(user_id, application_id, body.note)
+    if body.resume_id_sent and not await repo.verify_resume_ownership(
+        body.resume_id_sent, user_id
+    ):
+        raise HTTPException(status_code=403, detail="You do not have access to this resume.")
+    submission = {
+        "applied_via": body.applied_via,
+        "apply_url": body.apply_url,
+        "resume_id_sent": body.resume_id_sent,
+        "answers_snapshot": (
+            [a.model_dump() for a in body.answers_snapshot]
+            if body.answers_snapshot is not None
+            else None
+        ),
+    }
+    if any(v is not None for v in submission.values()):
+        updated = await repo.update_application(user_id, application_id, submission)
     if updated is None:
         updated = await repo.get_application(user_id, application_id)
     return {"status": "done", "result": updated}
@@ -661,3 +983,39 @@ async def toggle_trigger(current_user: Annotated[dict, Depends(get_current_user)
         defaults={"name": "job application follow-ups", "schedule_hour": 9},
     )
     return {"status": "done", "enabled": enabled}
+
+
+
+class FeedScheduleRequest(BaseModel):
+    """When the daily feed runs. Hour resolution only: the sweep is hourly."""
+
+    enabled: Optional[bool] = None
+    schedule_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    timezone: Optional[str] = Field(default=None, description="IANA, e.g. Asia/Kolkata")
+
+
+@router.put("/feed/schedule")
+async def set_feed_schedule(
+    body: FeedScheduleRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Turn the daily feed on/off and set its local hour and timezone."""
+    if body.timezone:
+        try:
+            ZoneInfo(body.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise HTTPException(status_code=400, detail="Unknown timezone.")
+    trigger = await update_trigger(
+        current_user["uid"],
+        FEED_TRIGGER_TYPE,
+        body.model_dump(exclude_none=True),
+        defaults=FEED_TRIGGER_DEFAULTS,
+    )
+    return {
+        "status": "done",
+        "result": {
+            "enabled": trigger.get("enabled", True),
+            "schedule_hour": trigger.get("schedule_hour"),
+            "timezone": trigger.get("timezone", "UTC"),
+        },
+    }

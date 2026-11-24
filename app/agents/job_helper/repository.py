@@ -1,4 +1,5 @@
-"""MongoDB persistence for the job helper: tracked applications and resumes.
+"""MongoDB persistence for the job helper: tracked applications and resumes,
+plus the daily job feed and the preferences that drive it (see feed.py).
 
 TWO COLLECTIONS, ONE OF THEM POLYMORPHIC
 ────────────────────────────────────────
@@ -32,7 +33,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from bson import ObjectId
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 
 from app.database import get_db
 
@@ -40,6 +41,19 @@ logger = logging.getLogger(__name__)
 
 APPLICATIONS = "job_applications"
 RESUMES = "resumes"
+# The daily ranked feed: one document per (user, posting), deduplicated across
+# boards by `fingerprint`. Separate from job_applications on purpose — the feed
+# is hundreds of postings the user has not chosen, and the tracker is the few
+# they have; mixing them would make every tracker read filter out the noise.
+FEED = "job_feed"
+PREFERENCES = "job_preferences"
+# The answers every form asks for, plus answers the user chose to remember from
+# past forms (`answers`, keyed by the question's normalised label).
+APPLY_PROFILES = "apply_profiles"
+
+# Remembered answers per user. Enough for every question a job search keeps
+# meeting; a bound so a misbehaving client cannot grow one document forever.
+MAX_REMEMBERED_ANSWERS = 300
 
 # How much JD text is stored per application. Postings run long and the whole
 # thing is re-sent to the model on every re-analysis; past this the tail is
@@ -337,11 +351,186 @@ async def delete_resume(user_id: str, resume_id: str) -> Optional[dict]:
     return resume
 
 
+# ── job feed ─────────────────────────────────────────────────────────────────
+async def upsert_feed_items(user_id: str, items: List[dict]) -> int:
+    """Insert postings not seen before; for ones already in the feed only bump
+    `last_seen_at`. Returns how many were new.
+
+    `$setOnInsert` is what makes a re-seen posting harmless: a job the user
+    dismissed yesterday comes back from the board today and stays dismissed,
+    and a score already paid for is not thrown away.
+    """
+    if not items:
+        return 0
+    now = _now()
+    ops = []
+    for item in items:
+        doc = {k: v for k, v in item.items() if k not in ("user_id", "fingerprint")}
+        doc.setdefault("state", "new")
+        doc.setdefault("score", None)
+        doc["first_seen_at"] = now
+        ops.append(
+            UpdateOne(
+                {"user_id": user_id, "fingerprint": item["fingerprint"]},
+                {"$setOnInsert": doc, "$set": {"last_seen_at": now}},
+                upsert=True,
+            )
+        )
+    result = await get_db()[FEED].bulk_write(ops, ordered=False)
+    return result.upserted_count
+
+
+async def unscored_feed_items(user_id: str, limit: int) -> List[dict]:
+    """New postings still waiting for a model score, most promising first by
+    the free keyword pre-score — so a capped run spends its calls well."""
+    cursor = (
+        get_db()[FEED]
+        .find({"user_id": user_id, "state": "new", "score": None})
+        .sort("prefilter_score", -1)
+    )
+    return [_serialize(d) for d in await cursor.to_list(length=limit)]
+
+
+async def list_feed(
+    user_id: str, state: Optional[str] = "new", limit: int = 50
+) -> List[dict]:
+    query: dict = {"user_id": user_id}
+    if state:
+        query["state"] = state
+    cursor = (
+        get_db()[FEED]
+        # The description is the bulk of a document and the list screen shows
+        # the one-line reason instead; GET /feed/{id} returns it in full.
+        .find(query, {"description": 0})
+        # Descending puts unscored (null) items last, under every scored one.
+        .sort([("score", -1), ("prefilter_score", -1), ("first_seen_at", -1)])
+    )
+    return [_serialize(d) for d in await cursor.to_list(length=limit)]
+
+
+async def feed_items_by_fingerprint(user_id: str, fingerprints: List[str]) -> List[dict]:
+    cursor = (
+        get_db()[FEED]
+        .find({"user_id": user_id, "fingerprint": {"$in": fingerprints}})
+        .sort([("score", -1), ("prefilter_score", -1)])
+    )
+    return [_serialize(d) for d in await cursor.to_list(length=len(fingerprints))]
+
+
+async def get_feed_item(user_id: str, item_id: str) -> Optional[dict]:
+    oid = _oid(item_id)
+    if not oid:
+        return None
+    return _serialize(await get_db()[FEED].find_one({"_id": oid, "user_id": user_id}))
+
+
+async def update_feed_item(user_id: str, item_id: str, updates: dict) -> Optional[dict]:
+    oid = _oid(item_id)
+    if not oid:
+        return None
+    doc = await get_db()[FEED].find_one_and_update(
+        {"_id": oid, "user_id": user_id},
+        {"$set": updates},
+        return_document=ReturnDocument.AFTER,
+    )
+    return _serialize(doc)
+
+
+async def prune_feed(user_id: str, before_iso: str) -> int:
+    """Drop postings no board has returned since `before_iso`. Tracked ones stay:
+    they are linked from an application."""
+    result = await get_db()[FEED].delete_many(
+        {
+            "user_id": user_id,
+            "state": {"$ne": "tracked"},
+            "last_seen_at": {"$lt": before_iso},
+        }
+    )
+    return result.deleted_count
+
+
+async def clear_filtered_feed(user_id: str) -> int:
+    """Forget postings hidden by a dealbreaker, so changed preferences are
+    applied to them afresh on the next refresh instead of hiding them forever."""
+    result = await get_db()[FEED].delete_many({"user_id": user_id, "state": "filtered"})
+    return result.deleted_count
+
+
+# ── preferences ──────────────────────────────────────────────────────────────
+async def get_preferences(user_id: str) -> Optional[dict]:
+    doc = await get_db()[PREFERENCES].find_one({"user_id": user_id}, {"_id": 0})
+    return doc
+
+
+async def save_preferences(user_id: str, prefs: dict) -> dict:
+    now = _now()
+    await get_db()[PREFERENCES].update_one(
+        {"user_id": user_id},
+        {"$set": {**prefs, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return await get_preferences(user_id) or {}
+
+
+# ── apply profile ────────────────────────────────────────────────────────────
+async def get_apply_profile(user_id: str) -> Optional[dict]:
+    return await get_db()[APPLY_PROFILES].find_one({"user_id": user_id}, {"_id": 0})
+
+
+async def save_apply_profile(user_id: str, profile: dict) -> dict:
+    """Replace the profile fields; remembered answers are left alone."""
+    now = _now()
+    await get_db()[APPLY_PROFILES].update_one(
+        {"user_id": user_id},
+        {
+            "$set": {"profile": profile, "updated_at": now},
+            "$setOnInsert": {"created_at": now, "answers": {}},
+        },
+        upsert=True,
+    )
+    return await get_apply_profile(user_id) or {}
+
+
+async def remember_answers(user_id: str, answers: dict) -> int:
+    """Store `{normalised_label: {label, value}}`. Returns how many are kept in
+    total. Refuses past MAX_REMEMBERED_ANSWERS rather than silently dropping."""
+    if not answers:
+        return 0
+    doc = await get_apply_profile(user_id) or {}
+    existing = doc.get("answers") or {}
+    if len(set(existing) | set(answers)) > MAX_REMEMBERED_ANSWERS:
+        raise ValueError(
+            f"At most {MAX_REMEMBERED_ANSWERS} remembered answers — forget some first."
+        )
+    now = _now()
+    await get_db()[APPLY_PROFILES].update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                **{f"answers.{k}": {**v, "updated_at": now} for k, v in answers.items()},
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now, "profile": {}},
+        },
+        upsert=True,
+    )
+    return len(set(existing) | set(answers))
+
+
+async def forget_answer(user_id: str, norm_label: str) -> bool:
+    result = await get_db()[APPLY_PROFILES].update_one(
+        {"user_id": user_id, f"answers.{norm_label}": {"$exists": True}},
+        {"$unset": {f"answers.{norm_label}": ""}, "$set": {"updated_at": _now()}},
+    )
+    return result.modified_count > 0
+
+
 # ── indexes ──────────────────────────────────────────────────────────────────
 # Every read here is scoped by user_id and then sorted or narrowed by status;
 # unindexed that is a collection scan per screen. Same reasoning, and the same
 # explicit names for idempotence, as learning_tracker/indexes.py.
-INDEXES: tuple[tuple[str, list[tuple[str, int]], str], ...] = (
+# An optional fourth element carries extra create_index options (unique, …).
+INDEXES: tuple[tuple, ...] = (
     (APPLICATIONS, [("user_id", 1), ("updated_at", -1)], "job_apps_by_owner"),
     (
         APPLICATIONS,
@@ -354,6 +543,21 @@ INDEXES: tuple[tuple[str, list[tuple[str, int]], str], ...] = (
         [("user_id", 1), ("application_id", 1)],
         "job_resumes_by_application",
     ),
+    # The dedupe guarantee: one row per posting per user, however many boards
+    # (or extension imports) return it.
+    (
+        FEED,
+        [("user_id", 1), ("fingerprint", 1)],
+        "job_feed_by_fingerprint",
+        {"unique": True},
+    ),
+    (
+        FEED,
+        [("user_id", 1), ("state", 1), ("score", -1), ("prefilter_score", -1)],
+        "job_feed_ranked",
+    ),
+    (PREFERENCES, [("user_id", 1)], "job_prefs_by_owner", {"unique": True}),
+    (APPLY_PROFILES, [("user_id", 1)], "apply_profile_by_owner", {"unique": True}),
 )
 
 
@@ -361,8 +565,10 @@ async def ensure_indexes() -> None:
     """Create the job-helper indexes. Idempotent, and best-effort: a failure here
     degrades performance, so it must not stop the app from booting."""
     db = get_db()
-    for collection, keys, name in INDEXES:
+    for collection, keys, name, *options in INDEXES:
         try:
-            await db[collection].create_index(keys, name=name, background=True)
+            await db[collection].create_index(
+                keys, name=name, background=True, **(options[0] if options else {})
+            )
         except Exception as e:
             logger.error("job helper index %s failed: %s", name, e)
