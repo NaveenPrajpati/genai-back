@@ -592,12 +592,32 @@ async def list_feed(
 ):
     """The ranked feed, best match first. `state=filtered` shows what the
     dealbreakers hid and why; `state=all` shows everything."""
+    user_id = current_user["uid"]
     items = await repo.list_feed(
-        current_user["uid"],
+        user_id,
         None if state == "all" else state,
         max(1, min(limit, 200)),
     )
-    return {"status": "done", "result": items}
+    # What the list alone cannot say: how much the filters are hiding, how many
+    # jobs still wait for a score, and whether scoring is possible at all.
+    return {
+        "status": "done",
+        "result": items,
+        "hidden": await repo.count_feed(user_id, {"state": "filtered"}),
+        "unscored": await repo.count_feed(user_id, {"state": "new", "score": None}),
+        "needs_resume": not await repo.latest_base_resume(user_id),
+    }
+
+
+@router.post("/feed/score")
+async def score_feed(current_user: Annotated[dict, Depends(get_current_user)]):
+    """Score waiting jobs now (up to 20 per call) — after uploading a resume or
+    changing filters, without searching the boards again."""
+    user_id = current_user["uid"]
+    await rate_limit.limit_user(
+        "job_query", user_id, JOB_QUERY_RATE_LIMIT, JOB_QUERY_RATE_WINDOW
+    )
+    return {"status": "done", "result": await feed.score_pending(user_id)}
 
 
 @router.post("/feed/refresh")

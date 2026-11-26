@@ -996,7 +996,16 @@ async def test_tracking_a_posting_twice_returns_the_same_application(monkeypatch
     analyse.assert_not_awaited()
 
 
+def _feed_meta(monkeypatch, hidden=0, unscored=0, resume=None):
+    monkeypatch.setattr(
+        routes.repo, "count_feed",
+        AsyncMock(side_effect=lambda uid, q: hidden if q.get("state") == "filtered" else unscored),
+    )
+    monkeypatch.setattr(routes.repo, "latest_base_resume", AsyncMock(return_value=resume))
+
+
 def test_the_feed_route_reads_only_the_callers_feed(monkeypatch):
+    _feed_meta(monkeypatch)
     monkeypatch.setattr(routes.repo, "list_feed", AsyncMock(return_value=[]))
     with _client(user={"uid": "me"}) as client:
         resp = client.get("/job-helper/feed")
@@ -1054,6 +1063,7 @@ def test_an_unknown_timezone_is_refused(monkeypatch):
 
 
 def test_state_all_lists_the_whole_feed(monkeypatch):
+    _feed_meta(monkeypatch)
     monkeypatch.setattr(routes.repo, "list_feed", AsyncMock(return_value=[]))
     with _client(user={"uid": "me"}) as client:
         assert client.get("/job-helper/feed?state=all").status_code == 200
@@ -1365,17 +1375,26 @@ async def test_tracking_an_imported_card_uses_the_text_from_the_users_tab(monkey
     fetch.assert_not_awaited()  # LinkedIn would refuse it anyway
 
 
-async def test_a_title_only_listing_tells_the_scorer_so(monkeypatch):
-    seen = {}
+async def test_a_card_only_listing_tells_the_scorer_so(monkeypatch):
+    seen = []
 
     async def capture(messages):
-        seen["posting"] = messages[1].content
-        return ListingScore(match_score=60, reason="From the title only: ok")
+        seen.append(messages[1].content)
+        return ListingScore(match_score=60, reason="From the card only: ok")
 
     fake = SimpleNamespace(ainvoke=capture)
     monkeypatch.setattr(ranking, "fast_llm", SimpleNamespace(with_structured_output=lambda _: fake))
-    await ranking.score_listing({"title": "AI Engineer", "description": ""}, "resume", JobPreferences(), {})
-    assert ranking.TITLE_ONLY in seen["posting"]
+    prefs = JobPreferences()
+    # A bare title, a two-line card snippet, and a full posting.
+    await ranking.score_listing({"title": "AI Engineer", "description": ""}, "r", prefs, {})
+    await ranking.score_listing(
+        {"title": "AI Engineer", "description": "Python, LLMs. 2-5 yrs.", "description_truncated": True},
+        "r", prefs, {},
+    )
+    await ranking.score_listing({"title": "AI Engineer", "description": "x " * 800}, "r", prefs, {})
+    assert ranking.CARD_ONLY in seen[0]
+    assert ranking.CARD_ONLY in seen[1] and "Python, LLMs" in seen[1]
+    assert ranking.CARD_ONLY not in seen[2]
 
 
 def test_tracking_a_feed_item_without_a_body_still_works(monkeypatch):
@@ -1387,3 +1406,66 @@ def test_tracking_a_feed_item_without_a_body_still_works(monkeypatch):
         assert client.post("/job-helper/feed/f1/track", json={"jd_text": "x" * 500}).status_code == 201
     assert track.await_args_list[0].kwargs["page_text"] is None
     assert track.await_args_list[1].kwargs["page_text"] == "x" * 500
+
+
+
+def test_the_feed_says_what_it_hides_and_why_nothing_is_scored(monkeypatch):
+    _feed_meta(monkeypatch, hidden=21, unscored=14, resume=None)
+    monkeypatch.setattr(routes.repo, "list_feed", AsyncMock(return_value=[]))
+    with _client() as client:
+        body = client.get("/job-helper/feed").json()
+    assert body["hidden"] == 21 and body["unscored"] == 14 and body["needs_resume"] is True
+
+
+def test_title_relevance_matches_whole_words_only():
+    q = ["ai engineer", "mern stack"]
+    assert ranking.title_relevance({"title": "Full Stack AI Engineer"}, q) == 1.0
+    # "ai" inside "email"/"maintain" is not the word "ai".
+    assert ranking.title_relevance({"title": "Email Maintenance Engineer"}, q) == 0.5
+    assert ranking.title_relevance({"title": "Customer Service Representative"}, q) == 0.0
+
+
+def test_off_topic_board_results_are_hidden_but_imports_never_are():
+    prefs = JobPreferences(queries=["ai engineer"])
+    board = feed._prepare(
+        [_listing(title="Customer Service Representative", source="remotive"),
+         _listing(title="AI Engineer", company="Sarvam", source="remotive")],
+        prefs, [],
+    )
+    states = {i["title"]: i["state"] for i in board}
+    assert states == {"Customer Service Representative": "filtered", "AI Engineer": "new"}
+    imported = feed._prepare([_listing(title="Customer Service Representative")], prefs, [], source="linkedin")
+    assert imported[0]["state"] == "new"
+
+
+async def test_changing_filters_brings_hidden_imports_back_instead_of_deleting_them(monkeypatch):
+    items = [
+        {"id": "n1", "state": "filtered", "filtered_reason": "not remote", "title": "AI Engineer",
+         "company": "Acme", "location": "Bengaluru", "remote": False, "source": "naukri"},
+        {"id": "r1", "state": "new", "title": "Content Writer", "company": "X",
+         "location": "Remote", "remote": True, "source": "remotive"},
+    ]
+    monkeypatch.setattr(feed.repo, "feed_items_in_states", AsyncMock(return_value=items))
+    update = AsyncMock()
+    monkeypatch.setattr(feed.repo, "update_feed_item", update)
+
+    out = await feed.refilter("u1", JobPreferences(queries=["ai engineer"], work_mode="any"))
+
+    assert out == {"hidden": 1, "shown": 1}
+    calls = {c.args[1]: c.args[2] for c in update.await_args_list}
+    assert calls["n1"] == {"state": "new", "filtered_reason": None}
+    assert calls["r1"]["filtered_reason"] == feed.OFF_TOPIC
+
+
+async def test_an_import_reports_what_the_filters_hid(monkeypatch):
+    monkeypatch.setattr(
+        feed, "get_preferences", AsyncMock(return_value=(JobPreferences(work_mode="remote"), True))
+    )
+    monkeypatch.setattr(feed.repo, "latest_base_resume", AsyncMock(return_value=None))
+    monkeypatch.setattr(feed.repo, "upsert_feed_items", AsyncMock(return_value=2))
+    monkeypatch.setattr(
+        feed.repo, "feed_items_by_fingerprint",
+        AsyncMock(return_value=[{"state": "filtered", "filtered_reason": "not remote"}] * 2),
+    )
+    out = await feed.import_listings("u1", [_listing(), _listing(company="B")], "naukri")
+    assert out["hidden"] == {"not remote": 2} and out["needs_resume"] is True

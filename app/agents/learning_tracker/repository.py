@@ -1446,6 +1446,43 @@ async def fetch_quiz(user_id: str, quizId: Optional[str] = None) -> Optional[dic
         return None
 
 
+#: Quizzes raised in chat. `None` is a chat quiz stored before `kind` was stamped
+#: on them — every other kind has carried one since it existed.
+CHAT_QUIZ_KINDS = (None, "chat")
+
+#: Sets that gate a topic's completion or its place on the review ladder.
+CHECKPOINT_KINDS = ("checkpoint", "review")
+
+
+def is_chat_quiz(quiz: Optional[dict]) -> bool:
+    return bool(quiz) and quiz.get("kind") in CHAT_QUIZ_KINDS
+
+
+async def fetch_chat_quiz(
+    user_id: str, quizId: Optional[str] = None
+) -> Optional[dict]:
+    """A quiz raised in chat: the one named, else the learner's most recent.
+
+    The only kind the free-grading paths (POST /submit-quiz and the chat grader)
+    may touch. Those paths hand back every correct option, which is the point of
+    a chat quiz and fatal to a gated one: a digest's recall check or a checkpoint
+    graded through them leaks its answer key, and a checkpoint graded there is
+    recorded as attempted without `apply_checkpoint` ever running — a failure
+    that owes no revision. Without a quizId the fallback used to be the newest
+    quiz of *any* kind, which on a fresh thread is usually the checkpoint the
+    learner has just opened.
+    """
+    query: dict = {"user_id": user_id, "kind": {"$in": list(CHAT_QUIZ_KINDS)}}
+    try:
+        if quizId:
+            query["_id"] = ObjectId(quizId)
+            return await get_db()["quizzes"].find_one(query)
+        return await get_db()["quizzes"].find_one(query, sort=[("_id", -1)])
+    except Exception as e:
+        logger.error("fetch_chat_quiz error user=%s: %s", user_id, e)
+        return None
+
+
 def attempt_misses(questions: list[dict], result: dict) -> list[dict]:
     """What a learner got wrong, in words rather than indices.
 
@@ -1522,6 +1559,37 @@ async def record_quiz_attempt(
         )
     except Exception as e:
         logger.error("record_quiz_attempt error user=%s: %s", user_id, e)
+
+
+async def record_chat_attempt(
+    user_id: str, quizId: str, quiz: dict, result: dict
+) -> bool:
+    """Record a chat quiz's grading once, and against no topic.
+
+    A chat quiz reveals its answers, so grading it again is harmless — but
+    recording it again is not: the resubmission is a copy of the key it was just
+    shown. Only the first grading is kept. `quiz_graded` fails closed, so an
+    unreadable history skips the write rather than doubling it.
+
+    No `topicId`, including on legacy chat quizzes that carry one. They were
+    stamped with whatever topic was underway rather than what the quiz was about,
+    and a miss filed under the wrong topic is how the misconception tracker comes
+    to believe something untrue.
+
+    Returns whether an attempt was written.
+    """
+    if await quiz_graded(user_id, quizId):
+        return False
+    await record_quiz_attempt(
+        user_id,
+        quizId,
+        quiz.get("roadmapId"),
+        None,
+        result,
+        questions=quiz.get("questions") or [],
+        kind="chat",
+    )
+    return True
 
 
 # ── misconceptions ───────────────────────────────────────────────────────────
@@ -1980,9 +2048,14 @@ async def recent_attempts(
 #: this afternoon, so a topic completed at 100% could sit at 45% and be reported
 #: as "not sticking yet".
 #:
+#: `chat` is a quiz on whatever the learner typed, which need not be the topic
+#: underway — "quiz me on Docker" during a Rust topic used to be filed against
+#: Rust. It reveals its answers and can be asked for on demand, so a learner
+#: could also raise a topic's mastery by asking for easy ones until it moved.
+#:
 #: What remains is what mastery was always meant to be: `checkpoint` and `review`,
 #: the two assessments, plus any attempt recorded before kinds existed.
-UNSCORED_KINDS = ("practice", "digest")
+UNSCORED_KINDS = ("practice", "digest", "chat")
 
 
 async def roadmap_mastery(user_id: str, roadmap: dict) -> dict:

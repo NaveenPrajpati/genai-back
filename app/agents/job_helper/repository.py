@@ -449,11 +449,20 @@ async def prune_feed(user_id: str, before_iso: str) -> int:
     return result.deleted_count
 
 
-async def clear_filtered_feed(user_id: str) -> int:
-    """Forget postings hidden by a dealbreaker, so changed preferences are
-    applied to them afresh on the next refresh instead of hiding them forever."""
-    result = await get_db()[FEED].delete_many({"user_id": user_id, "state": "filtered"})
-    return result.deleted_count
+async def feed_items_in_states(
+    user_id: str, states: List[str], limit: int = 1000
+) -> List[dict]:
+    """Feed items for re-filtering: only what a dealbreaker reads, never the
+    description."""
+    cursor = get_db()[FEED].find(
+        {"user_id": user_id, "state": {"$in": states}},
+        {"description": 0},
+    )
+    return [_serialize(d) for d in await cursor.to_list(length=limit)]
+
+
+async def count_feed(user_id: str, query: dict) -> int:
+    return await get_db()[FEED].count_documents({"user_id": user_id, **query})
 
 
 # ── preferences ──────────────────────────────────────────────────────────────

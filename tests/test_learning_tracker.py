@@ -4395,7 +4395,7 @@ async def test_start_topic_says_what_it_displaced(monkeypatch):
         ],
     }
     monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=roadmap))
-    monkeypatch.setattr(lt_actions, "start_topic", AsyncMock(return_value=True))
+    monkeypatch.setattr(lt_actions, "set_topic_progress", AsyncMock(return_value=True))
 
     out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": "t2"})
     assert "Borrowing" in out
@@ -4406,7 +4406,7 @@ async def test_start_topic_refuses_an_unknown_topic(monkeypatch):
     roadmap = {"_id": ObjectId(), "title": "Rust", "topics": []}
     monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=roadmap))
     started = AsyncMock(return_value=True)
-    monkeypatch.setattr(lt_actions, "start_topic", started)
+    monkeypatch.setattr(lt_actions, "set_topic_progress", started)
 
     out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": "nope"})
     assert "No topic" in out
@@ -5133,3 +5133,287 @@ def test_a_short_option_appearing_in_prose_is_not_treated_as_a_leak():
     }
     graded = repo.grade_quiz([q], {0: 1})
     assert repo.redact_review(graded, False, [q])["review"][0]["hint"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# gated quizzes stay on their own routes
+#
+# /submit-quiz and the chat grader hand back every correct option. That is the
+# point of a chat quiz and fatal to a checkpoint or a digest's recall check.
+# --------------------------------------------------------------------------- #
+def _graded_env(monkeypatch, *docs, already_graded=False):
+    db = _DB()
+    db["quizzes"] = _quizzes(*docs)
+    db["quiz_attempts"].count_documents = AsyncMock(return_value=1 if already_graded else 0)
+    client, db, route = _api(monkeypatch, db)
+    return client, db
+
+
+@pytest.mark.parametrize("kind", ["checkpoint", "review", "digest", "practice"])
+def test_the_free_grader_refuses_a_gated_set(monkeypatch, kind):
+    """Sending a checkpoint's quizId here used to return its answer key, and
+    record an attempt without `apply_checkpoint` ever running."""
+    gated = {**_checkpoint(), "kind": kind}
+    client, db = _graded_env(monkeypatch, gated)
+
+    res = client.post(
+        "/learning/submit-quiz",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 0}]},
+    )
+
+    assert res.status_code == 404
+    db["quiz_attempts"].insert_one.assert_not_awaited()
+
+
+def test_the_free_grader_still_grades_a_chat_quiz_against_no_topic(monkeypatch):
+    """Legacy chat quizzes carry no kind and were stamped with the topic underway;
+    the attempt is filed against no topic and as `chat`, so it scores nothing."""
+    legacy = {"_id": ObjectId(_OID), "user_id": "u1", "roadmapId": _OID,
+              "topicId": "t1", "questions": [_Q]}
+    client, db = _graded_env(monkeypatch, legacy)
+
+    res = client.post(
+        "/learning/submit-quiz",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 0}]},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["result"]["review"][0]["correctOption"] == "b"
+    written = db["quiz_attempts"].insert_one.await_args.args[0]
+    assert written["kind"] == "chat"
+    assert written["topicId"] is None
+
+
+def test_a_chat_quiz_is_recorded_only_the_first_time(monkeypatch):
+    """The resubmission is a copy of the key it was just shown."""
+    chat = {"_id": ObjectId(_OID), "user_id": "u1", "kind": "chat", "questions": [_Q]}
+    client, db = _graded_env(monkeypatch, chat, already_graded=True)
+
+    res = client.post(
+        "/learning/submit-quiz",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["result"]["correct"] == 1
+    db["quiz_attempts"].insert_one.assert_not_awaited()
+
+
+@pytest.mark.parametrize("kind", ["digest", "chat", "practice"])
+def test_only_a_checkpoint_set_can_complete_a_topic(monkeypatch, kind):
+    """A digest check and a chat quiz both carry a topic, so "has a topic" was
+    never the test: either one sent here completed the topic."""
+    client, db = _graded_env(monkeypatch, {**_checkpoint(), "kind": kind})
+
+    res = client.post(
+        "/learning/checkpoint/submit",
+        json={"quizId": _OID, "answers": [{"question": 0, "answer": 1}]},
+    )
+
+    assert res.status_code == 404
+    db["roadmaps"].update_one.assert_not_awaited()
+
+
+async def test_the_chat_grader_only_ever_looks_at_chat_quizzes(monkeypatch):
+    """With no quizId it used to fall back to the newest quiz of any kind — on a
+    fresh thread, usually the checkpoint the learner had just opened."""
+    col = _patch_db(monkeypatch, _collection())
+
+    await repo.fetch_chat_quiz("userA")
+
+    filt = col.find_one.await_args.args[0]
+    assert filt["kind"] == {"$in": [None, "chat"]}
+    assert filt["user_id"] == "userA"
+
+
+def test_chat_attempts_do_not_count_toward_mastery():
+    assert "chat" in repo.UNSCORED_KINDS
+
+
+async def test_a_chat_quiz_is_stored_as_chat_and_against_no_topic(monkeypatch):
+    from langchain_core.runnables import RunnableLambda
+
+    from app.agents.learning_tracker.state import Question, QuizOutput
+
+    roadmap = {"_id": _OID, "title": "Rust",
+               "topics": [{"id": "t1", "order": 1, "progress_status": "in_progress"}]}
+    monkeypatch.setattr(lt, "fetch_roadmap", AsyncMock(return_value=roadmap))
+    fake_llm = MagicMock()
+    fake_llm.with_structured_output.return_value = RunnableLambda(
+        lambda _: QuizOutput(quiz=[Question(question="Docker?", options=["a", "b"], answer=0)])
+    )
+    monkeypatch.setattr(lt, "llm", fake_llm)
+    col = _collection()
+    monkeypatch.setattr(lt, "get_db", lambda: {"quizzes": col})
+
+    await lt.tutor_agent(
+        {"user_id": "userA", "roadmapId": _OID, "intent": "quiz", "query": "quiz me on docker"}
+    )
+
+    stored = col.insert_one.await_args.args[0]
+    assert stored["kind"] == "chat"
+    assert stored["topicId"] is None
+
+
+# --------------------------------------------------------------------------- #
+# a pending roadmap proposal is reused only for the request it answered
+# --------------------------------------------------------------------------- #
+def _roadmap_node_env(monkeypatch, pending):
+    monkeypatch.setattr(lt, "get_pending", AsyncMock(return_value=pending))
+    created = AsyncMock(return_value="ap2")
+    monkeypatch.setattr(lt, "create_pending", created)
+    built = AsyncMock(return_value=_draft(_topic(1, "Go"), title="Go"))
+    monkeypatch.setattr(lt, "build_roadmap", built)
+    revised = AsyncMock(return_value=_draft(_topic(1, "Edited")))
+    monkeypatch.setattr(lt, "revise_roadmap", revised)
+    monkeypatch.setattr(lt, "interrupt", lambda _payload: "rejected")
+    resolved = AsyncMock()
+    monkeypatch.setattr(lt, "resolve", resolved)
+    return created, built, revised, resolved
+
+
+def _pending(action_type="save_roadmap", request=None):
+    doc = {"_id": ObjectId(), "action_type": action_type,
+           "payload": _draft(_topic(1, "Rust")).model_dump()}
+    if request is not None:
+        doc["request"] = request
+    return doc
+
+
+async def test_an_unanswered_proposal_is_not_offered_for_a_different_request(monkeypatch):
+    stale = _pending(request={"action_type": "save_roadmap", "query": "rust", "roadmapId": None})
+    created, built, _, resolved = _roadmap_node_env(monkeypatch, stale)
+
+    await lt.roadmap_agent(
+        {"user_id": "userA", "thread_id": "t1", "intent": "create_roadmap", "query": "go"}
+    )
+
+    assert resolved.await_args_list[0].args == (str(stale["_id"]), "superseded")
+    built.assert_awaited_once()
+    assert created.await_args.kwargs["request"]["query"] == "go"
+
+
+async def test_a_replay_on_resume_reuses_its_own_proposal(monkeypatch):
+    own = _pending(request={"action_type": "save_roadmap", "query": "rust", "roadmapId": None})
+    created, built, _, resolved = _roadmap_node_env(monkeypatch, own)
+
+    await lt.roadmap_agent(
+        {"user_id": "userA", "thread_id": "t1", "intent": "create_roadmap", "query": "rust"}
+    )
+
+    built.assert_not_awaited()
+    created.assert_not_awaited()
+    assert [c.args[1] for c in resolved.await_args_list] == ["rejected"]
+
+
+async def test_a_new_roadmap_draft_is_never_applied_as_a_modify(monkeypatch):
+    """Even a legacy approval with no recorded request: a new-roadmap draft has no
+    `existing_id`s, and merging it replaced the stored roadmap wholesale."""
+    legacy_create = _pending(action_type="save_roadmap")
+    monkeypatch.setattr(lt, "fetch_roadmap", AsyncMock(return_value={"_id": _OID, "topics": []}))
+    _, built, revised, resolved = _roadmap_node_env(monkeypatch, legacy_create)
+
+    await lt.roadmap_agent(
+        {"user_id": "userA", "thread_id": "t1", "intent": "modify_roadmap",
+         "roadmapId": _OID, "query": "add a topic"}
+    )
+
+    assert resolved.await_args_list[0].args[1] == "superseded"
+    revised.assert_awaited_once()
+    built.assert_not_awaited()
+
+
+async def test_a_legacy_proposal_in_flight_is_still_resumable(monkeypatch):
+    """Regenerating there would save a draft the learner never saw."""
+    legacy = _pending(action_type="save_roadmap")
+    _, built, _, resolved = _roadmap_node_env(monkeypatch, legacy)
+
+    await lt.roadmap_agent(
+        {"user_id": "userA", "thread_id": "t1", "intent": "create_roadmap", "query": "rust"}
+    )
+
+    built.assert_not_awaited()
+    assert "superseded" not in [c.args[1] for c in resolved.await_args_list]
+
+
+# --------------------------------------------------------------------------- #
+# starting a topic never steps backwards or takes the slot
+# --------------------------------------------------------------------------- #
+async def _report_finished(monkeypatch, topics, matched_id):
+    from langchain_core.runnables import RunnableLambda
+
+    monkeypatch.setattr(lt, "fetch_roadmap", AsyncMock(return_value={"_id": _OID, "topics": topics}))
+    wrote = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt, "set_topic_progress", wrote)
+    fake_llm = MagicMock()
+    fake_llm.with_structured_output.return_value = RunnableLambda(
+        lambda _: MagicMock(topicId=matched_id)
+    )
+    monkeypatch.setattr(lt, "fast_llm", fake_llm)
+    out = await lt.progress_agent(
+        {"user_id": "userA", "intent": "update_progress", "roadmapId": _OID,
+         "query": "I finished it"}
+    )
+    return out, wrote
+
+
+async def test_finishing_a_topic_awaiting_its_checkpoint_does_not_reopen_it(monkeypatch):
+    topics = [{"id": "t1", "title": "Pointers", "progress_status": "needs_review"}]
+    out, wrote = await _report_finished(monkeypatch, topics, "t1")
+
+    assert out["log_status"] == "checkpoint_required"
+    wrote.assert_not_awaited()
+
+
+async def test_finishing_another_topic_does_not_take_the_slot(monkeypatch):
+    topics = [
+        {"id": "t1", "title": "Ownership", "progress_status": "in_progress"},
+        {"id": "t2", "title": "Pointers", "progress_status": "not_started"},
+    ]
+    out, wrote = await _report_finished(monkeypatch, topics, "t2")
+
+    assert out["log_status"] == "checkpoint_required"
+    assert out["next_topic"] == "Pointers"
+    wrote.assert_not_awaited()
+
+
+def _tool_roadmap(*statuses):
+    return {
+        "_id": ObjectId(),
+        "title": "Rust",
+        "topics": [
+            {"id": f"t{i}", "order": i, "title": f"Topic {i}", "progress_status": s}
+            for i, s in enumerate(statuses, start=1)
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "statuses, target, says",
+    [
+        (("completed", "in_progress"), "t1", "already complete"),
+        (("needs_review", "not_started"), "t1", "waiting on its checkpoint"),
+        (("needs_review", "not_started"), "t2", '"Topic 1" is waiting'),
+        (("in_progress",), "t1", "already the topic underway"),
+    ],
+)
+async def test_the_start_topic_tool_never_steps_backwards(monkeypatch, statuses, target, says):
+    monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=_tool_roadmap(*statuses)))
+    wrote = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt_actions, "set_topic_progress", wrote)
+
+    out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": target})
+
+    assert says in out
+    wrote.assert_not_awaited()
+
+
+async def test_the_start_topic_tool_starts_a_skipped_topic(monkeypatch):
+    monkeypatch.setattr(lt_actions, "fetch_roadmap", AsyncMock(return_value=_tool_roadmap("completed", "skipped")))
+    wrote = AsyncMock(return_value=True)
+    monkeypatch.setattr(lt_actions, "set_topic_progress", wrote)
+
+    out = await _tools()["start_topic"].ainvoke({"roadmapId": "r1", "topicId": "t2"})
+
+    assert out.startswith('Started "Topic 2"')
+    assert wrote.await_args.args[1:3] == ("t2", "in_progress")

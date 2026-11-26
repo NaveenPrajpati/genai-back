@@ -7,7 +7,8 @@ workflow hand-rolling its own lookup/insert/resolve against a different store.
 Canonical document shape:
     {
         _id, user_id, threadId, action_type, payload,
-        status: "pending" | "approved" | "rejected",
+        status: "pending" | "approved" | "rejected" | "superseded",
+        request?,  # what the proposal answered — see create_pending
         createdAt, resolvedAt
     }
 
@@ -38,20 +39,31 @@ def _now() -> str:
 
 
 async def create_pending(
-    user_id: str, thread_id: str, action_type: str, payload: dict
+    user_id: str,
+    thread_id: str,
+    action_type: str,
+    payload: dict,
+    request: dict | None = None,
 ) -> str | None:
-    """Insert a pending approval and return its id (used by schedulers)."""
+    """Insert a pending approval and return its id (used by schedulers).
+
+    `request` records what the proposal was made *for*, apart from the proposal
+    itself. A node replayed on resume reuses its pending approval; one run fresh
+    on a thread whose last proposal was never answered must not. Telling the two
+    apart needs to know which request the pending one answered.
+    """
+    doc = {
+        "user_id": user_id,
+        "threadId": thread_id,
+        "action_type": action_type,
+        "payload": payload,
+        "status": "pending",
+        "createdAt": _now(),
+    }
+    if request is not None:
+        doc["request"] = request
     try:
-        res = await _col().insert_one(
-            {
-                "user_id": user_id,
-                "threadId": thread_id,
-                "action_type": action_type,
-                "payload": payload,
-                "status": "pending",
-                "createdAt": _now(),
-            }
-        )
+        res = await _col().insert_one(doc)
         return str(res.inserted_id)
     except Exception as e:
         logger.error("approval insert error thread=%s: %s", thread_id, e)

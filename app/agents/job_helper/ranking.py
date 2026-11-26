@@ -101,6 +101,25 @@ def _mentions(skill: str, text: str) -> bool:
     return re.search(pattern, text) is not None
 
 
+def title_relevance(listing: dict, queries: List[str]) -> float:
+    """0-1: the best share of any query's words that appear in the title, as
+    whole words — "ai" must not match inside "email" or "maintain"."""
+    words_in_title = set(_norm(listing.get("title")).split())
+    best = 0.0
+    for query in queries:
+        words = [w for w in _norm(query).split() if len(w) > 1]
+        if words:
+            best = max(best, sum(w in words_in_title for w in words) / len(words))
+    return best
+
+
+# Board results below this are off-topic. Keyless boards match loosely —
+# Remotive answered "ai engineer" with customer-service and copywriting roles —
+# so a title must carry most of some query's words to stay. Only search
+# results are gated: a card the user imported is one they chose to look at.
+MIN_TITLE_RELEVANCE = 0.51
+
+
 def prefilter(
     listing: dict, skills: List[str], queries: List[str]
 ) -> Tuple[int, List[str]]:
@@ -116,15 +135,7 @@ def prefilter(
     # Ten matching skills is a strong posting whatever the resume's length; a
     # thirty-skill resume should not make every posting look weak.
     skill_part = min(len(hits) / max(1, min(len(skills), 10)), 1.0)
-
-    title = _norm(listing.get("title"))
-    title_part = 0.0
-    for query in queries:
-        words = [w for w in _norm(query).split() if len(w) > 1]
-        if words:
-            title_part = max(title_part, sum(w in title for w in words) / len(words))
-
-    return round(70 * skill_part + 30 * title_part), hits
+    return round(70 * skill_part + 30 * title_relevance(listing, queries)), hits
 
 
 SCORE_SYSTEM = """\
@@ -142,14 +153,25 @@ give credit for skills the candidate merely could learn. `matched` and \
 reads in a list ("Strong on LLM/RAG work; missing production Kubernetes"). \
 Set `min_years_required` only when the posting states a number.
 
-When the posting says "(No description — title only.)", judge from the title, \
-company and location alone: score no higher than 70, leave `matched` and \
-`missing` empty, and start `reason` with "From the title only:".
+When the posting ends with "(Only the results-card preview is known…)", you \
+are seeing a title and at most a short snippet, not the posting. Judge from \
+what is there: score no higher than 70, list in `matched` and `missing` only \
+skills the preview itself names, and start `reason` with "From the card only:".
 """
 
-# What the scorer is shown for a listing imported from a results page, where
-# the card carries a title and no description (see feed.import_listings).
-TITLE_ONLY = "(No description — title only.)"
+# Appended for a listing known only from a results card — a title, maybe a
+# two-line snippet (LinkedIn/Naukri/Indeed imports, Adzuna's truncated text).
+# Without it the scorer reads a snippet as the whole posting and grades a
+# fragment as if nothing else were required.
+CARD_ONLY = "(Only the results-card preview is known — not the full description.)"
+
+# Below this, a description flagged as truncated is a card snippet.
+THIN_CHARS = 600
+
+
+def is_card_only(listing: dict) -> bool:
+    text = (listing.get("description") or "").strip()
+    return not text or (bool(listing.get("description_truncated")) and len(text) < THIN_CHARS)
 
 
 def _prefs_context(prefs: JobPreferences, memory: dict) -> str:
@@ -178,11 +200,11 @@ async def score_listing(
             + (" (remote)" if listing.get("remote") else ""),
             f"Salary: {listing['salary']}" if listing.get("salary") else "",
             "",
-            (listing.get("description") or "")[:MAX_SCORE_DESCRIPTION_CHARS]
-            or TITLE_ONLY,
+            (listing.get("description") or "")[:MAX_SCORE_DESCRIPTION_CHARS],
+            CARD_ONLY if is_card_only(listing) else "",
         )
         if b is not None
-    )
+    ).strip()
     chain = fast_llm.with_structured_output(ListingScore)
     return await chain.ainvoke(
         [

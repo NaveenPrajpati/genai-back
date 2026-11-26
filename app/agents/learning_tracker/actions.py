@@ -12,7 +12,8 @@ and a failed checkpoint owes revision before a retry. A tool that marked a diges
 read, set a topic complete, or answered on the learner's behalf would not be a
 convenience — it would make every mastery score in the app a claim about nothing.
 So none exists, and `set_topic_progress` is reachable here only as
-`in_progress`, exactly as the chat path has always been restricted.
+`in_progress` — and only for a topic that hasn't been taught yet, so starting one
+can never reopen a finished topic or one waiting on its checkpoint.
 
 **Everything is reversible.** No approval interrupt guards these, because a
 confirmation dialog on every action would rebuild by hand the clicking this set
@@ -43,7 +44,7 @@ from .repository import (
     resolve_roadmap_id,
     set_digest_schedule,
     set_roadmap_status,
-    start_topic,
+    set_topic_progress,
 )
 from .triggers import pull_next_digest
 
@@ -111,17 +112,48 @@ def build_action_tools(user_id: str) -> list[StructuredTool]:
         )
         if not topic:
             return "No topic with that id on that roadmap."
+
+        # Starting is a step forward, never a step back. Restarting a finished
+        # topic un-completes it and the learner must pass its checkpoint again to
+        # get it back, and restarting one at `needs_review` reopens a drip-feed
+        # that has already taught it in full — neither is the one-tap-reversible
+        # trade this module is allowed to make on its own.
+        status = topic.get("progress_status") or "not_started"
+        if status == "in_progress":
+            return f'"{topic.get("title")}" is already the topic underway.'
+        if status == "completed":
+            return (
+                f'"{topic.get("title")}" is already complete — its reviews come '
+                "back on their own schedule."
+            )
+        if status == "needs_review":
+            return (
+                f'"{topic.get("title")}" has been taught in full and is waiting on '
+                "its checkpoint. Passing that is what moves it on."
+            )
+
+        # A topic waiting on its checkpoint holds the slot until it is sat;
+        # starting another beside it would leave two in flight. The repository
+        # swap only demotes an `in_progress` holder, so it is refused here.
+        others = [t for t in roadmap.get("topics") or [] if t.get("id") != topicId]
+        owed = next(
+            (t for t in others if t.get("progress_status") == "needs_review"), None
+        )
+        if owed:
+            return (
+                f'Cannot start it yet — "{owed.get("title")}" is waiting on its '
+                "checkpoint, and that has to be passed first."
+            )
+
         # Exactly one topic is underway at a time; the repository demotes whoever
         # held the slot. Saying so matters — the learner is giving something up.
         previous = next(
-            (
-                t
-                for t in roadmap.get("topics") or []
-                if t.get("progress_status") == "in_progress" and t.get("id") != topicId
-            ),
-            None,
+            (t for t in others if t.get("progress_status") == "in_progress"), None
         )
-        ok = await start_topic(roadmapId, topicId, user_id)
+        # Through `set_topic_progress` rather than the bare swap so the roadmap's
+        # own status rolls up too: starting a skipped topic on a completed
+        # roadmap has to reopen the roadmap, or no lesson for it ever arrives.
+        ok = await set_topic_progress(roadmapId, topicId, "in_progress", user_id)
         if not ok:
             return "Could not start that topic just now."
         moved = (
@@ -218,7 +250,9 @@ def build_action_tools(user_id: str) -> list[StructuredTool]:
             _start_topic,
             "start_topic",
             "Pick up a topic and begin its daily lessons. Exactly one topic is "
-            "underway at a time, so this replaces whichever was.",
+            "underway at a time, so this replaces whichever was. Declines for a "
+            "topic already complete or waiting on its checkpoint, and while "
+            "another topic is waiting on its checkpoint.",
             TopicArg,
         ),
         (

@@ -28,7 +28,14 @@ from app.agents.memory_store import get_profile
 
 from . import repository as repo
 from .jobsearch import search_all
-from .ranking import dealbreaker, fingerprint, prefilter, score_listing
+from .ranking import (
+    MIN_TITLE_RELEVANCE,
+    dealbreaker,
+    fingerprint,
+    prefilter,
+    score_listing,
+    title_relevance,
+)
 from .service import _resume_digest, fetch_job_posting, track_application
 from .state import JobPreferences
 
@@ -81,9 +88,48 @@ async def get_preferences(user_id: str) -> tuple[JobPreferences, bool]:
 
 async def save_preferences(user_id: str, prefs: JobPreferences) -> JobPreferences:
     await repo.save_preferences(user_id, prefs.model_dump())
-    # A posting hidden by the old dealbreakers may be wanted under the new ones.
-    await repo.clear_filtered_feed(user_id)
+    await refilter(user_id, prefs)
     return prefs
+
+
+# The boards the backend searches itself. Imports from a portal page are the
+# user's own pick and are never judged off-topic.
+BOARD_SOURCES = {"jsearch", "adzuna", "remotive", "arbeitnow"}
+OFF_TOPIC = "off-topic for the roles you're searching"
+
+
+def _hide_reason(item: dict, prefs: JobPreferences) -> Optional[str]:
+    """Why a stored item should be hidden under `prefs`, or None."""
+    blocked = dealbreaker(item, prefs)
+    if blocked:
+        return blocked
+    if item.get("source") in BOARD_SOURCES and prefs.queries:
+        if title_relevance(item, prefs.queries) < MIN_TITLE_RELEVANCE:
+            return OFF_TOPIC
+    years = item.get("min_years_required")
+    if prefs.max_years_required is not None and years is not None and years > prefs.max_years_required:
+        return f"asks for {years}+ years"
+    return None
+
+
+async def refilter(user_id: str, prefs: JobPreferences) -> dict:
+    """Apply the current preferences to what is already in the feed: hide what
+    they now rule out, bring back what they no longer do.
+
+    Re-judging rather than deleting matters for imports. A LinkedIn or Naukri
+    card exists only because the user imported it from their own tab; deleting
+    it on a filter change would lose it for good.
+    """
+    hidden = shown = 0
+    for item in await repo.feed_items_in_states(user_id, ["new", "filtered"]):
+        reason = _hide_reason(item, prefs)
+        if reason and item.get("state") == "new":
+            await repo.update_feed_item(user_id, item["id"], {"state": "filtered", "filtered_reason": reason})
+            hidden += 1
+        elif not reason and item.get("state") == "filtered":
+            await repo.update_feed_item(user_id, item["id"], {"state": "new", "filtered_reason": None})
+            shown += 1
+    return {"hidden": hidden, "shown": shown}
 
 
 # ── ingest ───────────────────────────────────────────────────────────────────
@@ -115,7 +161,7 @@ def _prepare(
     items = []
     for key, listing in unique.items():
         pre, hits = prefilter(listing, skills, prefs.queries)
-        blocked = dealbreaker(listing, prefs)
+        blocked = _hide_reason({**listing, "source": source or listing.get("source")}, prefs)
         items.append(
             {
                 "fingerprint": key,
@@ -203,6 +249,10 @@ async def refresh_feed(user_id: str) -> dict:
             "Tell me which roles to look for first — for example 'AI Engineer'."
         )
 
+    # Older items get today's rules too (off-topic board results from before
+    # the relevance gate existed, a changed dealbreaker).
+    await refilter(user_id, prefs)
+
     search = await search_all(
         prefs.queries,
         prefs.locations,
@@ -260,7 +310,24 @@ async def import_listings(user_id: str, listings: List[dict], source: str) -> di
     current = await repo.feed_items_by_fingerprint(
         user_id, [item["fingerprint"] for item in items]
     )
-    return {"new": new, "items": current, "needs_resume": resume is None}
+    hidden: dict = {}
+    for item in current:
+        if item.get("state") == "filtered":
+            reason = item.get("filtered_reason") or "your filters"
+            hidden[reason] = hidden.get(reason, 0) + 1
+    # Said out loud: an import whose every card a filter hid otherwise looks
+    # like an import that did nothing.
+    return {"new": new, "items": current, "needs_resume": resume is None, "hidden": hidden}
+
+
+async def score_pending(user_id: str) -> dict:
+    """Score unscored feed items now (capped like any run) — after a resume
+    upload, or for items a filter change just brought back."""
+    prefs, _ = await get_preferences(user_id)
+    resume = await repo.latest_base_resume(user_id)
+    scored = await _score_pending(user_id, prefs, resume)
+    remaining = await repo.count_feed(user_id, {"state": "new", "score": None})
+    return {"scored": len(scored), "remaining": remaining, "needs_resume": resume is None}
 
 
 # ── leaving the feed ─────────────────────────────────────────────────────────

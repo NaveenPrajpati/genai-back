@@ -51,6 +51,7 @@ from app.agents.learning_tracker.triggers import (
     pull_next_digest,
 )
 from app.agents.learning_tracker.repository import (
+    CHECKPOINT_KINDS,
     LEARNING_NS,
     ActiveRoadmapLimit,
     apply_checkpoint,
@@ -64,6 +65,7 @@ from app.agents.learning_tracker.repository import (
     due_misconceptions,
     due_reviews,
     failed_attempts,
+    fetch_chat_quiz,
     fetch_digest,
     fetch_quiz,
     fetch_roadmap,
@@ -86,6 +88,7 @@ from app.agents.learning_tracker.repository import (
     profile_snapshot,
     quiz_graded,
     recent_attempts,
+    record_chat_attempt,
     record_explanation,
     record_quiz_attempt,
     record_revision,
@@ -417,21 +420,16 @@ async def submit_quiz(
     """Grade a quiz submitted from the UI. Shares `grade_quiz` with the chat path
     (quiz_grader_agent), so the same answers can't score differently."""
     user_id = current_user["uid"]
-    quiz = await fetch_quiz(user_id, body.quizId)
+    # Chat quizzes only. This route reveals every correct option, so a digest
+    # check or checkpoint sent here would leak its key — see `fetch_chat_quiz`.
+    # Those are graded by their own routes, which withhold it.
+    quiz = await fetch_chat_quiz(user_id, body.quizId)
     if not quiz:
         raise HTTPException(status_code=404, detail="Quiz not found.")
 
     questions = quiz.get("questions", [])
     result = grade_quiz(questions, {a.question: a.answer for a in body.answers})
-    await record_quiz_attempt(
-        user_id,
-        body.quizId,
-        quiz.get("roadmapId"),
-        quiz.get("topicId"),
-        result,
-        questions=questions,
-        kind=quiz.get("kind") or "chat",
-    )
+    await record_chat_attempt(user_id, body.quizId, quiz, result)
     # A quiz raised in chat gates nothing, so there's nothing to protect by
     # withholding the answers — seeing them is the whole point of asking.
     return {"status": "done", "result": result}
@@ -1302,8 +1300,16 @@ async def submit_checkpoint(
     """
     user_id = current_user["uid"]
     quiz = await fetch_quiz(user_id, body.quizId)
-    # A quiz raised in chat without a roadmap has nothing to attach a result to.
-    if not quiz or not quiz.get("topicId") or not quiz.get("roadmapId"):
+    # Only a set issued as a checkpoint can complete a topic. A chat quiz is
+    # stamped with a roadmap, and a digest check with a topic too, so "has a
+    # topic" was never the test: either one sent here would complete the topic
+    # on questions of the learner's own choosing, or on two about last week's tips.
+    if (
+        not quiz
+        or quiz.get("kind") not in CHECKPOINT_KINDS
+        or not quiz.get("topicId")
+        or not quiz.get("roadmapId")
+    ):
         raise HTTPException(status_code=404, detail="Checkpoint not found.")
 
     # One grading per set. The cooldown and the daily cap are enforced where a

@@ -34,14 +34,14 @@ from .state import (
 from .repository import (
     LEARNING_NS,
     active_topic,
-    fetch_quiz,
+    fetch_chat_quiz,
     fetch_roadmap,
     grade_quiz,
     insertRoadmapToDb,
     materialize_roadmap,
     merge_roadmap,
     profile_snapshot,
-    record_quiz_attempt,
+    record_chat_attempt,
     replace_roadmap,
     resolve_roadmap_id,
     roadmap_progress,
@@ -114,6 +114,37 @@ async def classify_intent(state: LearningState):
     return {"intent": data["intent"]}
 
 
+def _roadmap_request(state: LearningState, action_type: str) -> dict:
+    """What a roadmap proposal is being made for. On resume LangGraph replays the
+    node with the checkpointed state, so a replay produces the same request."""
+    return {
+        "action_type": action_type,
+        "query": state.get("query") or "",
+        "roadmapId": state.get("roadmapId") if action_type == "update_roadmap" else None,
+    }
+
+
+def _answers_request(approval: dict, request: dict) -> bool:
+    """Whether a pending proposal was made for `request`.
+
+    Reusing whatever is pending on the thread meant a learner who ignored the
+    "Rust" proposal and typed "build me a Go roadmap" was shown Rust again — and
+    worse, that a pending *new-roadmap* draft was picked up by a modify. That
+    draft carries no `existing_id`s, so approving it replaced the stored roadmap
+    with an unrelated one and kept progress only where titles happened to match.
+
+    Approvals written before `request` was recorded fall back to matching the
+    action alone, so a proposal in flight across the deploy can still be resumed
+    — regenerating there would save a draft the learner never saw.
+    """
+    if approval.get("action_type") != request["action_type"]:
+        return False
+    recorded = approval.get("request")
+    if recorded is None:
+        return True
+    return recorded == request
+
+
 async def roadmap_agent(state: LearningState):
     user_id = state.get("user_id")
     is_modify = state.get("intent") == "modify_roadmap"
@@ -128,8 +159,19 @@ async def roadmap_agent(state: LearningState):
             return {"intent": state.get("intent"), "roadmap_status": "not_found"}
 
     # Re-run safe: LangGraph replays this node on resume, so reuse the proposal
-    # already on this thread instead of paying for a second generation.
+    # already on this thread instead of paying for a second generation — but
+    # only if it was made for this request. See `_answers_request`.
+    request = _roadmap_request(state, action_type)
     existing_approval = await get_pending(state.get("thread_id"), ROADMAP_ACTIONS)
+    if existing_approval and not _answers_request(existing_approval, request):
+        logger.info(
+            "superseding stale roadmap approval %s thread=%s",
+            existing_approval["_id"],
+            state.get("thread_id"),
+        )
+        await resolve(str(existing_approval["_id"]), "superseded")
+        existing_approval = None
+
     if existing_approval:
         approval_id = str(existing_approval["_id"])
         draft = RoadmapDraft(**existing_approval["payload"])
@@ -144,7 +186,11 @@ async def roadmap_agent(state: LearningState):
         logger.info("roadmap_agent draft: %s", draft.title)
 
         approval_id = await create_pending(
-            user_id, state.get("thread_id"), action_type, draft.model_dump()
+            user_id,
+            state.get("thread_id"),
+            action_type,
+            draft.model_dump(),
+            request=request,
         )
         logger.info("roadmap pending approval created: %s", approval_id)
 
@@ -253,16 +299,20 @@ async def tutor_agent(state: LearningState):
     logger.info("query data %s", result)
 
     # Persist the full quiz (including correct answers) so we can grade a later
-    # submission. Only the answer-free version is returned to the client. The
-    # topic it was taken against is stamped on so a score can be attributed.
-    current = active_topic(roadmap) if roadmap else None
+    # submission. Only the answer-free version is returned to the client.
+    #
+    # Stamped `chat` and with no topic. The quiz is on whatever the learner
+    # asked about, which need not be the topic underway, so attributing it to
+    # that topic filed "quiz me on Docker" against Rust. The kind is what keeps
+    # it out of the checkpoint and digest routes, and theirs out of this one.
     quizId = None
     try:
         res = await get_db()["quizzes"].insert_one(
             {
                 "user_id": state.get("user_id"),
                 "roadmapId": state.get("roadmapId"),
-                "topicId": (current or {}).get("id"),
+                "topicId": None,
+                "kind": "chat",
                 "questions": [q.model_dump() for q in result.quiz],
                 "createdAt": datetime.now(timezone.utc).isoformat(),
             }
@@ -286,7 +336,9 @@ async def quiz_grader_agent(state: LearningState):
     model that misreads an answer cannot also mark it correct.
     """
     user_id = state.get("user_id")
-    quiz = await fetch_quiz(user_id, state.get("quizId"))
+    # Chat quizzes only: the result below carries every correct option. See
+    # `fetch_chat_quiz` for what grading a checkpoint or digest check here did.
+    quiz = await fetch_chat_quiz(user_id, state.get("quizId"))
     if not quiz:
         return {"quiz_result": None, "log_status": "quiz_not_found"}
 
@@ -328,15 +380,7 @@ async def quiz_grader_agent(state: LearningState):
         "quiz graded user=%s %s/%s", user_id, result["correct"], result["total"]
     )
 
-    await record_quiz_attempt(
-        user_id,
-        str(quiz["_id"]),
-        quiz.get("roadmapId"),
-        quiz.get("topicId"),
-        result,
-        questions=questions,
-        kind=quiz.get("kind") or "chat",
-    )
+    await record_chat_attempt(user_id, str(quiz["_id"]), quiz, result)
     return {"quiz_result": result, "quizId": str(quiz["_id"])}
 
 
@@ -442,16 +486,36 @@ async def progress_agent(state: LearningState):
     # it: completion is earned by passing the checkpoint. Letting chat mark
     # things done would be a trivial way around the gate, which would make the
     # gate — and the mastery scores behind it — meaningless.
-    updated = await set_topic_progress(
-        roadmapId, result.topicId, "in_progress", user_id
+    #
+    # Nor does it get to rearrange the roadmap. The answer is "take its
+    # checkpoint" whatever the topic's state, and the only write it may make is
+    # starting the topic when nothing else holds the slot:
+    # - a topic at `needs_review` has been taught in full and owes a
+    #   checkpoint; starting it again put it back to `in_progress` and
+    #   restarted a drip-feed it had already finished;
+    # - another topic holding the slot keeps it. Reporting progress on X used to
+    #   make X current and demote whatever the learner was actually working on.
+    holder = next(
+        (
+            t
+            for t in topics
+            if t.get("progress_status") in ("in_progress", "needs_review")
+        ),
+        None,
     )
-    if updated:
+    # `matched` itself counts as a holder, so a topic already in flight or
+    # awaiting its checkpoint is left exactly as it is.
+    if holder is None:
+        if not await set_topic_progress(
+            roadmapId, result.topicId, "in_progress", user_id
+        ):
+            return {"roadmap": existing_roadmap, "log_status": "not_found"}
         matched["progress_status"] = "in_progress"
 
     return {
         "roadmap": existing_roadmap,
         "next_topic": matched.get("title", ""),
-        "log_status": "checkpoint_required" if updated else "not_found",
+        "log_status": "checkpoint_required",
     }
 
 
